@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/qpack"
@@ -31,6 +33,11 @@ type RawServerConn struct {
 
 	qlogger qlogwriter.Recorder
 	logger  *slog.Logger
+
+	controlStream    *quic.SendStream
+	draining         atomic.Bool
+	gracefullyClosed chan struct{}
+	graceCloseOnce   sync.Once
 }
 
 func newRawServerConn(
@@ -44,13 +51,14 @@ func newRawServerConn(
 	maxHeaderBytes int,
 ) *RawServerConn {
 	c := &RawServerConn{
-		idleTimeout:    idleTimeout,
-		serverContext:  serverContext,
-		requestHandler: requestHandler,
-		maxHeaderBytes: maxHeaderBytes,
-		decoder:        qpack.NewDecoder(),
-		qlogger:        qlogger,
-		logger:         logger,
+		idleTimeout:      idleTimeout,
+		serverContext:    serverContext,
+		requestHandler:   requestHandler,
+		maxHeaderBytes:   maxHeaderBytes,
+		decoder:          qpack.NewDecoder(),
+		qlogger:          qlogger,
+		logger:           logger,
+		gracefullyClosed: make(chan struct{}),
 	}
 	c.rawConn = *newRawConn(conn, enableDatagrams, c.onStreamsEmpty, nil, qlogger, logger)
 	if idleTimeout > 0 {
@@ -92,6 +100,64 @@ func (c *RawServerConn) requestMaxHeaderBytes() int {
 
 func (c *RawServerConn) openControlStream(settings *settingsFrame) (*quic.SendStream, error) {
 	return c.rawConn.openControlStream(settings)
+}
+
+// SetControlStream records the already-open control stream so that the
+// connection can later send a GOAWAY frame for graceful shutdown.
+func (c *RawServerConn) SetControlStream(str *quic.SendStream) {
+	c.controlStream = str
+}
+
+// Draining reports whether graceful shutdown has been initiated.
+func (c *RawServerConn) Draining() bool {
+	return c.draining.Load()
+}
+
+// RejectRequestStream resets a newly-arrived request stream once the
+// connection is draining: after a GOAWAY frame, a conforming client must not
+// send new requests, and any that race with the GOAWAY are rejected.
+func (c *RawServerConn) RejectRequestStream(str *quic.Stream) {
+	str.CancelRead(quic.StreamErrorCode(ErrCodeRequestRejected))
+	str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestRejected))
+}
+
+// GracefulShutdown initiates an RFC 9114 graceful shutdown of this HTTP/3
+// connection: it sends a GOAWAY frame, rejects requests that arrive after the
+// GOAWAY, and closes the QUIC connection with H3_NO_ERROR once the last
+// tracked stream has finished. The returned channel is closed when the
+// underlying connection has been closed.
+func (c *RawServerConn) GracefulShutdown() <-chan struct{} {
+	c.graceCloseOnce.Do(func() {
+		c.draining.Store(true)
+		nextStreamID := c.rawConn.nextStreamID()
+		if c.controlStream != nil {
+			// Sending might block if the peer has not granted enough flow
+			// control credit; the write is guaranteed to return once the
+			// connection is closed, so a separate goroutine is required.
+			go func() {
+				_, _ = c.controlStream.Write((&goAwayFrame{StreamID: nextStreamID}).Append(nil))
+			}()
+		}
+		go c.drainAndClose()
+	})
+	return c.gracefullyClosed
+}
+
+func (c *RawServerConn) drainAndClose() {
+	defer close(c.gracefullyClosed)
+	// Stop the idle timer: once we have asked the peer to close, the idle
+	// timeout must not race with the graceful shutdown.
+	if c.idleTimer != nil {
+		c.idleTimer.Stop()
+	}
+	// If no request stream is active, close right away; otherwise block until
+	// every stream tracked by the HTTP/3 layer has completed.
+	if !c.rawConn.hasActiveStreams() {
+		_ = c.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "")
+		return
+	}
+	<-c.rawConn.streamsGone()
+	_ = c.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "")
 }
 
 func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {

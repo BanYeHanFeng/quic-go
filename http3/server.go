@@ -424,10 +424,11 @@ func (s *Server) removeListener(l *QUICListener) {
 }
 
 func (s *Server) NewRawServerConn(conn *quic.Conn) (*RawServerConn, error) {
-	hconn, _, _, err := s.newRawServerConn(conn)
+	hconn, ctrlStr, _, err := s.newRawServerConn(conn)
 	if err != nil {
 		return nil, err
 	}
+	hconn.SetControlStream(ctrlStr)
 	return hconn, nil
 }
 

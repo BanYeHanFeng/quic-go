@@ -32,8 +32,10 @@ type rawConn struct {
 
 	enableDatagrams bool
 
-	streamMx sync.Mutex
-	streams  map[quic.StreamID]*stateTrackingStream
+	streamMx        sync.Mutex
+	streams         map[quic.StreamID]*stateTrackingStream
+	streamsGoneCh   chan struct{}
+	streamsGoneOnce sync.Once
 
 	rcvdControlStr      atomic.Bool
 	rcvdQPACKEncoderStr atomic.Bool
@@ -63,6 +65,7 @@ func newRawConn(
 		enableDatagrams:   enableDatagrams,
 		receivedSettings:  make(chan struct{}),
 		streams:           make(map[quic.StreamID]*stateTrackingStream),
+		streamsGoneCh:     make(chan struct{}),
 		qlogger:           qlogger,
 		onStreamsEmpty:    onStreamsEmpty,
 		controlStrHandler: controlStrHandler,
@@ -141,7 +144,33 @@ func (c *rawConn) clearStream(id quic.StreamID) {
 	}
 	if len(c.streams) == 0 {
 		c.onStreamsEmpty()
+		c.streamsGoneOnce.Do(func() { close(c.streamsGoneCh) })
 	}
+}
+
+// streamsGone returns a channel that is closed once every stream tracked by
+// this connection has finished (both send and receive sides).
+func (c *rawConn) streamsGone() <-chan struct{} {
+	return c.streamsGoneCh
+}
+
+// nextStreamID returns the highest client-initiated bidirectional stream ID
+// that has been tracked plus four, i.e. the first stream ID that must be
+// rejected once the server starts a graceful shutdown (see RFC 9114 §5.2).
+func (c *rawConn) nextStreamID() quic.StreamID {
+	c.streamMx.Lock()
+	defer c.streamMx.Unlock()
+
+	if len(c.streams) == 0 {
+		return 0
+	}
+	var next quic.StreamID
+	for id := range c.streams {
+		if id > next {
+			next = id
+		}
+	}
+	return next + 4
 }
 
 func (c *rawConn) hasActiveStreams() bool {
