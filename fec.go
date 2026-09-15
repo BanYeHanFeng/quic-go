@@ -49,14 +49,21 @@ const (
 	// (if allowed by the configuration), which makes the group survive two losses.
 	fecHighLossThreshold = 0.12
 
-	fecFeedbackMinProtected = 8
-	fecFeedbackInterval     = 50 * time.Millisecond
+	// fecFeedbackInterval is the minimum interval between two FEC_FEEDBACK frames.
+	fecFeedbackInterval = 50 * time.Millisecond
 	// fecEvaluationInterval is how often the sender re-evaluates the loss rate.
 	fecEvaluationInterval = 30 * time.Millisecond
 	// fecPeerLossValidity is how long a loss report from the peer is considered
-	// current. While FEC is repairing packets, the sender itself sees no loss at all,
-	// so the report of the peer is what keeps FEC engaged.
+	// current. The loss rate of the path is measured by the receiver, so a report
+	// that stopped arriving means the path has to be re-measured from scratch.
 	fecPeerLossValidity = 150 * time.Millisecond
+	// fecReorderWindow is the number of packets a packet may be late before the
+	// receiver counts it as lost.
+	fecReorderWindow = 8
+	// fecMaxTrackerJump is the maximum packet number jump the loss tracker accounts
+	// for. A larger jump resets the tracker (packets can only be authenticated, so
+	// this only guards against a misbehaving peer).
+	fecMaxTrackerJump = 4096
 
 	fecMaxPendingGroups = 8
 	fecCacheSlack       = 16
@@ -261,16 +268,13 @@ func (c *Conn) dataPacketSizeLimit() protocol.ByteCount {
 }
 
 // fecRecordSentPacket hands a packet that was just written to the wire to the FEC
-// encoder, and lets the encoder re-evaluate the loss rate. The evaluation has to
-// happen even while FEC is idle: the sender's own loss counters are what engages
-// FEC in the first place. (While FEC is repairing, those counters stay quiet - then
-// the peer's feedback keeps it engaged.)
+// encoder, and lets the encoder re-evaluate the loss rate.
 func (c *Conn) fecRecordSentPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time) {
 	state := c.fecState.Load()
 	if state == nil {
 		return
 	}
-	state.encoder.evaluate(now, c.connStats.PacketsSent.Load(), c.connStats.PacketsLost.Load(), false)
+	state.encoder.tick(now)
 	if !state.encoder.protecting() {
 		return
 	}
@@ -312,7 +316,7 @@ func (c *Conn) handleFECFeedbackFrame(frame *wire.FECFeedbackFrame, rcvTime mono
 	if state == nil {
 		return
 	}
-	state.encoder.onFeedback(frame, c.connStats.PacketsSent.Load(), c.connStats.PacketsLost.Load(), rcvTime)
+	state.encoder.onFeedback(frame, rcvTime)
 }
 
 // fecFlushDeadline returns the time at which an open (partial) FEC group should be
@@ -425,12 +429,11 @@ type fecEncoder struct {
 
 	lossEWMA float64
 
-	lastEvaluation  monotime.Time
-	lastSentPackets uint64
-	lastLostPackets uint64
+	lastEvaluation monotime.Time
 
 	feedbackSeen bool
-	fbProtected  uint64
+	fbReceived   uint64
+	fbLost       uint64
 	fbRecovered  uint64
 	fbFailed     uint64
 
@@ -585,72 +588,52 @@ func (e *fecEncoder) flush() {
 	e.closeGroup(group, group.maxPacketSize)
 }
 
-// evaluate updates the smoothed loss rate and recomputes the redundancy.
-//
-// The loss rate is the maximum of
-//   - the loss the sender itself observed (packets that were never acknowledged, i.e.
-//     packets that FEC failed to repair), and
-//   - the loss reported by the peer, which includes packets that FEC did repair.
-//
-// The second component is what keeps FEC engaged while it is working; the first one
-// is what engages FEC in the first place (while FEC is idle, the peer sees no
-// protected packets, and therefore has nothing to report).
-func (e *fecEncoder) evaluate(now monotime.Time, sentPackets, lostPackets uint64, force bool) {
-	if !force && !e.lastEvaluation.IsZero() && now.Sub(e.lastEvaluation) < fecEvaluationInterval {
+// tick re-evaluates the loss rate. The loss rate of the path is measured by the peer
+// (it sees the gaps in the packet number sequence), so the loss rate decays towards
+// zero if the peer's reports stop arriving.
+func (e *fecEncoder) tick(now monotime.Time) {
+	if !e.lastEvaluation.IsZero() && now.Sub(e.lastEvaluation) < fecEvaluationInterval {
 		return
 	}
-	var selfLoss float64
-	if sentPackets > e.lastSentPackets {
-		deltaSent := sentPackets - e.lastSentPackets
-		deltaLost := uint64(0)
-		if lostPackets > e.lastLostPackets {
-			deltaLost = lostPackets - e.lastLostPackets
-		}
-		if deltaLost > deltaSent {
-			deltaLost = deltaSent
-		}
-		selfLoss = float64(deltaLost) / float64(deltaSent)
-	}
-	e.lastSentPackets = sentPackets
-	e.lastLostPackets = lostPackets
 	e.lastEvaluation = now
-
-	var peerLoss float64
+	var sample float64
 	if !e.peerLossTime.IsZero() && now.Sub(e.peerLossTime) < fecPeerLossValidity {
-		peerLoss = e.peerLoss
+		sample = e.peerLoss
 	}
-	sample := max(selfLoss, peerLoss)
-	if sample > 0 || e.lossEWMA > 0 {
-		e.lossEWMA = fecLossEWMAAlpha*sample + (1-fecLossEWMAAlpha)*e.lossEWMA
-	}
-	e.state.setLossRate(e.lossEWMA)
-	e.updateRedundancy()
+	e.updateLoss(sample)
 }
 
-func (e *fecEncoder) onFeedback(feedback *wire.FECFeedbackFrame, sentPackets, lostPackets uint64, now monotime.Time) {
-	if e.feedbackSeen && feedback.ProtectedPackets >= e.fbProtected {
-		if deltaProtected := feedback.ProtectedPackets - e.fbProtected; deltaProtected > 0 {
-			deltaRecovered := uint64(0)
-			if feedback.RecoveredPackets > e.fbRecovered {
-				deltaRecovered = feedback.RecoveredPackets - e.fbRecovered
+// onFeedback processes a loss report of the peer. The counters are cumulative, so a
+// lost feedback packet degrades nothing but the freshness of the report.
+func (e *fecEncoder) onFeedback(feedback *wire.FECFeedbackFrame, now monotime.Time) {
+	if e.feedbackSeen && feedback.ReceivedPackets >= e.fbReceived && feedback.LostPackets >= e.fbLost {
+		deltaReceived := feedback.ReceivedPackets - e.fbReceived
+		deltaLost := feedback.LostPackets - e.fbLost
+		if deltaReceived+deltaLost > 0 {
+			lost := deltaLost
+			if lost > deltaReceived+deltaLost {
+				lost = deltaReceived + deltaLost
 			}
-			deltaFailed := uint64(0)
-			if feedback.FailedPackets > e.fbFailed {
-				deltaFailed = feedback.FailedPackets - e.fbFailed
-			}
-			lost := deltaRecovered + deltaFailed
-			if lost > deltaProtected {
-				lost = deltaProtected
-			}
-			e.peerLoss = float64(lost) / float64(deltaProtected)
+			e.peerLoss = float64(lost) / float64(deltaReceived+deltaLost)
 			e.peerLossTime = now
 		}
 	}
-	e.fbProtected = feedback.ProtectedPackets
+	e.fbReceived = feedback.ReceivedPackets
+	e.fbLost = feedback.LostPackets
 	e.fbRecovered = feedback.RecoveredPackets
 	e.fbFailed = feedback.FailedPackets
 	e.feedbackSeen = true
-	e.evaluate(now, sentPackets, lostPackets, true)
+	e.lastEvaluation = now
+	e.updateLoss(e.peerLoss)
+}
+
+func (e *fecEncoder) updateLoss(sample float64) {
+	if sample < 0 {
+		sample = 0
+	}
+	e.lossEWMA = fecLossEWMAAlpha*sample + (1-fecLossEWMAAlpha)*e.lossEWMA
+	e.state.setLossRate(e.lossEWMA)
+	e.updateRedundancy()
 }
 
 func (e *fecEncoder) updateRedundancy() {
@@ -788,9 +771,78 @@ type fecDecoder struct {
 	pending      map[uint64]*fecPendingGroup
 	pendingOrder []uint64
 
-	feedbackPending   bool
-	feedbackProtected uint64
-	feedbackTime      monotime.Time
+	// tracker measures the packet loss rate of the path, independently of whether
+	// packets are FEC protected. This is what makes the sender engage FEC.
+	tracker fecLossTracker
+
+	feedbackTime         monotime.Time
+	reportedReceived     uint64
+	reportedLost         uint64
+}
+
+// fecLossTracker measures the loss rate of the path by looking at the gaps in the
+// received 1-RTT packet numbers. A packet number is only counted as lost once it is
+// fecReorderWindow packets behind the largest received packet number, so that packets
+// that were merely reordered are not counted as lost.
+type fecLossTracker struct {
+	initialized  bool
+	largest      protocol.PacketNumber
+	watermark    protocol.PacketNumber
+	seen         map[protocol.PacketNumber]struct{}
+	presumedLost map[protocol.PacketNumber]struct{}
+	received     uint64
+	lost         uint64
+}
+
+func (t *fecLossTracker) record(pn protocol.PacketNumber) {
+	t.received++
+	if !t.initialized {
+		t.initialized = true
+		t.largest = pn
+		t.watermark = pn - 1
+		t.seen = make(map[protocol.PacketNumber]struct{})
+		t.presumedLost = make(map[protocol.PacketNumber]struct{})
+		return
+	}
+	if pn > t.largest {
+		t.largest = pn
+	}
+	if pn <= t.watermark {
+		// A packet that arrived late: undo the "presumed lost" if we counted one.
+		if _, ok := t.presumedLost[pn]; ok {
+			delete(t.presumedLost, pn)
+			if t.lost > 0 {
+				t.lost--
+			}
+		}
+		return
+	}
+	t.seen[pn] = struct{}{}
+	newWatermark := t.largest - fecReorderWindow
+	if newWatermark <= t.watermark {
+		return
+	}
+	if newWatermark-t.watermark > fecMaxTrackerJump {
+		// Don't account for absurd jumps (this can only be caused by a misbehaving
+		// peer): start over.
+		t.initialized = false
+		t.record(pn)
+		return
+	}
+	for pn := t.watermark + 1; pn <= newWatermark; pn++ {
+		if _, ok := t.seen[pn]; ok {
+			delete(t.seen, pn)
+			continue
+		}
+		t.lost++
+		t.presumedLost[pn] = struct{}{}
+	}
+	t.watermark = newWatermark
+	for pn := range t.presumedLost {
+		if pn < t.watermark-fecReorderWindow {
+			delete(t.presumedLost, pn)
+		}
+	}
 }
 
 func (d *fecDecoder) cacheSize() int {
@@ -809,6 +861,7 @@ func (d *fecDecoder) reset() {
 }
 
 func (d *fecDecoder) recordPacket(pn protocol.PacketNumber, data []byte, keyPhase protocol.KeyPhaseBit) {
+	d.tracker.record(pn)
 	if d.haveKeyPhase && keyPhase != d.keyPhase {
 		// Packets of the previous key phase can't be decrypted anymore.
 		d.reset()
@@ -847,7 +900,6 @@ func (d *fecDecoder) handleRepair(frame *wire.FECRepairFrame, now monotime.Time)
 		d.pending[frame.Group] = group
 		d.pendingOrder = append(d.pendingOrder, frame.Group)
 		d.state.protectedRecv.Add(frame.PacketCount)
-		d.feedbackProtected += frame.PacketCount
 		for len(d.pendingOrder) > fecMaxPendingGroups {
 			evicted := d.pendingOrder[0]
 			d.pendingOrder = d.pendingOrder[1:]
@@ -871,7 +923,6 @@ func (d *fecDecoder) handleRepair(frame *wire.FECRepairFrame, now monotime.Time)
 	}
 	if len(missing) == 0 {
 		delete(d.pending, frame.Group)
-		d.maybeQueueFeedback(now)
 		return nil
 	}
 	rows := d.pendingRows(group, frame)
@@ -882,7 +933,6 @@ func (d *fecDecoder) handleRepair(frame *wire.FECRepairFrame, now monotime.Time)
 	if len(rows) < len(missing) {
 		d.state.failedRecv.Add(uint64(len(missing)))
 		delete(d.pending, frame.Group)
-		d.maybeQueueFeedback(now)
 		return nil
 	}
 	recovered := fecRecover(rows, frame, missing, d.cache)
@@ -892,7 +942,6 @@ func (d *fecDecoder) handleRepair(frame *wire.FECRepairFrame, now monotime.Time)
 		d.state.recoveredRecv.Add(uint64(len(recovered)))
 	}
 	delete(d.pending, frame.Group)
-	d.maybeQueueFeedback(now)
 	return recovered
 }
 
@@ -1008,28 +1057,26 @@ func fecSolve(matrix [][]byte, rhs [][]byte) bool {
 	return true
 }
 
-func (d *fecDecoder) maybeQueueFeedback(now monotime.Time) {
-	if d.feedbackPending {
-		return
-	}
-	if d.feedbackProtected < fecFeedbackMinProtected {
-		return
-	}
-	if !d.feedbackTime.IsZero() && now.Sub(d.feedbackTime) < fecFeedbackInterval {
-		return
-	}
-	d.feedbackPending = true
-}
 
+// pendingFeedback returns a feedback frame if a new loss report is due. The loss rate
+// of the path is measured locally (packet number gaps), so reports are sent even
+// while FEC is idle: they are what makes the sender engage FEC in the first place.
 func (d *fecDecoder) pendingFeedback(now monotime.Time) *wire.FECFeedbackFrame {
-	if !d.feedbackPending {
+	if !d.tracker.initialized {
 		return nil
 	}
-	d.feedbackPending = false
-	d.feedbackProtected = 0
+	if !d.feedbackTime.IsZero() && now.Sub(d.feedbackTime) < fecFeedbackInterval {
+		return nil
+	}
+	if d.tracker.received == d.reportedReceived && d.tracker.lost == d.reportedLost {
+		return nil
+	}
 	d.feedbackTime = now
+	d.reportedReceived = d.tracker.received
+	d.reportedLost = d.tracker.lost
 	return &wire.FECFeedbackFrame{
-		ProtectedPackets: d.state.protectedRecv.Load(),
+		ReceivedPackets:  d.tracker.received,
+		LostPackets:      d.tracker.lost,
 		RecoveredPackets: d.state.recoveredRecv.Load(),
 		FailedPackets:    d.state.failedRecv.Load(),
 		ParityPackets:    d.state.parityRecv.Load(),

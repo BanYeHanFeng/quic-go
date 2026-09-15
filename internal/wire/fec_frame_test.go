@@ -25,12 +25,12 @@ func TestFECRepairFrameRoundTrip(t *testing.T) {
 	if frame.Length(protocol.Version1) != protocol.ByteCount(len(data)) {
 		t.Fatalf("length mismatch: %d vs %d", frame.Length(protocol.Version1), len(data))
 	}
-	parsed, n, err := parseFECRepairFrame(data, protocol.Version1)
+	parsed, n, err := parseFECRepairFrame(data[1:], protocol.Version1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != len(data) {
-		t.Fatalf("expected to consume %d bytes, consumed %d", len(data), n)
+	if n != len(data)-1 {
+		t.Fatalf("expected to consume %d bytes, consumed %d", len(data)-1, n)
 	}
 	if parsed.Group != frame.Group || parsed.Row != frame.Row || parsed.RowCount != frame.RowCount {
 		t.Fatalf("unexpected group/row: %+v", parsed)
@@ -79,7 +79,7 @@ func TestFECRepairFrameTruncated(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 1; i < len(data); i++ {
-		if _, _, err := parseFECRepairFrame(data[:i], protocol.Version1); err == nil {
+		if _, _, err := parseFECRepairFrame(data[1:i], protocol.Version1); err == nil {
 			t.Fatalf("expected an error for a truncated frame of %d bytes", i)
 		}
 	}
@@ -107,7 +107,7 @@ func TestFECRepairFrameInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := parseFECRepairFrame(invalidData, protocol.Version1); err == nil {
+	if _, _, err := parseFECRepairFrame(invalidData[1:], protocol.Version1); err == nil {
 		t.Fatal("expected an error for a mismatching parity length")
 	}
 	// a single protected packet is invalid
@@ -119,7 +119,7 @@ func TestFECRepairFrameInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := parseFECRepairFrame(invalidData, protocol.Version1); err == nil {
+	if _, _, err := parseFECRepairFrame(invalidData[1:], protocol.Version1); err == nil {
 		t.Fatal("expected an error for a single protected packet")
 	}
 	if len(data) == 0 {
@@ -129,8 +129,9 @@ func TestFECRepairFrameInvalid(t *testing.T) {
 
 func TestFECFeedbackFrameRoundTrip(t *testing.T) {
 	frame := &FECFeedbackFrame{
-		ProtectedPackets: 1234,
-		RecoveredPackets: 17,
+		ReceivedPackets:  1234,
+		LostPackets:      17,
+		RecoveredPackets: 12,
 		FailedPackets:    3,
 		ParityPackets:    99,
 	}
@@ -141,12 +142,12 @@ func TestFECFeedbackFrameRoundTrip(t *testing.T) {
 	if frame.Length(protocol.Version1) != protocol.ByteCount(len(data)) {
 		t.Fatalf("length mismatch: %d vs %d", frame.Length(protocol.Version1), len(data))
 	}
-	parsed, n, err := parseFECFeedbackFrame(data, protocol.Version1)
+	parsed, n, err := parseFECFeedbackFrame(data[1:], protocol.Version1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != len(data) {
-		t.Fatalf("expected to consume %d bytes, consumed %d", len(data), n)
+	if n != len(data)-1 {
+		t.Fatalf("expected to consume %d bytes, consumed %d", len(data)-1, n)
 	}
 	if *parsed != *frame {
 		t.Fatalf("unexpected frame: %+v", parsed)

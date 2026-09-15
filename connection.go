@@ -2700,7 +2700,8 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 		c.sendQueue.Send(buf, uint16(maxSize), ecn)
 
 		if dontSendMore {
-			return nil
+			_, err := c.maybeSendFECPackets(now)
+			return err
 		}
 		if c.sendQueue.WouldBlock() {
 			return nil

@@ -200,11 +200,14 @@ func (f *FECRepairFrame) Length(_ protocol.Version) protocol.ByteCount {
 //
 // Wire format:
 //
-//	0x33 | protected packets | recovered packets | failed packets | parity packets
+//	0x33 | received packets | lost packets | recovered packets | failed packets | parity packets
 type FECFeedbackFrame struct {
-	// ProtectedPackets is the number of protected packets that were part of a group
-	// for which a parity row was received.
-	ProtectedPackets uint64
+	// ReceivedPackets is the number of 1-RTT packets received by the peer.
+	ReceivedPackets uint64
+	// LostPackets is the number of packet numbers the peer never received (gaps in
+	// the packet number sequence). This is the loss rate of the path, independent of
+	// whether the packets were protected by FEC.
+	LostPackets uint64
 	// RecoveredPackets is the number of packets that were reconstructed from parity.
 	RecoveredPackets uint64
 	// FailedPackets is the number of protected packets that were still missing after
@@ -217,7 +220,7 @@ type FECFeedbackFrame struct {
 func parseFECFeedbackFrame(b []byte, _ protocol.Version) (*FECFeedbackFrame, int, error) {
 	startLen := len(b)
 	f := &FECFeedbackFrame{}
-	fields := []*uint64{&f.ProtectedPackets, &f.RecoveredPackets, &f.FailedPackets, &f.ParityPackets}
+	fields := []*uint64{&f.ReceivedPackets, &f.LostPackets, &f.RecoveredPackets, &f.FailedPackets, &f.ParityPackets}
 	for _, field := range fields {
 		value, l, err := quicvarint.Parse(b)
 		if err != nil {
@@ -231,7 +234,8 @@ func parseFECFeedbackFrame(b []byte, _ protocol.Version) (*FECFeedbackFrame, int
 
 func (f *FECFeedbackFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
 	b = quicvarint.Append(b, uint64(FrameTypeFECFeedback))
-	b = quicvarint.Append(b, f.ProtectedPackets)
+	b = quicvarint.Append(b, f.ReceivedPackets)
+	b = quicvarint.Append(b, f.LostPackets)
 	b = quicvarint.Append(b, f.RecoveredPackets)
 	b = quicvarint.Append(b, f.FailedPackets)
 	b = quicvarint.Append(b, f.ParityPackets)
@@ -241,7 +245,8 @@ func (f *FECFeedbackFrame) Append(b []byte, _ protocol.Version) ([]byte, error) 
 func (f *FECFeedbackFrame) Length(_ protocol.Version) protocol.ByteCount {
 	return protocol.ByteCount(
 		quicvarint.Len(uint64(FrameTypeFECFeedback)) +
-			quicvarint.Len(f.ProtectedPackets) +
+			quicvarint.Len(f.ReceivedPackets) +
+			quicvarint.Len(f.LostPackets) +
 			quicvarint.Len(f.RecoveredPackets) +
 			quicvarint.Len(f.FailedPackets) +
 			quicvarint.Len(f.ParityPackets),
