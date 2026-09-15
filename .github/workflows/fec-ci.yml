@@ -43,19 +43,3 @@ jobs:
         run: go test -count=1 -race -v -run 'TestFEC.*(Path|LostPackets)' -timeout 20m ./
       - name: 全部测试
         run: go test -count=1 ./... || true
-      - name: gofmt 自动格式化并回推
-        if: github.ref == 'refs/heads/fec-dev' && github.event_name == 'push'
-        run: |
-          set -euo pipefail
-          files="fec.go fec_test.go fec_integration_test.go internal/wire/fec_frame.go internal/wire/fec_frame_test.go"
-          gofmt -w ${files}
-          if git diff --quiet; then
-            echo "格式无需修改"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "样式: gofmt 自动格式化 FEC 代码"
-          git push
-
