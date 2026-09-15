@@ -71,7 +71,7 @@ func LogFrame(logger utils.Logger, frame Frame, sent bool) {
 	case *FECRepairFrame:
 		logger.Debugf("\t%s &wire.FECRepairFrame{Group: %d, Row: %d, Count: %d, First: %d, Parity length: %d}", dir, f.Group, f.Row, f.PacketCount, f.FirstPacketNumber, len(f.Parity))
 	case *FECFeedbackFrame:
-		logger.Debugf("\t%s &wire.FECFeedbackFrame{Protected: %d, Recovered: %d, Failed: %d, Parity: %d}", dir, f.ProtectedPackets, f.RecoveredPackets, f.FailedPackets, f.ParityPackets)
+		logger.Debugf("\t%s &wire.FECFeedbackFrame{Received: %d, Lost: %d, Recovered: %d, Failed: %d, Parity: %d}", dir, f.ReceivedPackets, f.LostPackets, f.RecoveredPackets, f.FailedPackets, f.ParityPackets)
 	default:
 		logger.Debugf("\t%s %#v", dir, frame)
 	}
