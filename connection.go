@@ -2670,12 +2670,6 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 		}
 
 		if !dontSendMore {
-			if _, err := c.maybeSendFECPackets(now); err != nil {
-				return err
-			}
-		}
-
-		if !dontSendMore {
 			sendMode := c.sentPacketHandler.SendMode(now)
 			if sendMode == ackhandler.SendPacingLimited {
 				c.resetPacingDeadline()
@@ -2699,9 +2693,15 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 
 		c.sendQueue.Send(buf, uint16(maxSize), ecn)
 
-		if dontSendMore {
-			_, err := c.maybeSendFECPackets(now)
+		// Send pending FEC packets only after the batch has been handed to the send
+		// queue. The queue is bounded, and a FEC packet must not take the slot that
+		// the next batch needs.
+		if _, err := c.maybeSendFECPackets(now); err != nil {
 			return err
+		}
+
+		if dontSendMore {
+			return nil
 		}
 		if c.sendQueue.WouldBlock() {
 			return nil

@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -282,5 +283,176 @@ func TestFECRecoversLostPackets(t *testing.T) {
 	}
 	if stats.RecoveredPackets == 0 {
 		t.Fatalf("no packet was reconstructed from parity: %+v", stats)
+	}
+}
+
+// gsoTestPair sets up a client and a server on real UDP sockets (which enables GSO on
+// Linux), with a userspace UDP relay in between that drops every n-th packet in both
+// directions. Unlike lossyPacketConn (which hides the socket optimizations from
+// quic-go), this exercises the GSO send path together with FEC.
+type gsoTestPair struct {
+	clientConn      *Conn
+	serverConn      *Conn
+	clientTransport *Transport
+	serverTransport *Transport
+	listener        *Listener
+	relay           *udpDropRelay
+}
+
+func (p *gsoTestPair) Close() {
+	if p.clientConn != nil {
+		_ = p.clientConn.CloseWithError(0, "")
+	}
+	if p.serverConn != nil {
+		_ = p.serverConn.CloseWithError(0, "")
+	}
+	if p.listener != nil {
+		_ = p.listener.Close()
+	}
+	if p.clientTransport != nil {
+		_ = p.clientTransport.Close()
+	}
+	if p.serverTransport != nil {
+		_ = p.serverTransport.Close()
+	}
+	if p.relay != nil {
+		p.relay.Close()
+	}
+}
+
+// udpDropRelay forwards UDP packets between a client and a server, dropping every
+// dropEvery-th packet (in both directions).
+type udpDropRelay struct {
+	conn      *net.UDPConn
+	upstream  *net.UDPAddr
+	dropEvery int64
+	counter   atomic.Int64
+	client    atomic.Pointer[net.UDPAddr]
+	closeOnce sync.Once
+}
+
+func newUDPDropRelay(upstream *net.UDPAddr, dropEvery int64) (*udpDropRelay, error) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return nil, err
+	}
+	relay := &udpDropRelay{conn: conn, upstream: upstream, dropEvery: dropEvery}
+	go relay.run()
+	return relay, nil
+}
+
+func (r *udpDropRelay) Addr() net.Addr { return r.conn.LocalAddr() }
+
+func (r *udpDropRelay) Close() {
+	r.closeOnce.Do(func() { _ = r.conn.Close() })
+}
+
+func (r *udpDropRelay) run() {
+	buffer := make([]byte, 65535)
+	for {
+		n, addr, err := r.conn.ReadFromUDP(buffer)
+		if err != nil {
+			return
+		}
+		if r.counter.Add(1)%r.dropEvery == 0 {
+			continue
+		}
+		if addr.Port == r.upstream.Port && addr.IP.Equal(r.upstream.IP) {
+			// downstream: server -> client
+			if client := r.client.Load(); client != nil {
+				_, _ = r.conn.WriteToUDP(buffer[:n], client)
+			}
+			continue
+		}
+		// upstream: client -> server
+		r.client.Store(addr)
+		_, _ = r.conn.WriteToUDP(buffer[:n], r.upstream)
+	}
+}
+
+func newGSOTestPair(t *testing.T, dropEvery int64) *gsoTestPair {
+	t.Helper()
+	serverTLS, clientTLS := testTLSConfigs(t)
+	serverUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testConfig := &Config{
+		MaxIdleTimeout:  2 * time.Minute,
+		KeepAlivePeriod: 5 * time.Second,
+	}
+	serverTransport := &Transport{Conn: serverUDP}
+	listener, err := serverTransport.Listen(serverTLS, testConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay, err := newUDPDropRelay(serverUDP.LocalAddr().(*net.UDPAddr), dropEvery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	acceptCh := make(chan *Conn, 1)
+	acceptErrCh := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			acceptErrCh <- err
+			return
+		}
+		acceptCh <- conn
+	}()
+	clientUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTransport := &Transport{Conn: clientUDP}
+	clientConn, err := clientTransport.Dial(ctx, relay.Addr(), clientTLS, testConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair := &gsoTestPair{
+		clientConn:      clientConn,
+		clientTransport: clientTransport,
+		serverTransport: serverTransport,
+		listener:        listener,
+		relay:           relay,
+	}
+	var serverConn *Conn
+	select {
+	case serverConn = <-acceptCh:
+	case err := <-acceptErrCh:
+		pair.Close()
+		t.Fatal(err)
+	case <-ctx.Done():
+		pair.Close()
+		t.Fatal("timeout accepting the QUIC connection")
+	}
+	pair.serverConn = serverConn
+	return pair
+}
+
+// TestFECRecoversLostPacketsGSO is the same test as TestFECRecoversLostPackets, but on
+// real UDP sockets: on Linux quic-go sends batches of packets with GSO there, a code
+// path that a wrapped (non OOB capable) packet connection doesn't exercise.
+func TestFECRecoversLostPacketsGSO(t *testing.T) {
+	pair := newGSOTestPair(t, 8)
+	defer pair.Close()
+	<-pair.clientConn.HandshakeComplete()
+	enableFEC(t, pair.clientConn, "client")
+	enableFEC(t, pair.serverConn, "server")
+
+	payload := randomPacket(t, 4*1024*1024)
+	received := transfer(t, pair.clientConn, pair.serverConn, payload)
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("payload mismatch: got %d bytes, expected %d", len(received), len(payload))
+	}
+	clientStats := pair.clientConn.FECStats()
+	serverStats := pair.serverConn.FECStats()
+	if clientStats.ParityPacketsSent == 0 {
+		t.Fatalf("no parity packet was sent over the GSO path: %+v", clientStats)
+	}
+	if serverStats.RecoveredPackets == 0 {
+		t.Fatalf("no packet was reconstructed from parity: %+v", serverStats)
 	}
 }
