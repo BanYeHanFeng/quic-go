@@ -2746,14 +2746,16 @@ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
 	p, buf, err := c.packer.PackAckOnlyPacket(c.maxPacketSize(), now, c.version)
 	if err != nil {
 		if err == errNothingToPack {
-			return nil
+			_, err = c.maybeSendFECPackets(now)
+			return err
 		}
 		return err
 	}
 	c.logShortHeaderPacket(p, ecn, buf.Len())
 	c.registerPackedShortHeaderPacket(p, ecn, now)
 	c.sendQueue.Send(buf, 0, ecn)
-	return nil
+	_, err = c.maybeSendFECPackets(now)
+	return err
 }
 
 func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time) error {

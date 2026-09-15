@@ -50,7 +50,7 @@ const (
 	fecHighLossThreshold = 0.12
 
 	// fecFeedbackInterval is the minimum interval between two FEC_FEEDBACK frames.
-	fecFeedbackInterval = 50 * time.Millisecond
+	fecFeedbackInterval = 20 * time.Millisecond
 	// fecEvaluationInterval is how often the sender re-evaluates the loss rate.
 	fecEvaluationInterval = 30 * time.Millisecond
 	// fecPeerLossValidity is how long a loss report from the peer is considered
@@ -606,17 +606,23 @@ func (e *fecEncoder) tick(now monotime.Time) {
 // onFeedback processes a loss report of the peer. The counters are cumulative, so a
 // lost feedback packet degrades nothing but the freshness of the report.
 func (e *fecEncoder) onFeedback(feedback *wire.FECFeedbackFrame, now monotime.Time) {
-	if e.feedbackSeen && feedback.ReceivedPackets >= e.fbReceived && feedback.LostPackets >= e.fbLost {
-		deltaReceived := feedback.ReceivedPackets - e.fbReceived
-		deltaLost := feedback.LostPackets - e.fbLost
-		if deltaReceived+deltaLost > 0 {
-			lost := deltaLost
-			if lost > deltaReceived+deltaLost {
-				lost = deltaReceived + deltaLost
-			}
-			e.peerLoss = float64(lost) / float64(deltaReceived+deltaLost)
-			e.peerLossTime = now
+	var deltaReceived, deltaLost uint64
+	if !e.feedbackSeen {
+		// The first report already carries the counters observed since the connection
+		// was established, so it can be used right away.
+		deltaReceived = feedback.ReceivedPackets
+		deltaLost = feedback.LostPackets
+	} else if feedback.ReceivedPackets >= e.fbReceived && feedback.LostPackets >= e.fbLost {
+		deltaReceived = feedback.ReceivedPackets - e.fbReceived
+		deltaLost = feedback.LostPackets - e.fbLost
+	}
+	if deltaReceived+deltaLost > 0 {
+		lost := deltaLost
+		if lost > deltaReceived+deltaLost {
+			lost = deltaReceived + deltaLost
 		}
+		e.peerLoss = float64(lost) / float64(deltaReceived+deltaLost)
+		e.peerLossTime = now
 	}
 	e.fbReceived = feedback.ReceivedPackets
 	e.fbLost = feedback.LostPackets
@@ -839,7 +845,7 @@ func (t *fecLossTracker) record(pn protocol.PacketNumber) {
 	}
 	t.watermark = newWatermark
 	for pn := range t.presumedLost {
-		if pn < t.watermark-fecReorderWindow {
+		if pn < t.watermark-4*fecReorderWindow {
 			delete(t.presumedLost, pn)
 		}
 	}

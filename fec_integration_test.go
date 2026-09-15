@@ -271,7 +271,7 @@ func TestFECRecoversLostPackets(t *testing.T) {
 	pair.clientLossy.dropEvery.Store(8)
 	pair.serverLossy.dropEvery.Store(8)
 
-	payload := randomPacket(t, 512*1024)
+	payload := randomPacket(t, 4*1024*1024)
 	received := transfer(t, pair.clientConn, pair.serverConn, payload)
 	if !bytes.Equal(received, payload) {
 		t.Fatalf("payload mismatch: got %d bytes, expected %d", len(received), len(payload))
