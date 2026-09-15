@@ -556,7 +556,7 @@ func (e *fecEncoder) repairHeaderReserve(groupSize int) protocol.ByteCount {
 	if groupSize < 1 {
 		return 0
 	}
-	return protocol.ByteCount(1 + 4 + 1 + 1 + 2 + 4 + 2) +
+	return protocol.ByteCount(1+4+1+1+2+4+2) +
 		protocol.ByteCount(groupSize-1) +
 		protocol.ByteCount(groupSize*2) +
 		2
@@ -775,9 +775,9 @@ type fecDecoder struct {
 	// packets are FEC protected. This is what makes the sender engage FEC.
 	tracker fecLossTracker
 
-	feedbackTime         monotime.Time
-	reportedReceived     uint64
-	reportedLost         uint64
+	feedbackTime     monotime.Time
+	reportedReceived uint64
+	reportedLost     uint64
 }
 
 // fecLossTracker measures the loss rate of the path by looking at the gaps in the
@@ -1056,7 +1056,6 @@ func fecSolve(matrix [][]byte, rhs [][]byte) bool {
 	}
 	return true
 }
-
 
 // pendingFeedback returns a feedback frame if a new loss report is due. The loss rate
 // of the path is measured locally (packet number gaps), so reports are sent even
