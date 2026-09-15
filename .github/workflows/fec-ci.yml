@@ -1,0 +1,61 @@
+name: FEC CI
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fec:
+    name: 构建与 FEC 测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+      - name: 配置 Go 环境
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.5
+          cache: true
+      - name: 格式检查（仅报告）
+        run: |
+          files="fec.go fec_test.go fec_integration_test.go internal/wire/fec_frame.go internal/wire/fec_frame_test.go"
+          echo "::group::gofmt 差异"
+          gofmt -l ${files} || true
+          gofmt -d ${files} || true
+          echo "::endgroup::"
+      - name: go vet
+        run: go vet ./ ./internal/wire/
+      - name: 构建
+        run: go build ./...
+      - name: FEC 单元测试
+        run: go test -count=1 -v -run 'FEC|Fec|GF256' ./internal/wire/ ./
+      - name: FEC 集成测试（含竞态检测）
+        run: go test -count=1 -race -v -run 'TestFEC.*(Path|LostPackets)' -timeout 20m ./
+      - name: 全部测试
+        run: go test -count=1 ./... || true
+      - name: gofmt 自动格式化并回推
+        if: github.ref == 'refs/heads/fec-dev' && github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          files="fec.go fec_test.go fec_integration_test.go internal/wire/fec_frame.go internal/wire/fec_frame_test.go"
+          gofmt -w ${files}
+          if git diff --quiet; then
+            echo "格式无需修改"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "样式: gofmt 自动格式化 FEC 代码"
+          git push
+

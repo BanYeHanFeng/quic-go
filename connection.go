@@ -167,6 +167,8 @@ type Conn struct {
 
 	maxPayloadSizeEstimate atomic.Uint32
 
+	fecState atomic.Pointer[fecState]
+
 	initialStream       *initialCryptoStream
 	handshakeStream     *cryptoStream
 	oneRTTStream        *cryptoStream // only set for the server
@@ -925,6 +927,10 @@ func (c *Conn) maybeResetTimer() {
 	if !c.pacingDeadline.IsZero() && c.pacingDeadline.Before(deadline) {
 		deadline = c.pacingDeadline
 	}
+	// A partial FEC group is protected once it has been idle for the flush delay.
+	if t := c.fecFlushDeadline(); !t.IsZero() && t.Before(deadline) {
+		deadline = t
+	}
 	c.timer.Reset(monotime.Until(deadline))
 }
 
@@ -1238,6 +1244,9 @@ func (c *Conn) handleShortHeaderPacket(
 		return false, err
 	}
 	c.largestRcvdAppData = max(c.largestRcvdAppData, pn)
+	// Keep the packet around: if packet level FEC is enabled, it may be needed to
+	// reconstruct a lost packet of the same FEC group.
+	c.fecRecordReceivedPacket(pn, p.data, keyPhase)
 
 	if c.logger.Debug() {
 		c.logger.Debugf("<- Reading packet %d (%d bytes) for connection %s, 1-RTT", pn, p.Size(), destConnID)
@@ -1975,6 +1984,10 @@ func (c *Conn) handleFrame(
 		err = c.connIDGenerator.Retire(frame.SequenceNumber, destConnID, rcvTime.Add(3*c.rttStats.PTO(false)))
 	case *wire.HandshakeDoneFrame:
 		err = c.handleHandshakeDoneFrame(rcvTime)
+	case *wire.FECRepairFrame:
+		err = c.handleFECRepairFrame(frame, rcvTime)
+	case *wire.FECFeedbackFrame:
+		c.handleFECFeedbackFrame(frame, rcvTime)
 	default:
 		err = fmt.Errorf("unexpected frame type: %s", reflect.ValueOf(&frame).Elem().Type().Name())
 	}
@@ -2597,16 +2610,21 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 	for {
 		buf := getPacketBuffer()
 		ecn := c.sentPacketHandler.ECNMode(true)
-		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
+		if _, err := c.appendOneShortHeaderPacket(buf, c.dataPacketSizeLimit(), ecn, now); err != nil {
 			if err == errNothingToPack {
 				buf.Release()
 				c.sentPacketHandler.MaybeNotifyAppLimited()
-				return nil
+				_, err = c.maybeSendFECPackets(now)
+				return err
 			}
 			return err
 		}
 
 		c.sendQueue.Send(buf, 0, ecn)
+
+		if _, err := c.maybeSendFECPackets(now); err != nil {
+			return err
+		}
 
 		if c.sendQueue.WouldBlock() {
 			return nil
@@ -2632,7 +2650,7 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 
 func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 	buf := getLargePacketBuffer()
-	maxSize := c.maxPacketSize()
+	maxSize := c.dataPacketSizeLimit()
 
 	ecn := c.sentPacketHandler.ECNMode(true)
 	for {
@@ -2645,9 +2663,16 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 			c.sentPacketHandler.MaybeNotifyAppLimited()
 			if buf.Len() == 0 {
 				buf.Release()
-				return nil
+				_, err = c.maybeSendFECPackets(now)
+				return err
 			}
 			dontSendMore = true
+		}
+
+		if !dontSendMore {
+			if _, err := c.maybeSendFECPackets(now); err != nil {
+				return err
+			}
 		}
 
 		if !dontSendMore {
@@ -2780,6 +2805,10 @@ func (c *Conn) appendOneShortHeaderPacket(buf *packetBuffer, maxSize protocol.By
 	size := buf.Len() - startLen
 	c.logShortHeaderPacket(p, ecn, size)
 	c.registerPackedShortHeaderPacket(p, ecn, now)
+	// Hand the packet to the FEC encoder. The encoder only reads the packet here
+	// (before the buffer is handed over to the send queue) and accumulates the
+	// parity of the current FEC group.
+	c.fecRecordSentPacket(p.PacketNumber, buf.Data[int(startLen):int(startLen+size)], maxSize, now)
 	return size, nil
 }
 

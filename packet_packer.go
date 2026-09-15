@@ -26,6 +26,7 @@ type packer interface {
 	PackApplicationClose(*qerr.ApplicationError, protocol.ByteCount, protocol.Version) (*coalescedPacket, error)
 	PackPathProbePacket(protocol.ConnectionID, []ackhandler.Frame, protocol.Version) (shortHeaderPacket, *packetBuffer, error)
 	PackMTUProbePacket(ping ackhandler.Frame, size protocol.ByteCount, v protocol.Version) (shortHeaderPacket, *packetBuffer, error)
+	PackFECPacket(frame wire.Frame, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, *packetBuffer, error)
 
 	SetToken([]byte)
 }
@@ -515,6 +516,31 @@ func (p *packetPacker) PackAckOnlyPacket(maxSize protocol.ByteCount, now monotim
 // It should be called after the handshake is confirmed.
 func (p *packetPacker) AppendPacket(buf *packetBuffer, maxSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, error) {
 	return p.appendPacket(buf, false, maxSize, now, v)
+}
+
+// PackFECPacket packs a packet containing a single packet level FEC frame
+// (a FEC_REPAIR or FEC_FEEDBACK frame).
+func (p *packetPacker) PackFECPacket(frame wire.Frame, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+	sealer, err := p.cryptoSetup.Get1RTTSealer()
+	if err != nil {
+		return shortHeaderPacket{}, nil, err
+	}
+	connID := p.getDestConnID()
+	pn, pnLen := p.pnManager.PeekPacketNumber(protocol.Encryption1RTT)
+	pl := payload{
+		frames: []ackhandler.Frame{{Frame: frame}},
+		length: frame.Length(v),
+	}
+	if wire.ShortHeaderLen(connID, pnLen)+pl.length+protocol.ByteCount(sealer.Overhead()) > maxPacketSize {
+		return shortHeaderPacket{}, nil, errFECFrameTooLarge
+	}
+	buffer := getPacketBuffer()
+	packet, err := p.appendShortHeaderPacket(buffer, connID, pn, pnLen, sealer.KeyPhase(), pl, 0, maxPacketSize, sealer, false, v)
+	if err != nil {
+		buffer.Release()
+		return shortHeaderPacket{}, nil, err
+	}
+	return packet, buffer, nil
 }
 
 func (p *packetPacker) appendPacket(

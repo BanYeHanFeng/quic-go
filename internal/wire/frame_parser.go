@@ -55,7 +55,12 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
 		valid := ft.isValidRFC9000() ||
 			(p.supportsDatagrams && ft.IsDatagramFrameType()) ||
 			(p.supportsResetStreamAt && ft == FrameTypeResetStreamAt) ||
-			(p.supportsAckFrequency && (ft == FrameTypeAckFrequency || ft == FrameTypeImmediateAck))
+			(p.supportsAckFrequency && (ft == FrameTypeAckFrequency || ft == FrameTypeImmediateAck)) ||
+			// FEC frames are accepted unconditionally. They are only acted upon if
+			// packet level FEC was enabled for this connection; this keeps a peer
+			// that enabled FEC from tearing down the connection when its parity
+			// packets arrive before the local side enabled FEC.
+			ft.IsFECFrameType()
 		if !valid {
 			return 0, parsed, &qerr.TransportError{
 				ErrorCode:    qerr.FrameEncodingError,
@@ -165,6 +170,10 @@ func (p *FrameParser) ParseLessCommonFrame(frameType FrameType, data []byte, v p
 		frame, l, err = parseAckFrequencyFrame(data, v)
 	case FrameTypeImmediateAck:
 		frame = &ImmediateAckFrame{}
+	case FrameTypeFECRepair:
+		frame, l, err = parseFECRepairFrame(data, v)
+	case FrameTypeFECFeedback:
+		frame, l, err = parseFECFeedbackFrame(data, v)
 	default:
 		err = errUnknownFrameType
 	}
