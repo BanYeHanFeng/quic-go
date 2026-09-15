@@ -380,7 +380,7 @@ type fecGroup struct {
 	packetNumbers []protocol.PacketNumber
 	lengths       []protocol.ByteCount
 	maxLength     protocol.ByteCount
-	maxPacketSize protocol.ByteCount
+	maxPacketSize protocol.ByteCount // MTU at the time the group was opened
 	// parity holds one accumulator per parity row. A member that is shorter than the
 	// longest member of the group simply doesn't contribute to the tail, which is
 	// exactly the zero-extension the receiver assumes.
@@ -478,23 +478,22 @@ func (e *fecEncoder) hasPendingRepair() bool {
 }
 
 // addPacket adds a packet that was just sent to the current FEC group.
+// maxPacketSize is the maximum size of a QUIC packet (the MTU), not the (smaller)
+// size limit that applies to FEC protected packets.
 func (e *fecEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time) {
 	if !e.protecting() || len(data) == 0 {
 		return
 	}
 	if protocol.ByteCount(len(data)) > maxPacketSize {
-		// Too large to be protected (this can happen when the packet size limit
-		// changed while the group was open). Start a new group instead of producing
-		// a parity packet that doesn't fit into a datagram.
+		// A packet that doesn't even fit into a datagram (shouldn't happen).
 		e.closeGroup(e.group, maxPacketSize)
 		e.group = nil
 		return
 	}
 	if group := e.group; group != nil {
 		if len(group.packetNumbers) >= e.groupSize ||
-			pn-group.packetNumbers[len(group.packetNumbers)-1] > fecMaxPacketDelta ||
-			group.maxPacketSize != maxPacketSize {
-			e.closeGroup(group, group.maxPacketSize)
+			pn-group.packetNumbers[len(group.packetNumbers)-1] > fecMaxPacketDelta {
+			e.closeGroup(group, maxPacketSize)
 			e.group = nil
 		}
 	}
@@ -516,7 +515,7 @@ func (e *fecEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxPacketS
 	e.group.addPacket(pn, data)
 	if len(e.group.packetNumbers) >= e.groupSize {
 		// The group is complete: protect it right away.
-		e.closeGroup(e.group, e.group.maxPacketSize)
+		e.closeGroup(e.group, maxPacketSize)
 		e.group = nil
 	}
 }
@@ -567,7 +566,7 @@ func (e *fecEncoder) pendingRepair(now monotime.Time, maxPacketSize protocol.Byt
 		return frame
 	}
 	if group := e.group; group != nil && !now.Before(group.started.Add(e.config.FlushDelay)) {
-		e.closeGroup(group, group.maxPacketSize)
+		e.closeGroup(group, maxPacketSize)
 		e.group = nil
 		if len(e.ready) > 0 {
 			frame := e.ready[0]
@@ -576,16 +575,6 @@ func (e *fecEncoder) pendingRepair(now monotime.Time, maxPacketSize protocol.Byt
 		}
 	}
 	return nil
-}
-
-// flush forces the current group to be protected, e.g. when the connection goes idle.
-func (e *fecEncoder) flush() {
-	if e.group == nil {
-		return
-	}
-	group := e.group
-	e.group = nil
-	e.closeGroup(group, group.maxPacketSize)
 }
 
 // tick re-evaluates the loss rate. The loss rate of the path is measured by the peer
