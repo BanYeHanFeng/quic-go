@@ -336,6 +336,11 @@ func (c *Conn) maybeSendFECPackets(now monotime.Time) (bool, error) {
 	if state == nil {
 		return false, nil
 	}
+	// The send queue is bounded. FEC packets are only enqueued when the caller is
+	// guaranteed to have left room for them (sendQueue.Send panics when it's full).
+	if c.sendQueue.WouldBlock() {
+		return false, nil
+	}
 	if frame := state.encoder.pendingRepair(now, c.maxPacketSize()); frame != nil {
 		if err := c.sendFECFrame(state, frame, now); err != nil {
 			return false, err
