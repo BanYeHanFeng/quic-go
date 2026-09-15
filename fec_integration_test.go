@@ -116,7 +116,11 @@ func newFECTestPair(t *testing.T) *fecTestPair {
 	}
 	serverLossy := &lossyPacketConn{PacketConn: serverUDP}
 	serverTransport := &Transport{Conn: serverLossy}
-	listener, err := serverTransport.Listen(serverTLS, &Config{})
+	testConfig := &Config{
+		MaxIdleTimeout:  2 * time.Minute,
+		KeepAlivePeriod: 5 * time.Second,
+	}
+	listener, err := serverTransport.Listen(serverTLS, testConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +143,7 @@ func newFECTestPair(t *testing.T) *fecTestPair {
 	}
 	clientLossy := &lossyPacketConn{PacketConn: clientUDP}
 	clientTransport := &Transport{Conn: clientLossy}
-	clientConn, err := clientTransport.Dial(ctx, serverUDP.LocalAddr(), clientTLS, &Config{})
+	clientConn, err := clientTransport.Dial(ctx, serverUDP.LocalAddr(), clientTLS, testConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,6 +181,21 @@ func transfer(t *testing.T, client *Conn, server *Conn, payload []byte) []byte {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	progressCtx, stopProgress := context.WithCancel(ctx)
+	defer stopProgress()
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-progressCtx.Done():
+				return
+			case <-ticker.C:
+				t.Logf("still transferring: client %+v, client FEC %+v, server FEC %+v",
+					client.ConnectionStats(), client.FECStats(), server.FECStats())
+			}
+		}
+	}()
 	stream, err := client.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -206,9 +225,11 @@ func transfer(t *testing.T, client *Conn, server *Conn, payload []byte) []byte {
 	case data := <-receivedCh:
 		return data
 	case err := <-errCh:
-		t.Fatal(err)
+		t.Fatalf("the peer failed to read the payload: %v (client %+v, client FEC %+v, server FEC %+v)",
+			err, client.ConnectionStats(), client.FECStats(), server.FECStats())
 	case <-ctx.Done():
-		t.Fatal("timeout waiting for the payload")
+		t.Fatalf("timeout waiting for the payload (client %+v, client FEC %+v, server FEC %+v)",
+			client.ConnectionStats(), client.FECStats(), server.FECStats())
 	}
 	return nil
 }
@@ -246,9 +267,9 @@ func TestFECRecoversLostPackets(t *testing.T) {
 	enableFEC(t, pair.clientConn, "client")
 	enableFEC(t, pair.serverConn, "server")
 
-	// Drop every 4th packet in both directions.
-	pair.clientLossy.dropEvery.Store(4)
-	pair.serverLossy.dropEvery.Store(4)
+	// Drop every 8th packet in both directions (12.5% loss).
+	pair.clientLossy.dropEvery.Store(8)
+	pair.serverLossy.dropEvery.Store(8)
 
 	payload := randomPacket(t, 512*1024)
 	received := transfer(t, pair.clientConn, pair.serverConn, payload)

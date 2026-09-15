@@ -800,7 +800,7 @@ func (t *fecLossTracker) record(pn protocol.PacketNumber) {
 		t.initialized = true
 		t.largest = pn
 		t.watermark = pn - 1
-		t.seen = make(map[protocol.PacketNumber]struct{})
+		t.seen = map[protocol.PacketNumber]struct{}{pn: {}}
 		t.presumedLost = make(map[protocol.PacketNumber]struct{})
 		return
 	}

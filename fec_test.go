@@ -305,8 +305,10 @@ func TestFECDecaysWithoutFeedback(t *testing.T) {
 	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 16, MinGroupSize: 2, MaxParityRows: 1}
 	state := newFECState(config)
 	now := monotime.Now()
-	feedback := &wire.FECFeedbackFrame{ReceivedPackets: 100, LostPackets: 20}
-	state.encoder.onFeedback(feedback, now)
+	// the first report only establishes the baseline of the cumulative counters
+	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 100, LostPackets: 20}, now)
+	now = now.Add(200 * time.Millisecond)
+	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 200, LostPackets: 40}, now)
 	if !state.encoder.protecting() {
 		t.Fatal("FEC didn't engage on a lossy path")
 	}
