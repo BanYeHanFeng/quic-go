@@ -262,9 +262,12 @@ func TestFECIdleWithoutLoss(t *testing.T) {
 
 // pumpFEC drives a realistic packet stream through the whole encoder send path -
 // loss feedback, group assembly, the flush deadline and the overhead budget - and
-// returns the resulting statistics. Traffic arrives in bursts; the flush deadline is
-// only reached between bursts, which is what produces partial groups.
-func pumpFEC(t *testing.T, config FECConfig, lossPercent uint64, packetCount, packetLength int) FECStats {
+// returns the resulting statistics together with the parity bytes that were queued.
+//
+// Parity bytes are counted from the frames themselves: FECStats.ParityBytesSent is
+// incremented when a frame is handed to the wire, which happens in the connection's
+// send loop and is not part of the encoder.
+func pumpFEC(t *testing.T, config FECConfig, lossPercent uint64, packetCount, packetLength int) (FECStats, protocol.ByteCount) {
 	t.Helper()
 	const (
 		burstLength = 128
@@ -276,6 +279,7 @@ func pumpFEC(t *testing.T, config FECConfig, lossPercent uint64, packetCount, pa
 	state := newFECState(config)
 	now := monotime.Now()
 	feedback := &wire.FECFeedbackFrame{}
+	var parityBytes protocol.ByteCount
 	for i := range packetCount {
 		now = now.Add(fecTestPacketInterval)
 		feedback.ReceivedPackets += 100 - lossPercent
@@ -287,10 +291,24 @@ func pumpFEC(t *testing.T, config FECConfig, lossPercent uint64, packetCount, pa
 			// The burst ended: the open partial group passes its flush deadline.
 			flushTime = now.Add(10 * time.Millisecond)
 		}
-		for state.encoder.pendingRepair(flushTime, 1452) != nil {
+		for {
+			frame := state.encoder.pendingRepair(flushTime, 1452)
+			if frame == nil {
+				break
+			}
+			parityBytes += frame.Length(protocol.Version1)
 		}
 	}
-	return state.stats()
+	return state.stats(), parityBytes
+}
+
+// measuredOverhead is the parity/protected byte ratio of a pumpFEC run. It is the
+// quantity MaxOverheadPercent bounds.
+func measuredOverhead(parityBytes protocol.ByteCount, stats FECStats) float64 {
+	if stats.ConsideredBytesSent == 0 {
+		return 0
+	}
+	return float64(parityBytes) / float64(stats.ConsideredBytesSent)
 }
 
 func TestFECEngagesOnLoss(t *testing.T) {
@@ -323,13 +341,13 @@ func TestFECEngagesOnLoss(t *testing.T) {
 func TestFECOverheadCapIsEnforced(t *testing.T) {
 	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
 	for _, packetLength := range []int{60, 300, 1200, 1400} {
-		stats := pumpFEC(t, config, 5, 3000, packetLength)
-		if stats.ParityPacketsSent == 0 {
+		stats, parityBytes := pumpFEC(t, config, 5, 3000, packetLength)
+		if parityBytes == 0 {
 			t.Fatalf("no parity was sent at all with %d byte packets", packetLength)
 		}
-		if stats.MeasuredOverhead > 0.10+1e-9 {
+		if overhead := measuredOverhead(parityBytes, stats); overhead > 0.10+1e-9 {
 			t.Fatalf("measured overhead %v exceeds the 10%% cap with %d byte packets (%d parity bytes / %d protected bytes)",
-				stats.MeasuredOverhead, packetLength, stats.ParityBytesSent, stats.ProtectedBytesSent)
+				overhead, packetLength, parityBytes, stats.ConsideredBytesSent)
 		}
 	}
 }
@@ -341,12 +359,12 @@ func TestFECSkipsUnexpandableGroups(t *testing.T) {
 	// 20 byte packets can never fund a parity packet that has to carry the group
 	// header, so FEC has to leave groups unprotected instead of spending multiples of
 	// the traffic it protects.
-	stats := pumpFEC(t, FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}, 5, 500, 20)
+	stats, parityBytes := pumpFEC(t, FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}, 5, 500, 20)
 	if stats.SkippedGroups == 0 {
 		t.Fatal("expected groups to be skipped: 20 byte packets can't pay for their parity")
 	}
-	if stats.MeasuredOverhead > 0.10+1e-9 {
-		t.Fatalf("measured overhead %v exceeds the 10%% cap", stats.MeasuredOverhead)
+	if overhead := measuredOverhead(parityBytes, stats); overhead > 0.10+1e-9 {
+		t.Fatalf("measured overhead %v exceeds the 10%% cap", overhead)
 	}
 }
 
@@ -355,15 +373,15 @@ func TestFECSkipsUnexpandableGroups(t *testing.T) {
 // configuration. It used to be dead code: the default group size was too small for
 // two rows to fit into the default overhead cap.
 func TestFECDoubleRowEngagesByDefault(t *testing.T) {
-	stats := pumpFEC(t, FECConfig{}, 20, 4000, 1200)
+	stats, parityBytes := pumpFEC(t, FECConfig{}, 20, 4000, 1200)
 	if stats.ParityRows != 2 {
 		t.Fatalf("expected 2 parity rows at 20%% loss with default settings, got %d", stats.ParityRows)
 	}
-	if stats.ParityPacketsSent == 0 {
+	if parityBytes == 0 {
 		t.Fatal("no parity was sent at all")
 	}
-	if stats.MeasuredOverhead > 0.10+1e-9 {
-		t.Fatalf("measured overhead %v exceeds the 10%% cap", stats.MeasuredOverhead)
+	if overhead := measuredOverhead(parityBytes, stats); overhead > 0.10+1e-9 {
+		t.Fatalf("measured overhead %v exceeds the 10%% cap", overhead)
 	}
 }
 

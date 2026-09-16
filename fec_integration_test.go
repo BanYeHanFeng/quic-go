@@ -170,10 +170,26 @@ func newFECTestPair(t *testing.T) *fecTestPair {
 	return pair
 }
 
+// fecTestOverheadCap is the overhead cap both endpoints are configured with in the
+// integration tests. It is checked against the measured overhead at the end of a
+// transfer, which is the strongest form of the bandwidth bound: real packets, real
+// parity frames, the real send path.
+const fecTestOverheadCap = 25
+
 func enableFEC(t *testing.T, conn *Conn, name string) {
 	t.Helper()
-	if err := conn.EnableFEC(FECConfig{MaxOverheadPercent: 25, MaxGroupSize: 8, MinGroupSize: 2, MaxParityRows: 1}); err != nil {
+	if err := conn.EnableFEC(FECConfig{MaxOverheadPercent: fecTestOverheadCap, MaxGroupSize: 8, MinGroupSize: 2, MaxParityRows: 1}); err != nil {
 		t.Fatalf("enabling FEC on the %s failed: %v", name, err)
+	}
+}
+
+// requireOverheadWithinCap fails when an endpoint spent more parity traffic than the
+// configured share of the traffic FEC evaluated.
+func requireOverheadWithinCap(t *testing.T, name string, stats FECStats) {
+	t.Helper()
+	if stats.MeasuredOverhead > float64(fecTestOverheadCap)/100+1e-9 {
+		t.Fatalf("%s measured overhead %v exceeds the %d%% cap (%d parity bytes / %d considered bytes)",
+			name, stats.MeasuredOverhead, fecTestOverheadCap, stats.ParityBytesSent, stats.ConsideredBytesSent)
 	}
 }
 
@@ -284,6 +300,8 @@ func TestFECRecoversLostPackets(t *testing.T) {
 	if stats.RecoveredPackets == 0 {
 		t.Fatalf("no packet was reconstructed from parity: %+v", stats)
 	}
+	requireOverheadWithinCap(t, "client", pair.clientConn.FECStats())
+	requireOverheadWithinCap(t, "server", stats)
 }
 
 // gsoTestPair sets up a client and a server on real UDP sockets (which enables GSO on
@@ -461,4 +479,6 @@ func TestFECRecoversLostPacketsGSO(t *testing.T) {
 	if serverStats.ParityPacketsReceived == 0 {
 		t.Fatalf("no parity packet arrived over the GSO path: %+v", serverStats)
 	}
+	requireOverheadWithinCap(t, "client (GSO)", clientStats)
+	requireOverheadWithinCap(t, "server (GSO)", serverStats)
 }
