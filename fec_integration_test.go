@@ -29,14 +29,26 @@ type lossyPacketConn struct {
 	// bursts instead of being spread evenly.
 	burstLength atomic.Int64
 	burstPeriod atomic.Int64
-	counter     atomic.Int64
+	// burstOnce drops a single burst instead of one per period: the path is left clean
+	// after it, which is the pattern of a rare outage rather than of a persistently
+	// lossy path.
+	burstOnce atomic.Bool
+	// burstWriteOnly drops the burst on the direction the connection sends on, and
+	// leaves the other direction clean: it keeps the peer's loss reports from being
+	// lost with the burst, so the test measures the repair and not the reporting.
+	burstWriteOnly atomic.Bool
+	counter        atomic.Int64
 }
 
-func (c *lossyPacketConn) shouldDrop() bool {
+func (c *lossyPacketConn) shouldDrop(write bool) bool {
 	count := c.counter.Add(1)
 	if burstLength, burstPeriod := c.burstLength.Load(), c.burstPeriod.Load(); burstLength > 0 && burstPeriod > 0 {
-		if (count-1)%burstPeriod < burstLength {
-			return true
+		if !c.burstWriteOnly.Load() || write {
+			if index := (count - 1) / burstPeriod; index == 0 || !c.burstOnce.Load() {
+				if (count-1)%burstPeriod < burstLength {
+					return true
+				}
+			}
 		}
 	}
 	every := c.dropEvery.Load()
@@ -52,7 +64,7 @@ func (c *lossyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		if err != nil {
 			return n, addr, err
 		}
-		if c.shouldDrop() {
+		if c.shouldDrop(false) {
 			continue
 		}
 		return n, addr, nil
@@ -60,7 +72,7 @@ func (c *lossyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (c *lossyPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	if c.shouldDrop() {
+	if c.shouldDrop(true) {
 		return len(p), nil
 	}
 	return c.PacketConn.WriteTo(p, addr)
@@ -263,6 +275,58 @@ func transfer(t *testing.T, client *Conn, server *Conn, payload []byte) []byte {
 			client.ConnectionStats(), client.FECStats(), server.FECStats())
 	}
 	return nil
+}
+
+// TestFECRecoversBurstsWithTheShippedDefaults drops bursts of consecutive packets on
+// the direction the connection sends on, which is the pattern a mobile path loses with,
+// and runs the configuration QUICX ships with - the default 10% overhead cap and the
+// default window - instead of the lower cap the other integration tests use.
+//
+// A reactive scheme can only start repairing after the peer reported the loss, and each
+// row it spends then costs 1/rate packets of the window's lifetime, so a burst is only
+// reconstructed while its packets are still inside the window. That timing is what
+// TestFECHoldsTheLossPeakOfABurst pins deterministically; this test checks the same
+// configuration end to end, over real packets and the real send path.
+func TestFECRecoversBurstsWithTheShippedDefaults(t *testing.T) {
+	pair := newFECTestPair(t)
+	defer pair.Close()
+	<-pair.clientConn.HandshakeComplete()
+	// The configuration QUICX runs with, instead of the lower-cap test configuration
+	// the other integration tests use: this test is about what the defaults repair.
+	if err := pair.clientConn.EnableFEC(FECConfig{MaxOverheadPercent: defaultFECMaxOverheadPercent}); err != nil {
+		t.Fatalf("enabling FEC on the client failed: %v", err)
+	}
+	if err := pair.serverConn.EnableFEC(FECConfig{MaxOverheadPercent: defaultFECMaxOverheadPercent}); err != nil {
+		t.Fatalf("enabling FEC on the server failed: %v", err)
+	}
+
+	// Four consecutive packets every 128 packets, dropped on the direction the client
+	// sends on, which is the pattern a mobile path loses with: losses arrive in short
+	// bursts and the path is clean in between, instead of being spread evenly.
+	//
+	// The burst length stays well inside what the window can pay for, so this checks
+	// the repair end to end rather than the capacity limit: a burst that the window has
+	// to reconstruct entirely out of rows spent after the loss was reported is covered
+	// by TestFECHoldsTheLossPeakOfABurst, which can control the timing of the reports.
+	pair.clientLossy.burstWriteOnly.Store(true)
+	pair.clientLossy.burstLength.Store(4)
+	pair.clientLossy.burstPeriod.Store(128)
+
+	payload := randomPacket(t, 4*1024*1024)
+	received := transfer(t, pair.clientConn, pair.serverConn, payload)
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("payload mismatch: got %d bytes, expected %d", len(received), len(payload))
+	}
+	stats := pair.serverConn.FECStats()
+	t.Logf("burst repair with the shipped defaults: %+v", stats)
+	if stats.RecoveredPackets == 0 {
+		t.Fatalf("no packet was reconstructed from a burst: %+v", stats)
+	}
+	if stats.FailedPackets != 0 {
+		t.Fatalf("%d packets of the bursts were given up on: %+v", stats.FailedPackets, stats)
+	}
+	requireOverheadWithinCap(t, "client", pair.clientConn.FECStats())
+	requireOverheadWithinCap(t, "server", stats)
 }
 
 // TestFECCleanPathSendsNoParity verifies that FEC doesn't spend any bandwidth when

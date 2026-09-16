@@ -390,3 +390,69 @@ func TestFECCoefficientsAreMDS(t *testing.T) {
 		}
 	}
 }
+
+// TestFECHoldsTheLossPeakOfABurst pins the behaviour a burst of losses depends on: the
+// peer reports the burst once, the reports after it are clean, and the sender has to
+// keep spending rows at the redundancy of the burst for long enough to reconstruct it.
+// The redundancy has to follow the peak of the burst, not the smoothed estimate, which
+// only ramps up over several reports and decays again while the packets of the burst
+// are still inside the window.
+func TestFECHoldsTheLossPeakOfABurst(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 64, MaxParityRows: 1}
+	state := newFECWindowState(config)
+	now := monotime.Now()
+	// the first report only establishes the baseline of the cumulative counters
+	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 100, LostPackets: 0}, now)
+	if state.encoder.protecting() {
+		t.Fatalf("a lossless report engaged FEC: %v", state.encoder.rate)
+	}
+
+	// One report of a burst: 40 of 80 packets lost. The redundancy has to engage right
+	// away, from the peak of the burst, instead of waiting for the smoothed estimate to
+	// ramp up while the burst is already leaving the window.
+	now = now.Add(20 * time.Millisecond)
+	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 140, LostPackets: 40}, now)
+	if !state.encoder.protecting() {
+		t.Fatalf("the burst did not engage FEC (smoothed loss %v, rate %v)",
+			state.encoder.lossEWMA, state.encoder.rate)
+	}
+	if state.encoder.rate < 0.09 {
+		t.Fatalf("the redundancy stayed at the smoothed estimate instead of the peak: %v", state.encoder.rate)
+	}
+
+	// The reports that follow the burst are clean. The redundancy of the burst has to
+	// stay for the whole hold, so that the rows the burst needs can still be spent while
+	// its packets are inside the window.
+	for i := uint64(1); i <= 6; i++ {
+		now = now.Add(20 * time.Millisecond)
+		state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 140 + 10*i, LostPackets: 40}, now)
+		if !state.encoder.protecting() {
+			t.Fatalf("FEC disengaged %d reports after the burst (smoothed loss %v, rate %v)",
+				i, state.encoder.lossEWMA, state.encoder.rate)
+		}
+		if state.encoder.rate < 0.09 {
+			t.Fatalf("the redundancy decayed to %v within %d reports of the burst",
+				state.encoder.rate, i)
+		}
+	}
+	if state.windowSize.Load() == 0 {
+		t.Fatal("the statistics report no active window while the burst is held")
+	}
+
+	// Once the hold is over and the peer stopped reporting, the estimate has to decay
+	// as it did before, and FEC to disengage.
+	for range 40 {
+		now = now.Add(100 * time.Millisecond)
+		state.encoder.tick(now)
+	}
+	if state.encoder.protecting() {
+		t.Fatalf("FEC stayed engaged after the hold and without fresh reports (loss rate %v)",
+			state.lossRate())
+	}
+	if rate := state.encoder.rate; rate != 0 {
+		t.Fatalf("the redundancy outlived its hold: %v", rate)
+	}
+	if state.windowSize.Load() != 0 {
+		t.Fatal("the statistics still report an active window after the hold")
+	}
+}

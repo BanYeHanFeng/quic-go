@@ -55,7 +55,22 @@ const (
 	// configuration asks for another size. A window row is superseded by the rows that
 	// follow it, so a large window trades memory for burst tolerance, not recovery
 	// latency.
-	defaultFECWindowSize = 64
+	//
+	// It is the largest window the wire format has, because the window size is what
+	// bounds the burst a reactive scheme can repair at all. The sender can only start
+	// repairing after the peer reported the loss, and every row it then spends costs
+	// 1/rate packets of the window's lifetime, so the longest burst a window can
+	// reconstruct is about
+	//
+	//	window * cap / (1 + cap)
+	//
+	// packets: about 5.8 at the default 10% cap with a 64 packet window, about 11.6 at
+	// 128. Mobile paths lose in bursts of that order, and a burst longer than the
+	// window can reconstruct is not partly repaired - the packets that fall out of the
+	// window before a row covers them are lost to a retransmission. The larger window
+	// also halves the repair frame header each protected packet pays for, because a row
+	// is as long as the longest packet of its window either way.
+	defaultFECWindowSize = 128
 	// fecWindowMaxFlushRows bounds the number of rows an idle sender emits for the tail
 	// of its window.
 	fecWindowMaxFlushRows = 2
@@ -81,6 +96,26 @@ const (
 	// allows and the redundancy the sender aims for, so that a row is never refused
 	// because of rounding.
 	fecWindowRateMargin = 0.95
+	// fecWindowLossPeakHold is how long the highest loss rate of a burst keeps driving
+	// the redundancy after it was reported. A mobile path loses packets in short
+	// bursts: the peer reports one high loss rate for the burst, and the reports that
+	// follow are clean again. Without the hold the loss estimate decays within a few
+	// evaluation intervals - the example below - and the sender stops spending rows
+	// while the packets of the burst are still inside the window, which is exactly when
+	// they could still be reconstructed.
+	//
+	//	15% reported -> 4.5% after 30ms -> 1.4% after 60ms -> 0.4% after 90ms
+	//
+	// A row repairs one packet, so a burst costs one row per packet it lost, and a row
+	// is only emitted every 1/rate protected packets. The hold therefore has to last
+	// for the packets those rows are paid out of, which is what makes it a second
+	// rather than a few evaluation intervals: a burst of ten packets needs about 106
+	// protected packets at the 10% cap, and a path that carries 150 packets per second
+	// needs about 700ms for them. Holding longer costs nothing on a clean path - the
+	// rate the redundancy follows decays with the reports, and the byte credit stops
+	// the spend - while ending the hold early gives up on part of the burst, because
+	// the rows that were never emitted cannot repair anything later.
+	fecWindowLossPeakHold = time.Second
 	// fecWindowLengthEWMAAlpha is the weight of the newest packet when tracking the
 	// average protected packet size, which the redundancy calculation uses to keep the
 	// frame header inside the overhead cap.
@@ -284,6 +319,12 @@ type fecWindowEncoder struct {
 	fbLost         uint64
 	peerLoss       float64
 	peerLossTime   monotime.Time
+	// lossPeak is the highest loss rate the peer reported within the last
+	// fecWindowLossPeakHold, and lossPeakTime is when it was reported. It holds the
+	// redundancy of a burst after the burst is over, instead of letting the loss
+	// estimate decay away while the packets of the burst are still recoverable.
+	lossPeak     float64
+	lossPeakTime monotime.Time
 }
 
 func newFECWindowEncoder(state *fecWindowState, config FECConfig) *fecWindowEncoder {
@@ -338,17 +379,50 @@ func (e *fecWindowEncoder) flushDeadline() monotime.Time {
 
 // tick re-evaluates the loss rate. The loss rate of the path is measured by the peer
 // (it sees the gaps in the packet number sequence), so the loss rate decays towards
-// zero if the peer's reports stop arriving.
+// zero if the peer's reports stop arriving, and the redundancy of a burst is held for
+// fecWindowLossPeakHold after the burst.
 func (e *fecWindowEncoder) tick(now monotime.Time) {
 	if !e.lastEvaluation.IsZero() && now.Sub(e.lastEvaluation) < fecEvaluationInterval {
 		return
 	}
 	e.lastEvaluation = now
-	var sample float64
+	e.evaluateLoss(now)
+}
+
+// evaluateLoss re-evaluates the loss rate of the path from the freshest report the
+// peer sent, and drives the redundancy from it.
+//
+// The redundancy is computed from the highest rate the peer reported within the last
+// fecWindowLossPeakHold, not from the smoothed estimate. Two effects make the smoothed
+// estimate the wrong input for a reactive scheme on a bursty path:
+//
+//   - It only moves a fraction of the way to a sample, so a burst reported at L drives
+//     the redundancy as if the path lost 0.3*L, while reconstructing the burst needs a
+//     row per lost packet. Under half of what the burst costs can never repair it.
+//   - The burst is over before the sender could spend the rows, and the reports that
+//     follow it are clean, so the estimate is back near zero while the packets of the
+//     burst are still inside the window.
+//
+// The peak of the burst is held for fecWindowLossPeakHold instead, and the redundancy
+// follows the peak. The smoothed rate is still reported as the current estimate of the
+// path.
+//
+// A report that is not fresh is treated as no loss at all: the loss rate of the path is
+// measured by the peer, so a report that stopped arriving has to be re-measured from
+// scratch instead of holding the sender at the redundancy of a path that may be gone.
+func (e *fecWindowEncoder) evaluateLoss(now monotime.Time) {
+	var lossRate float64
 	if !e.peerLossTime.IsZero() && now.Sub(e.peerLossTime) < fecPeerLossValidity {
-		sample = e.peerLoss
+		lossRate = e.peerLoss
+		if e.lossPeak > lossRate && now.Sub(e.lossPeakTime) < fecWindowLossPeakHold {
+			lossRate = e.lossPeak
+		}
+	} else {
+		e.lossPeak = 0
 	}
-	e.updateLoss(sample)
+	e.lossEWMA = fecLossEWMAAlpha*lossRate + (1-fecLossEWMAAlpha)*e.lossEWMA
+	e.state.setLossRate(e.lossEWMA)
+	e.updateRedundancyFor(lossRate)
 }
 
 // onFeedback processes a loss report of the peer. The counters are cumulative, so a
@@ -369,14 +443,28 @@ func (e *fecWindowEncoder) onFeedback(feedback *wire.FECFeedbackFrame, now monot
 		}
 		e.peerLoss = float64(lost) / float64(deltaReceived+deltaLost)
 		e.peerLossTime = now
+		// Only a higher rate raises the peak, but every fresh report moves its
+		// deadline: the hold has to survive the clean reports that follow a burst,
+		// otherwise a single clean report would drop the redundancy while the packets
+		// of the burst are still inside the window. A path that keeps losing raises the
+		// peak, and a path that keeps reporting clean holds the burst for the full
+		// duration.
+		if e.peerLoss > e.lossPeak {
+			e.lossPeak = e.peerLoss
+		}
+		e.lossPeakTime = now
 	}
 	e.fbReceived = feedback.ReceivedPackets
 	e.fbLost = feedback.LostPackets
 	e.feedbackSeen = true
 	e.lastEvaluation = now
-	e.updateLoss(e.peerLoss)
+	e.evaluateLoss(now)
 }
 
+// updateLoss applies a loss rate sample to the smoothed estimate of the path and
+// re-derives the redundancy from it. The encoder itself drives the redundancy from the
+// held peak of a burst rather than from the smoothed rate (see evaluateLoss); this is
+// the entry point for callers that only have the smoothed rate.
 func (e *fecWindowEncoder) updateLoss(sample float64) {
 	if sample < 0 {
 		sample = 0
@@ -386,17 +474,22 @@ func (e *fecWindowEncoder) updateLoss(sample float64) {
 	e.updateRedundancy()
 }
 
-// updateRedundancy computes the number of repair rows to send per protected packet.
-// The redundancy follows the measured loss rate, capped by the configured overhead:
-// when the estimated byte cost of a row would push the parity traffic over the cap,
-// the rate is reduced until it fits.
+// updateRedundancy re-derives the redundancy from the smoothed loss rate.
 func (e *fecWindowEncoder) updateRedundancy() {
-	if e.lossEWMA < fecMinLossRate {
+	e.updateRedundancyFor(e.lossEWMA)
+}
+
+// updateRedundancyFor computes the number of repair rows to send per protected packet
+// for a loss rate. It is capped by the configured overhead: when the estimated byte
+// cost of a row would push the parity traffic over the cap, the rate is reduced until
+// it fits.
+func (e *fecWindowEncoder) updateRedundancyFor(lossRate float64) {
+	if lossRate < fecMinLossRate {
 		// The path looks lossless: don't spend a single byte on redundancy.
 		e.setRate(0)
 		return
 	}
-	required := e.lossEWMA * fecLossSafetyFactor
+	required := lossRate * fecLossSafetyFactor
 	maxRate := e.overheadCap
 	if e.averageLength > 0 {
 		// A row costs the longest packet of its window plus the frame header, so a row
