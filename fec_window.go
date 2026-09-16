@@ -128,14 +128,22 @@ const (
 	// fecFeedbackInterval (20ms); on a connection that carries a few packets per second
 	// one report covers one or two packets, and a single lost packet among them would
 	// otherwise read as 50% or 100% loss and pin the redundancy at the overhead cap for
-	// as long as the connection is active.
-	fecLossSampleMinPackets = 64
+	// as long as the connection is active. Sixteen packets is small enough that a fast
+	// connection reaches it in its first reports, and large enough that one lost packet
+	// in the sample reads as its real share (6.25%) instead of as half the path.
+	fecLossSampleMinPackets = 16
+	// fecLossSampleMinLostPackets makes a pending sample a measurement as soon as it
+	// holds this many lost packets, however small it still is: a burst that already
+	// cost this many packets is not an artefact of the report size, and its packets
+	// leave the window while the sample is still filling up, so waiting for the rest of
+	// the sample would mean giving up on the burst. A single lost packet - the case
+	// that pinned the redundancy in production - is far below this.
+	fecLossSampleMinLostPackets = 8
 	// fecLossSampleMinDelayPackets and fecLossSampleMaxDelay bound the other side of the
 	// same trade-off: once a pending sample is this old it is accepted even when it is
 	// smaller than fecLossSampleMinPackets, so that a path carrying only a few packets
-	// per second still gets a measurement, and a burst still engages the redundancy
-	// without waiting for 64 packets to accumulate.
-	fecLossSampleMinDelayPackets = 16
+	// per second still gets a measurement instead of none.
+	fecLossSampleMinDelayPackets = 8
 	fecLossSampleMaxDelay        = 500 * time.Millisecond
 	// fecWindowLengthEWMAAlpha is the weight of the newest packet when tracking the
 	// average protected packet size, which the redundancy calculation uses to keep the
@@ -520,11 +528,11 @@ func (e *fecWindowEncoder) onFeedback(feedback *wire.FECFeedbackFrame, now monot
 }
 
 // accumulateLossSample adds the packets of one report to the pending sample and accepts
-// the sample as a measurement of the path once it is large enough to be one: either it
-// covers fecLossSampleMinPackets packets, or it has been pending for
-// fecLossSampleMaxDelay and covers fecLossSampleMinDelayPackets of them. Only an accepted
-// sample updates the loss rate and can raise the peak; the reports in between are the
-// sample.
+// the sample as a measurement of the path once it is large enough to be one: it covers
+// fecLossSampleMinPackets packets, or it already holds fecLossSampleMinLostPackets lost
+// packets, or it has been pending for fecLossSampleMaxDelay and covers
+// fecLossSampleMinDelayPackets of them. Only an accepted sample updates the loss rate and
+// can raise the peak; the reports in between are the sample.
 func (e *fecWindowEncoder) accumulateLossSample(received, lost uint64, now monotime.Time) {
 	if received == 0 && lost == 0 {
 		return
@@ -535,7 +543,7 @@ func (e *fecWindowEncoder) accumulateLossSample(received, lost uint64, now monot
 	e.sampleReceived += received
 	e.sampleLost += lost
 	total := e.sampleReceived + e.sampleLost
-	if total < fecLossSampleMinPackets &&
+	if total < fecLossSampleMinPackets && e.sampleLost < fecLossSampleMinLostPackets &&
 		(now.Sub(e.sampleStart) < fecLossSampleMaxDelay || total < fecLossSampleMinDelayPackets) {
 		return
 	}

@@ -467,21 +467,21 @@ func TestFECDoesNotReadATinyReportAsLoss(t *testing.T) {
 	state := newFECWindowState(config)
 	now := monotime.Now()
 	var received, lost uint64
-	for i := 0; i < 26; i++ {
+	for i := 0; i < 16; i++ {
 		now = now.Add(fecFeedbackInterval)
-		// 26 reports of one packet each, one of which carries a loss: the sample the
-		// reports accumulate into is 26 packets, so the loss rate is 1/26 = 3.8%.
-		if i == 25 {
+		// 16 reports of one packet each, one of which carries a loss: the sample the
+		// reports accumulate into is 16 packets, so the loss rate is 1/16 = 6.25%.
+		if i == 15 {
 			lost++
 		} else {
 			received++
 		}
 		state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: received, LostPackets: lost}, now)
 	}
-	if loss := state.encoder.peerLoss; loss < 0.02 || loss > 0.1 {
+	if loss := state.encoder.peerLoss; loss < 0.02 || loss > 0.15 {
 		t.Fatalf("a single lost packet was measured as %v loss", loss)
 	}
-	if rate := state.encoder.rate; rate <= 0 || rate > 0.12 {
+	if rate := state.encoder.rate; rate <= 0 || rate > 0.15 {
 		t.Fatalf("the redundancy followed a one packet report instead of the sample: %v", rate)
 	}
 }
