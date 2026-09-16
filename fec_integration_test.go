@@ -18,20 +18,32 @@ import (
 	"time"
 )
 
-// lossyPacketConn is a net.PacketConn that drops every n-th packet. Loss can be
-// enabled and disabled while the connection is running.
+// lossyPacketConn is a net.PacketConn that drops every n-th packet, and can drop bursts
+// of consecutive packets instead. Loss can be enabled and disabled while the connection
+// is running.
 type lossyPacketConn struct {
 	net.PacketConn
 	dropEvery atomic.Int64
-	counter   atomic.Int64
+	// burstLength and burstPeriod drop the first burstLength packets of every
+	// burstPeriod packets, which is the loss pattern of a mobile link: losses arrive in
+	// bursts instead of being spread evenly.
+	burstLength atomic.Int64
+	burstPeriod atomic.Int64
+	counter     atomic.Int64
 }
 
 func (c *lossyPacketConn) shouldDrop() bool {
+	count := c.counter.Add(1)
+	if burstLength, burstPeriod := c.burstLength.Load(), c.burstPeriod.Load(); burstLength > 0 && burstPeriod > 0 {
+		if (count-1)%burstPeriod < burstLength {
+			return true
+		}
+	}
 	every := c.dropEvery.Load()
 	if every <= 0 {
 		return false
 	}
-	return c.counter.Add(1)%every == 0
+	return count%every == 0
 }
 
 func (c *lossyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -180,6 +192,15 @@ func enableFEC(t *testing.T, conn *Conn, name string) {
 	t.Helper()
 	if err := conn.EnableFEC(FECConfig{MaxOverheadPercent: fecTestOverheadCap, MaxGroupSize: 8, MinGroupSize: 2, MaxParityRows: 1}); err != nil {
 		t.Fatalf("enabling FEC on the %s failed: %v", name, err)
+	}
+}
+
+// enableWindowFEC enables the sliding window scheme, which is selected on both ends by
+// the QUICX handshake in production.
+func enableWindowFEC(t *testing.T, conn *Conn, name string) {
+	t.Helper()
+	if err := conn.EnableFEC(FECConfig{Scheme: FECSchemeWindow, MaxOverheadPercent: fecTestOverheadCap, MaxGroupSize: 32, MaxParityRows: 2}); err != nil {
+		t.Fatalf("enabling window FEC on the %s failed: %v", name, err)
 	}
 }
 
@@ -481,4 +502,66 @@ func TestFECRecoversLostPacketsGSO(t *testing.T) {
 	}
 	requireOverheadWithinCap(t, "client (GSO)", clientStats)
 	requireOverheadWithinCap(t, "server (GSO)", serverStats)
+}
+
+// TestFECWindowRecoversLostPackets is the sliding window counterpart of
+// TestFECRecoversLostPackets: the packets lost on the wire are reconstructed from the
+// window repair rows, and the parity traffic stays within the configured cap.
+func TestFECWindowRecoversLostPackets(t *testing.T) {
+	pair := newFECTestPair(t)
+	defer pair.Close()
+	<-pair.clientConn.HandshakeComplete()
+	enableWindowFEC(t, pair.clientConn, "client")
+	enableWindowFEC(t, pair.serverConn, "server")
+
+	// Drop every 8th packet in both directions (12.5% loss).
+	pair.clientLossy.dropEvery.Store(8)
+	pair.serverLossy.dropEvery.Store(8)
+
+	payload := randomPacket(t, 4*1024*1024)
+	received := transfer(t, pair.clientConn, pair.serverConn, payload)
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("payload mismatch: got %d bytes, expected %d", len(received), len(payload))
+	}
+	stats := pair.serverConn.FECStats()
+	if stats.Scheme != FECSchemeWindow {
+		t.Fatalf("unexpected FEC scheme: %v", stats.Scheme)
+	}
+	if stats.ParityPacketsReceived == 0 {
+		t.Fatal("the receiver didn't see any repair row")
+	}
+	if stats.RecoveredPackets == 0 {
+		t.Fatalf("no packet was reconstructed from the window: %+v", stats)
+	}
+	requireOverheadWithinCap(t, "client", pair.clientConn.FECStats())
+	requireOverheadWithinCap(t, "server", stats)
+}
+
+// TestFECWindowRecoversBurstLosses drops bursts of consecutive packets: the whole burst
+// lands in the same window, and the rows that cover it reconstruct all of it. The block
+// scheme can only repair a burst as long as the number of parity rows of one group.
+func TestFECWindowRecoversBurstLosses(t *testing.T) {
+	pair := newFECTestPair(t)
+	defer pair.Close()
+	<-pair.clientConn.HandshakeComplete()
+	enableWindowFEC(t, pair.clientConn, "client")
+	enableWindowFEC(t, pair.serverConn, "server")
+
+	// Three consecutive packets every 64 packets: 4.7% loss, all of it in bursts.
+	pair.clientLossy.burstLength.Store(3)
+	pair.clientLossy.burstPeriod.Store(64)
+	pair.serverLossy.burstLength.Store(3)
+	pair.serverLossy.burstPeriod.Store(64)
+
+	payload := randomPacket(t, 4*1024*1024)
+	received := transfer(t, pair.clientConn, pair.serverConn, payload)
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("payload mismatch: got %d bytes, expected %d", len(received), len(payload))
+	}
+	stats := pair.serverConn.FECStats()
+	if stats.RecoveredPackets == 0 {
+		t.Fatalf("no packet was reconstructed from a burst: %+v", stats)
+	}
+	requireOverheadWithinCap(t, "client", pair.clientConn.FECStats())
+	requireOverheadWithinCap(t, "server", stats)
 }

@@ -1,0 +1,320 @@
+package quic
+
+import (
+	"bytes"
+	"testing"
+	"time"
+
+	"github.com/sagernet/quic-go/internal/monotime"
+	"github.com/sagernet/quic-go/internal/protocol"
+	"github.com/sagernet/quic-go/internal/wire"
+)
+
+// windowTestSender feeds packets into a sliding window encoder and collects the repair
+// rows it emits, in the order they would be sent.
+type windowTestSender struct {
+	state *fecWindowState
+	now   monotime.Time
+}
+
+func newWindowTestSender(config FECConfig, rate float64) *windowTestSender {
+	state := newFECWindowState(config)
+	// The adaptive controller is tested separately: a fixed rate makes the rows a test
+	// expects deterministic.
+	state.encoder.setRate(rate)
+	return &windowTestSender{state: state, now: monotime.Now()}
+}
+
+func (s *windowTestSender) send(t *testing.T, pn protocol.PacketNumber, data []byte) []*wire.FECWindowRepairFrame {
+	t.Helper()
+	s.state.encoder.addPacket(pn, data, 1452, s.now)
+	var rows []*wire.FECWindowRepairFrame
+	for {
+		frame := s.state.encoder.pendingFrame(s.now, 1452)
+		if frame == nil {
+			return rows
+		}
+		row, ok := frame.(*wire.FECWindowRepairFrame)
+		if !ok {
+			t.Fatalf("unexpected FEC frame type %T", frame)
+		}
+		s.state.frameSent(frame, protocol.Version1)
+		rows = append(rows, row)
+	}
+}
+
+// requireFECWindowRecovered checks that the decoder reconstructed exactly the expected
+// packets, with the bytes they were sent with.
+func requireFECWindowRecovered(t *testing.T, packets map[protocol.PacketNumber][]byte, recovered []fecRecoveredPacket, want []protocol.PacketNumber) {
+	t.Helper()
+	got := make(map[protocol.PacketNumber][]byte, len(recovered))
+	for _, packet := range recovered {
+		got[packet.packetNumber] = packet.data
+	}
+	for _, pn := range want {
+		data, ok := got[pn]
+		if !ok {
+			t.Fatalf("packet %d was not reconstructed (reconstructed: %v)", pn, got)
+		}
+		if !bytes.Equal(data, packets[pn]) {
+			t.Fatalf("packet %d was reconstructed incorrectly: %d bytes instead of %d", pn, len(data), len(packets[pn]))
+		}
+	}
+}
+
+// windowTestTransfer runs the whole chain: it sends count packets of varying sizes
+// through the encoder, drops the packets in lost, and returns everything the decoder
+// reconstructed.
+func windowTestTransfer(t *testing.T, config FECConfig, rate float64, count int, lost map[protocol.PacketNumber]bool) (map[protocol.PacketNumber][]byte, []fecRecoveredPacket, *fecWindowState) {
+	t.Helper()
+	sender := newWindowTestSender(config, rate)
+	packets := make(map[protocol.PacketNumber][]byte, count)
+	var rows []*wire.FECWindowRepairFrame
+	for i := 0; i < count; i++ {
+		pn := protocol.PacketNumber(1000 + i)
+		// Varying sizes: the lengths are part of the code, not part of the header.
+		data := randomPacket(t, 900+(i%7)*40)
+		packets[pn] = data
+		rows = append(rows, sender.send(t, pn, data)...)
+	}
+	if len(rows) == 0 {
+		t.Fatal("no repair row was emitted")
+	}
+	receiver := newFECWindowState(config)
+	var recovered []fecRecoveredPacket
+	for i := 0; i < count; i++ {
+		pn := protocol.PacketNumber(1000 + i)
+		if lost[pn] {
+			continue
+		}
+		recovered = append(recovered, receiver.decoder.recordPacket(pn, packets[pn], protocol.KeyPhaseZero)...)
+	}
+	for _, row := range rows {
+		recovered = append(recovered, receiver.decoder.handleRepair(row, sender.now)...)
+	}
+	return packets, recovered, receiver
+}
+
+func TestFECWindowRecoversSingleLoss(t *testing.T) {
+	for _, packetCount := range []int{8, 40, 200} {
+		config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
+		lost := map[protocol.PacketNumber]bool{1007: true}
+		packets, recovered, _ := windowTestTransfer(t, config, 0.5, packetCount, lost)
+		requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{1007})
+	}
+}
+
+func TestFECWindowRecoversBurstLosses(t *testing.T) {
+	// A burst of four consecutive packets. The block scheme can only repair a burst
+	// smaller than the number of parity rows of the group; the window rows that cover
+	// the burst are independent of each other, so the whole burst is reconstructed.
+	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
+	lost := map[protocol.PacketNumber]bool{1005: true, 1006: true, 1007: true, 1008: true}
+	packets, recovered, _ := windowTestTransfer(t, config, 0.5, 120, lost)
+	requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{1005, 1006, 1007, 1008})
+}
+
+func TestFECWindowNothingToRecover(t *testing.T) {
+	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
+	_, recovered, receiver := windowTestTransfer(t, config, 0.5, 60, nil)
+	if len(recovered) != 0 {
+		t.Fatalf("packets were reconstructed although nothing was lost: %v", recovered)
+	}
+	if stats := receiver.stats(); stats.RecoveredPackets != 0 {
+		t.Fatalf("unexpected recovery statistics: %+v", stats)
+	}
+}
+
+// TestFECWindowLatePacketCompletesEquation verifies the on-the-fly part of the decoder:
+// an equation that two lost packets leave underdetermined is solved as soon as one of
+// them arrives late.
+func TestFECWindowLatePacketCompletesEquation(t *testing.T) {
+	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 16, MaxOverheadPercent: 100, MaxParityRows: 2}
+	sender := newWindowTestSender(config, 0.25)
+	packets := make(map[protocol.PacketNumber][]byte)
+	var rows []*wire.FECWindowRepairFrame
+	for i := 0; i < 4; i++ {
+		pn := protocol.PacketNumber(2000 + i)
+		packets[pn] = randomPacket(t, 1000)
+		rows = append(rows, sender.send(t, pn, packets[pn])...)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected one repair row for four packets at 25%% redundancy, got %d", len(rows))
+	}
+	receiver := newFECWindowState(config)
+	recovered := receiver.decoder.recordPacket(2000, packets[2000], protocol.KeyPhaseZero)
+	recovered = append(recovered, receiver.decoder.recordPacket(2003, packets[2003], protocol.KeyPhaseZero)...)
+	if len(recovered) != 0 {
+		t.Fatalf("packets were reconstructed without any repair row: %v", recovered)
+	}
+	if recovered = receiver.decoder.handleRepair(rows[0], sender.now); len(recovered) != 0 {
+		t.Fatalf("one row reconstructed two unknown packets: %v", recovered)
+	}
+	// The late packet makes the equation solvable for the other lost packet.
+	recovered = receiver.decoder.recordPacket(2001, packets[2001], protocol.KeyPhaseZero)
+	requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{2002})
+}
+
+func TestFECWindowIdleWithoutLoss(t *testing.T) {
+	config := FECConfig{Scheme: FECSchemeWindow, MaxOverheadPercent: 10}
+	state := newFECWindowState(config)
+	now := monotime.Now()
+	for i := 0; i < 500; i++ {
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now)
+	}
+	if state.encoder.protecting() {
+		t.Fatal("window FEC engaged on a path without a loss report")
+	}
+	if frame := state.encoder.pendingFrame(now.Add(time.Second), 1452); frame != nil {
+		t.Fatal("a repair row was sent on a path without a loss report")
+	}
+	if stats := state.stats(); stats.ParityPacketsSent != 0 || stats.ParityBytesSent != 0 {
+		t.Fatalf("unexpected parity traffic on a lossless path: %+v", stats)
+	}
+}
+
+func TestFECWindowEngagesAndDisengages(t *testing.T) {
+	config := FECConfig{Scheme: FECSchemeWindow, MaxOverheadPercent: 10}
+	state := newFECWindowState(config)
+	now := monotime.Now()
+	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 100, LostPackets: 5}, now)
+	if !state.encoder.protecting() {
+		t.Fatal("window FEC did not engage on a 5% loss report")
+	}
+	if rate := state.encoder.rate; rate <= 0 || rate > 0.1 {
+		t.Fatalf("unexpected redundancy %v", rate)
+	}
+	if stats := state.stats(); stats.GroupSize == 0 {
+		t.Fatal("the statistics don't report the active window")
+	}
+	if !state.encoder.flushDeadline().IsZero() {
+		t.Fatal("an empty window has a flush deadline")
+	}
+	for i := 0; i < 20; i++ {
+		now = now.Add(fecEvaluationInterval)
+		state.encoder.tick(now)
+	}
+	if state.encoder.protecting() {
+		t.Fatalf("window FEC stayed engaged without fresh loss reports (rate %v)", state.encoder.rate)
+	}
+	if stats := state.stats(); stats.GroupSize != 0 {
+		t.Fatalf("the statistics still report an active window: %+v", stats)
+	}
+}
+
+func TestFECWindowOverheadStaysWithinCap(t *testing.T) {
+	for _, lossPercent := range []uint64{1, 2, 10, 25} {
+		config := FECConfig{Scheme: FECSchemeWindow, MaxOverheadPercent: 10, MaxGroupSize: 32, MaxParityRows: 2}
+		state := newFECWindowState(config)
+		now := monotime.Now()
+		var received, lost uint64
+		for i := 0; i < 4000; i++ {
+			state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now)
+			for {
+				frame := state.encoder.pendingFrame(now, 1452)
+				if frame == nil {
+					break
+				}
+				state.frameSent(frame, protocol.Version1)
+			}
+			// The peer reports every 50 packets, like a real feedback frame.
+			if i%50 == 49 {
+				received += 50
+				lost += lossPercent * 50 / 100
+				state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: received, LostPackets: lost}, now)
+			}
+		}
+		stats := state.stats()
+		if stats.ParityPacketsSent == 0 {
+			t.Fatalf("%d%% loss: no repair row was ever sent", lossPercent)
+		}
+		if stats.MeasuredOverhead > float64(config.MaxOverheadPercent)/100+1e-9 {
+			t.Fatalf("%d%% loss: measured overhead %v exceeds the %d%% cap (%d parity bytes / %d considered bytes)",
+				lossPercent, stats.MeasuredOverhead, config.MaxOverheadPercent, stats.ParityBytesSent, stats.ConsideredBytesSent)
+		}
+	}
+}
+
+func TestFECWindowProtectsTheIdleTail(t *testing.T) {
+	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 16, MaxOverheadPercent: 100, MaxParityRows: 2, FlushDelay: 2 * time.Millisecond}
+	sender := newWindowTestSender(config, 0.05)
+	var rows []*wire.FECWindowRepairFrame
+	for i := 0; i < 3; i++ {
+		rows = append(rows, sender.send(t, protocol.PacketNumber(1+i), randomPacket(t, 1200))...)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("repair rows were sent before the flush delay: %d", len(rows))
+	}
+	deadline := sender.state.encoder.flushDeadline()
+	if deadline.IsZero() {
+		t.Fatal("a pending window has no flush deadline")
+	}
+	frame := sender.state.encoder.pendingFrame(deadline, 1452)
+	if frame == nil {
+		t.Fatal("the idle tail was not protected")
+	}
+	row, ok := frame.(*wire.FECWindowRepairFrame)
+	if !ok {
+		t.Fatalf("unexpected FEC frame type %T", frame)
+	}
+	if len(row.PacketNumbers) != 3 {
+		t.Fatalf("the tail row covers %d packets, expected 3", len(row.PacketNumbers))
+	}
+}
+
+func TestFECWindowReserveCoversRepairFrame(t *testing.T) {
+	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: wire.MaxFECWindowSize, MaxOverheadPercent: 100, MaxParityRows: 2}
+	sender := newWindowTestSender(config, 1)
+	maxPacketSize := protocol.ByteCount(1452)
+	protectedLimit := maxPacketSize - sender.state.encoder.reserve() - fecMaxPacketOverhead
+	if protectedLimit <= 0 {
+		t.Fatal("the reserve doesn't leave any room for a protected packet")
+	}
+	var largest *wire.FECWindowRepairFrame
+	for i := 0; i < 3*wire.MaxFECWindowSize; i++ {
+		for _, row := range sender.send(t, protocol.PacketNumber(1+i), randomPacket(t, int(protectedLimit))) {
+			if largest == nil || len(row.PacketNumbers) > len(largest.PacketNumbers) {
+				largest = row
+			}
+		}
+	}
+	if largest == nil {
+		t.Fatal("no repair row was sent")
+	}
+	if len(largest.PacketNumbers) != wire.MaxFECWindowSize {
+		t.Fatalf("the largest row covers %d packets, expected a full window of %d", len(largest.PacketNumbers), wire.MaxFECWindowSize)
+	}
+	if length := largest.Length(protocol.Version1) + fecMaxPacketOverhead; length > maxPacketSize {
+		t.Fatalf("a repair row of %d bytes doesn't fit into a %d byte datagram", length, maxPacketSize)
+	}
+}
+
+// TestFECWindowCoefficientsAreMDS checks the property the sliding window code relies
+// on: any three rows reconstruct any three members of the window, whatever their
+// positions. It is the Cauchy determinant formula, checked on a few row and member
+// combinations instead of being taken on faith.
+func TestFECWindowCoefficientsAreMDS(t *testing.T) {
+	members := []int{0, 1, 2, 5, 9, 17, 33, 64, 90, 127}
+	rowSets := [][3]uint64{{0, 1, 2}, {3, 17, 40}, {7, 8, 9}, {13, 29, 61}, {64, 65, 66}}
+	for _, rowSet := range rowSets {
+		for i := 0; i < len(members); i++ {
+			for j := i + 1; j < len(members); j++ {
+				for k := j + 1; k < len(members); k++ {
+					matrix := make([][]byte, 3)
+					rhs := make([][]byte, 3)
+					for r, row := range rowSet {
+						matrix[r] = []byte{
+							fecWindowCoefficient(row, members[i]),
+							fecWindowCoefficient(row, members[j]),
+							fecWindowCoefficient(row, members[k]),
+						}
+						rhs[r] = []byte{1, 2, 3}
+					}
+					if !fecSolve(matrix, rhs) {
+						t.Fatalf("singular submatrix for the rows %v and the members %v", rowSet, []int{members[i], members[j], members[k]})
+					}
+				}
+			}
+		}
+	}
+}

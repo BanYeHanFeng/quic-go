@@ -40,6 +40,6 @@ jobs:
       - name: FEC 单元测试
         run: go test -count=1 -v -run 'FEC|Fec|GF256' ./internal/wire/ ./
       - name: FEC 集成测试（含竞态检测）
-        run: go test -count=1 -race -v -run 'TestFEC.*(Path|LostPackets)' -timeout 30m ./
+        run: go test -count=1 -race -v -run 'TestFEC.*(Path|LostPackets|Burst)' -timeout 30m ./
       - name: 全部测试
         run: go test -count=1 ./... || true
