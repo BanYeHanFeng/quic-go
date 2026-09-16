@@ -456,3 +456,86 @@ func TestFECHoldsTheLossPeakOfABurst(t *testing.T) {
 		t.Fatal("the statistics still report an active window after the hold")
 	}
 }
+
+// TestFECDoesNotReadATinyReportAsLoss pins the failure a 20ms report interval causes on a
+// slow connection: a report that covers one packet reads as 0% when the packet arrived
+// and as 100% when it was lost, so a single lost packet used to pin the redundancy at the
+// overhead cap for as long as the peer kept reporting. The reports are accumulated into a
+// sample that is large enough to measure the path instead.
+func TestFECDoesNotReadATinyReportAsLoss(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 20, MaxGroupSize: 64}
+	state := newFECWindowState(config)
+	now := monotime.Now()
+	var received, lost uint64
+	for i := 0; i < 26; i++ {
+		now = now.Add(fecFeedbackInterval)
+		// 26 reports of one packet each, one of which carries a loss: the sample the
+		// reports accumulate into is 26 packets, so the loss rate is 1/26 = 3.8%.
+		if i == 25 {
+			lost++
+		} else {
+			received++
+		}
+		state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: received, LostPackets: lost}, now)
+	}
+	if loss := state.encoder.peerLoss; loss < 0.02 || loss > 0.1 {
+		t.Fatalf("a single lost packet was measured as %v loss", loss)
+	}
+	if rate := state.encoder.rate; rate <= 0 || rate > 0.12 {
+		t.Fatalf("the redundancy followed a one packet report instead of the sample: %v", rate)
+	}
+}
+
+// TestFECReleasesTheLossPeakWhileReportsKeepComing pins the other half of the same bug:
+// the hold of a burst runs from the sample that measured it, so the clean reports that
+// follow it must not keep the redundancy of the burst alive. Without that, the highest
+// rate a noisy sample ever produced stayed in force for as long as the peer reported,
+// which is the whole life of an active connection: a clean path paid the overhead cap
+// forever.
+func TestFECReleasesTheLossPeakWhileReportsKeepComing(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 20, MaxGroupSize: 64, MaxParityRows: 1}
+	state := newFECWindowState(config)
+	now := monotime.Now()
+	// the first report establishes the baseline of the cumulative counters
+	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 100, LostPackets: 0}, now)
+	// one report of a burst: 40 of 80 packets lost
+	now = now.Add(fecFeedbackInterval)
+	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 140, LostPackets: 40}, now)
+	if !state.encoder.protecting() {
+		t.Fatal("the burst did not engage FEC")
+	}
+	// The path is clean again, and it keeps reporting. The hold is measured from the
+	// burst, so the redundancy has to be gone after it.
+	received := uint64(140)
+	for i := 0; i < 150; i++ {
+		now = now.Add(fecFeedbackInterval)
+		received += 64
+		state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: received, LostPackets: 40}, now)
+	}
+	if state.encoder.protecting() {
+		t.Fatalf("the redundancy of a burst outlived its hold (loss rate %v, rate %v)",
+			state.lossRate(), state.encoder.rate)
+	}
+}
+
+// TestFECHoldCoversTheWindowSpan checks that the hold of a burst follows how fast the
+// window is filled: a slow connection needs the redundancy for the time its window spans,
+// bounded so that a single burst cannot keep the overhead on for minutes.
+func TestFECHoldCoversTheWindowSpan(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 20, MaxGroupSize: 64, MaxParityRows: 1}
+	state := newFECWindowState(config)
+	now := monotime.Now()
+	if hold := state.encoder.holdDuration(); hold != fecWindowLossPeakHold {
+		t.Fatalf("an encoder that never sent a packet holds a peak for %v", hold)
+	}
+	state.encoder.setRate(0.1)
+	for i := 0; i < 40; i++ {
+		now = now.Add(100 * time.Millisecond)
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now, true)
+	}
+	// 64 packets at 100ms per packet span 6.4 seconds: more than the lower bound of the
+	// hold, and bounded by its maximum.
+	if hold := state.encoder.holdDuration(); hold != fecWindowLossPeakHoldMax {
+		t.Fatalf("the hold does not follow the packet rate: %v", hold)
+	}
+}
