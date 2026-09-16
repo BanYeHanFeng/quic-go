@@ -493,6 +493,8 @@ func TestFECRepairFrameFitsIntoDatagram(t *testing.T) {
 	const maxPacketSize protocol.ByteCount = 1252
 	config := FECConfig{MaxOverheadPercent: 100, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
 	state := newFECState(config)
+	state.encoder.groupSize = config.MaxGroupSize
+	state.encoder.rows = config.MaxParityRows
 	// The largest packet the encoder advertises for protection.
 	protectedLimit := maxPacketSize - state.encoder.reserve() - fecMaxPacketOverhead
 	now := monotime.Now()
