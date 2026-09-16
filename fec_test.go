@@ -126,8 +126,10 @@ func TestFECRecoversWithUnequalPacketSizes(t *testing.T) {
 	sender.encoder.groupSize = 4
 	sender.encoder.rows = 1
 	now := monotime.Now()
+	// The largest packet is bounded by what still leaves room for the parity packet in a
+	// 1452 byte datagram: 1452 - headerReserve(4) - the packet overhead.
 	packets := map[protocol.PacketNumber][]byte{
-		10: randomPacket(t, 1400),
+		10: randomPacket(t, 1300),
 		11: randomPacket(t, 17),
 		12: randomPacket(t, 900),
 		13: randomPacket(t, 1),
@@ -340,7 +342,9 @@ func TestFECEngagesOnLoss(t *testing.T) {
 // sent, for any packet size.
 func TestFECOverheadCapIsEnforced(t *testing.T) {
 	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
-	for _, packetLength := range []int{60, 300, 1200, 1400} {
+	// The largest case stays below what a 1452 byte datagram can protect: the parity
+	// packet needs room for the packet itself, the frame header and the packet overhead.
+	for _, packetLength := range []int{60, 300, 1200, 1280} {
 		stats, parityBytes := pumpFEC(t, config, 5, 3000, packetLength)
 		if parityBytes == 0 {
 			t.Fatalf("no parity was sent at all with %d byte packets", packetLength)
