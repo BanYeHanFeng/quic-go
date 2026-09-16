@@ -32,10 +32,10 @@ import (
 // FECConfig.MaxOverheadPercent. With no loss, no parity packets are sent at all.
 
 const (
-	defaultFECMaxGroupSize       = 16
+	defaultFECMaxGroupSize       = 32
 	defaultFECMinGroupSize       = 2
 	defaultFECMaxOverheadPercent = 10
-	defaultFECMaxParityRows      = 1
+	defaultFECMaxParityRows      = 2
 	defaultFECFlushDelay         = 2 * time.Millisecond
 
 	// fecMinLossRate is the loss rate above which FEC engages. Below this threshold
@@ -45,9 +45,17 @@ const (
 	// amount of redundancy: protecting against 1.5x the observed loss.
 	fecLossSafetyFactor = 1.5
 	fecLossEWMAAlpha    = 0.3
+	// fecLengthEWMAAlpha is the weight of the newest packet when tracking the average
+	// protected packet size, which the group size calculation uses to keep the
+	// per-group FEC_REPAIR header inside the overhead cap.
+	fecLengthEWMAAlpha = 0.2
 	// fecHighLossThreshold is the loss rate above which a second parity row is used
 	// (if allowed by the configuration), which makes the group survive two losses.
 	fecHighLossThreshold = 0.12
+	// fecDoubleRowThreshold is the redundancy (loss rate times safety factor) above
+	// which a single parity row is no longer considered sufficient, even when the
+	// measured loss rate itself is still below fecHighLossThreshold.
+	fecDoubleRowThreshold = 0.25
 
 	// fecFeedbackInterval is the minimum interval between two FEC_FEEDBACK frames.
 	fecFeedbackInterval = 20 * time.Millisecond
@@ -74,22 +82,27 @@ const (
 
 // FECConfig configures packet level forward error correction for a connection.
 // The zero value is a valid configuration: MaxOverheadPercent defaults to 10%,
-// MaxGroupSize to 16, MinGroupSize to 2 and MaxParityRows to 1 (plain XOR parity).
+// MaxGroupSize to 32, MinGroupSize to 2 and MaxParityRows to 2 (Reed-Solomon parity
+// over GF(2^8), which survives two losses per group).
 type FECConfig struct {
 	// MaxOverheadPercent caps the parity traffic as a percentage of the protected
 	// traffic. It bounds the bandwidth FEC is allowed to spend, no matter how high
-	// the measured loss rate is. Defaults to 10.
+	// the measured loss rate is. The cap is enforced on the bytes actually sent: a
+	// group is left unprotected when its parity packets would push the connection
+	// over the cap. Defaults to 10.
 	MaxOverheadPercent int
 	// MaxGroupSize is the maximum number of packets protected by one FEC group.
 	// Larger groups reduce the relative overhead, but increase the time until a
-	// lost packet can be repaired. Defaults to 16.
+	// lost packet can be repaired. It has to be large enough to fit MaxParityRows
+	// within MaxOverheadPercent, otherwise the second parity row can't be used.
+	// Defaults to 32.
 	MaxGroupSize int
 	// MinGroupSize is the smallest group the sender is willing to protect. Partial
 	// groups smaller than this are not protected. Defaults to 2.
 	MinGroupSize int
 	// MaxParityRows is the maximum number of parity rows sent per group. With 1 row
 	// a group survives a single loss (XOR parity, "RAID 5" style), with 2 rows it
-	// survives two losses ("RAID 6" style, Reed-Solomon over GF(2^8)). Defaults to 1.
+	// survives two losses ("RAID 6" style, Reed-Solomon over GF(2^8)). Defaults to 2.
 	MaxParityRows int
 	// FlushDelay is how long the sender keeps a partial group open while the
 	// connection is idle, before protecting it. Defaults to 2ms.
@@ -129,15 +142,36 @@ func (c FECConfig) withDefaults() FECConfig {
 
 // FECStats reports the state of the packet level FEC of a connection.
 type FECStats struct {
-	Enabled      bool
-	GroupSize    int     // current target group size, 0 if FEC is currently idle
-	ParityRows   int     // number of parity rows per group
-	LossRate     float64 // smoothed loss rate observed on the path
-	SendOverhead float64 // parity bytes / protected bytes, as currently configured
+	Enabled    bool
+	GroupSize  int     // current target group size, 0 if FEC is currently idle
+	ParityRows int     // number of parity rows per group
+	LossRate   float64 // smoothed loss rate observed by the peer on the path we send on
+	// ConfiguredOverhead is the parity/protected ratio the current group size and
+	// parity row count aim for. It is a configuration value, not a measurement.
+	ConfiguredOverhead float64
+	// MeasuredOverhead is the parity bytes actually sent divided by the protected
+	// bytes FEC has evaluated (ConsideredBytesSent). MaxOverheadPercent bounds this
+	// value: byte for byte, FEC never spends more than the configured share of the
+	// traffic it is protecting, no matter how small the groups are.
+	MeasuredOverhead float64
 
-	ProtectedPacketsSent     uint64
-	ParityPacketsSent        uint64
-	ParityBytesSent          uint64
+	ProtectedPacketsSent uint64
+	// ProtectedBytesSent is the number of bytes that were placed in a group that was
+	// actually protected by at least one parity packet.
+	ProtectedBytesSent uint64
+	// ConsideredBytesSent is the number of bytes that were placed in any group FEC
+	// closed. It is the denominator of MeasuredOverhead and includes the groups that
+	// were skipped to stay within the overhead cap.
+	ConsideredBytesSent uint64
+	ParityPacketsSent   uint64
+	ParityBytesSent     uint64
+	// SkippedGroups is the number of groups that were left unprotected because their
+	// parity packets would have exceeded MaxOverheadPercent.
+	SkippedGroups uint64
+
+	// The remaining counters describe the direction we receive on: they are produced
+	// by the decoder and are independent of LossRate, which the peer measures on the
+	// direction we send on.
 	ProtectedPacketsReceived uint64
 	RecoveredPackets         uint64
 	FailedPackets            uint64
@@ -160,9 +194,16 @@ type fecState struct {
 	targetGroupSize atomic.Int64
 	parityRows      atomic.Int64
 
-	protectedSent atomic.Uint64
-	paritySent    atomic.Uint64
-	parityBytes   atomic.Uint64
+	protectedSent  atomic.Uint64
+	protectedBytes atomic.Uint64
+	paritySent     atomic.Uint64
+	parityBytes    atomic.Uint64
+	// consideredBytes is the number of protected bytes FEC has evaluated so far. It
+	// is the denominator of MeasuredOverhead and therefore of the overhead cap: it
+	// includes the groups that were left unprotected because their parity would have
+	// exceeded the cap.
+	consideredBytes atomic.Uint64
+	skippedGroups   atomic.Uint64
 
 	protectedRecv atomic.Uint64
 	recoveredRecv atomic.Uint64
@@ -173,7 +214,11 @@ type fecState struct {
 func newFECState(config FECConfig) *fecState {
 	config = config.withDefaults()
 	state := &fecState{config: config}
-	state.encoder = &fecEncoder{state: state, config: config}
+	state.encoder = &fecEncoder{
+		state:  state,
+		config: config,
+		budget: newFECOverheadBudget(config.MaxOverheadPercent),
+	}
 	state.decoder = &fecDecoder{state: state, config: config}
 	state.parityRows.Store(1)
 	return state
@@ -223,21 +268,30 @@ func (c *Conn) FECStats() FECStats {
 func (s *fecState) stats() FECStats {
 	groupSize := int(s.targetGroupSize.Load())
 	rows := int(s.parityRows.Load())
+	protectedBytes := s.protectedBytes.Load()
+	parityBytes := s.parityBytes.Load()
+	consideredBytes := s.consideredBytes.Load()
 	stats := FECStats{
 		Enabled:                  true,
 		GroupSize:                groupSize,
 		ParityRows:               rows,
 		LossRate:                 s.lossRate(),
 		ProtectedPacketsSent:     s.protectedSent.Load(),
+		ProtectedBytesSent:       protectedBytes,
+		ConsideredBytesSent:      consideredBytes,
 		ParityPacketsSent:        s.paritySent.Load(),
-		ParityBytesSent:          s.parityBytes.Load(),
+		ParityBytesSent:          parityBytes,
+		SkippedGroups:            s.skippedGroups.Load(),
 		ProtectedPacketsReceived: s.protectedRecv.Load(),
 		RecoveredPackets:         s.recoveredRecv.Load(),
 		FailedPackets:            s.failedRecv.Load(),
 		ParityPacketsReceived:    s.parityRecv.Load(),
 	}
 	if groupSize > 0 && rows > 0 {
-		stats.SendOverhead = float64(rows) / float64(groupSize)
+		stats.ConfiguredOverhead = float64(rows) / float64(groupSize)
+	}
+	if consideredBytes > 0 {
+		stats.MeasuredOverhead = float64(parityBytes) / float64(consideredBytes)
 	}
 	return stats
 }
@@ -432,6 +486,16 @@ type fecEncoder struct {
 	group     *fecGroup
 	ready     []*wire.FECRepairFrame
 
+	// budget bounds the parity traffic to MaxOverheadPercent of the protected
+	// traffic. It is what makes the cap hold for partial groups and for groups
+	// whose members differ in size.
+	budget fecOverheadBudget
+	// averageLength is an EWMA of the size of the packets that were protected most
+	// recently. It lets the group size calculation account for the per-group frame
+	// header, which is a fixed cost that would otherwise push a group that is
+	// exactly at the cap over it.
+	averageLength float64
+
 	lossEWMA float64
 
 	lastEvaluation monotime.Time
@@ -444,6 +508,40 @@ type fecEncoder struct {
 
 	peerLoss     float64
 	peerLossTime monotime.Time
+}
+
+// fecOverheadBudget bounds the parity traffic of a connection to a fixed percentage
+// of its protected traffic.
+//
+// Protected bytes earn credit at the configured rate, parity bytes spend it. A group
+// is only protected when its parity packets fit into the accumulated credit, so the
+// ratio of parity bytes to protected bytes never exceeds the configured cap - no
+// matter how small the groups are, how skewed the packet sizes are, or how lossy the
+// path is. Credit is earned before it is spent within a group, so a group that is
+// large enough to pay for its own parity is always protected.
+type fecOverheadBudget struct {
+	// overhead is the credit earned per protected byte.
+	overhead float64
+	credit   float64
+}
+
+func newFECOverheadBudget(maxOverheadPercent int) fecOverheadBudget {
+	return fecOverheadBudget{overhead: float64(maxOverheadPercent) / 100}
+}
+
+// earn credits the bytes of a group that is about to be closed.
+func (b *fecOverheadBudget) earn(protectedBytes int) {
+	b.credit += float64(protectedBytes) * b.overhead
+}
+
+// spend reports whether parity traffic of the given size fits into the budget, and
+// deducts it if it does.
+func (b *fecOverheadBudget) spend(parityBytes int) bool {
+	if float64(parityBytes) > b.credit {
+		return false
+	}
+	b.credit -= float64(parityBytes)
+	return true
 }
 
 // protecting says whether the encoder currently protects outgoing packets.
@@ -518,6 +616,7 @@ func (e *fecEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxPacketS
 		}
 	}
 	e.group.addPacket(pn, data)
+	e.averageLength = fecLengthEWMAAlpha*float64(len(data)) + (1-fecLengthEWMAAlpha)*e.averageLength
 	if len(e.group.packetNumbers) >= e.groupSize {
 		// The group is complete: protect it right away.
 		e.closeGroup(e.group, maxPacketSize)
@@ -526,6 +625,12 @@ func (e *fecEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxPacketS
 }
 
 // closeGroup turns a group into FEC_REPAIR frames and queues them for sending.
+//
+// A group is only protected when its parity packets fit into the overhead budget and
+// into a datagram. Otherwise it is left unprotected: sending parity for it would
+// break the bandwidth bound the configuration promises. Leaving a group unprotected
+// is always safe - the packets are simply not recoverable by FEC, exactly as they
+// would be with a smaller group or a larger FlushDelay.
 func (e *fecEncoder) closeGroup(group *fecGroup, maxPacketSize protocol.ByteCount) {
 	if group == nil || len(group.packetNumbers) < e.config.MinGroupSize {
 		return
@@ -534,6 +639,23 @@ func (e *fecEncoder) closeGroup(group *fecGroup, maxPacketSize protocol.ByteCoun
 	if group.maxLength+headerReserve > maxPacketSize {
 		// The parity packet wouldn't fit into a datagram. Skip this group instead of
 		// sending a packet that can't be transmitted.
+		return
+	}
+	// Enforce MaxOverheadPercent on the bytes actually sent. The protected bytes are
+	// credited first, so a group that is large enough to pay for its own parity is
+	// protected even at the start of a connection.
+	var protectedBytes int
+	for _, length := range group.lengths {
+		protectedBytes += int(length)
+	}
+	e.budget.earn(protectedBytes)
+	e.state.consideredBytes.Add(uint64(protectedBytes))
+	parityBytes := (int(group.maxLength) + int(headerReserve)) * len(group.parity)
+	if !e.budget.spend(parityBytes) {
+		// Parity for this group would push the connection over MaxOverheadPercent. The
+		// group is left unprotected instead: the bandwidth bound wins over repairing
+		// this particular group.
+		e.state.skippedGroups.Add(1)
 		return
 	}
 	for row := range group.parity {
@@ -550,6 +672,7 @@ func (e *fecEncoder) closeGroup(group *fecGroup, maxPacketSize protocol.ByteCoun
 		e.ready = append(e.ready, frame)
 	}
 	e.state.protectedSent.Add(uint64(len(group.packetNumbers)))
+	e.state.protectedBytes.Add(uint64(protectedBytes))
 }
 
 func (e *fecEncoder) repairHeaderReserve(groupSize int) protocol.ByteCount {
@@ -636,6 +759,23 @@ func (e *fecEncoder) updateLoss(sample float64) {
 	e.updateRedundancy()
 }
 
+// estimatedOverhead is the byte ratio of parity traffic to protected traffic a group
+// of the given size and parity row count is expected to cost, including the
+// FEC_REPAIR frame header. It falls back to the pure packet ratio while the average
+// protected packet size is still unknown.
+func (e *fecEncoder) estimatedOverhead(rows, groupSize int) float64 {
+	if groupSize <= 0 {
+		return 1
+	}
+	if e.averageLength <= 0 {
+		return float64(rows) / float64(groupSize)
+	}
+	headerBytes := float64(e.repairHeaderReserve(groupSize))
+	parityBytes := (e.averageLength + headerBytes) * float64(rows)
+	protectedBytes := e.averageLength * float64(groupSize)
+	return parityBytes / protectedBytes
+}
+
 func (e *fecEncoder) updateRedundancy() {
 	overheadCap := float64(e.config.MaxOverheadPercent) / 100
 	if e.lossEWMA < fecMinLossRate {
@@ -646,19 +786,21 @@ func (e *fecEncoder) updateRedundancy() {
 		e.state.parityRows.Store(1)
 		return
 	}
-	target := e.lossEWMA * fecLossSafetyFactor
+	// required is the redundancy the measured loss rate asks for, before it is capped
+	// by the bandwidth budget. The rows decision is based on the uncapped value:
+	// capping it first would make the double row branch unreachable at low caps.
+	required := e.lossEWMA * fecLossSafetyFactor
+	rows := 1
+	if e.config.MaxParityRows > 1 &&
+		(e.lossEWMA >= fecHighLossThreshold || required >= fecDoubleRowThreshold) &&
+		// Two parity rows only fit into the overhead cap if the maximum group size is
+		// large enough to pay for them.
+		e.estimatedOverhead(2, e.config.MaxGroupSize) <= overheadCap {
+		rows = 2
+	}
+	target := required
 	if target > overheadCap {
 		target = overheadCap
-	}
-	rows := 1
-	if e.lossEWMA >= fecHighLossThreshold || target > 0.25 {
-		if e.config.MaxParityRows > 1 && float64(2)/float64(e.config.MaxGroupSize) <= overheadCap {
-			rows = 2
-			target = e.lossEWMA * fecLossSafetyFactor
-			if target > overheadCap {
-				target = overheadCap
-			}
-		}
 	}
 	groupSize := int(math.Round(float64(rows) / target))
 	if groupSize < e.config.MinGroupSize {
@@ -667,8 +809,10 @@ func (e *fecEncoder) updateRedundancy() {
 	if groupSize > e.config.MaxGroupSize {
 		groupSize = e.config.MaxGroupSize
 	}
-	// Never exceed the configured overhead cap.
-	for groupSize < e.config.MaxGroupSize && float64(rows)/float64(groupSize) > overheadCap {
+	// Never exceed the configured overhead cap. The estimate includes the FEC_REPAIR
+	// frame header, so that a group which is exactly at the cap still has room for it
+	// and isn't rejected by the budget in closeGroup.
+	for groupSize < e.config.MaxGroupSize && e.estimatedOverhead(rows, groupSize) > overheadCap {
 		groupSize++
 	}
 	e.rows = rows

@@ -115,7 +115,7 @@ func TestFECRecoversTwoLosses(t *testing.T) {
 }
 
 func TestFECRecoversWithUnequalPacketSizes(t *testing.T) {
-	config := FECConfig{MaxGroupSize: 8, MinGroupSize: 2, MaxOverheadPercent: 50, MaxParityRows: 1}
+	config := FECConfig{MaxGroupSize: 8, MinGroupSize: 2, MaxOverheadPercent: 100, MaxParityRows: 1}
 	sender := newFECState(config)
 	sender.encoder.groupSize = 4
 	sender.encoder.rows = 1
@@ -152,7 +152,7 @@ func TestFECRecoversWithUnequalPacketSizes(t *testing.T) {
 }
 
 func TestFECNothingToRecover(t *testing.T) {
-	config := FECConfig{MaxGroupSize: 8, MinGroupSize: 2, MaxOverheadPercent: 50, MaxParityRows: 1}
+	config := FECConfig{MaxGroupSize: 8, MinGroupSize: 2, MaxOverheadPercent: 100, MaxParityRows: 1}
 	sender := newFECState(config)
 	frames, packets := buildFECGroup(t, sender, 4, 1, 4)
 	receiver := newFECState(config)
@@ -165,7 +165,7 @@ func TestFECNothingToRecover(t *testing.T) {
 }
 
 func TestFECUnrecoverableLossIsCounted(t *testing.T) {
-	config := FECConfig{MaxGroupSize: 8, MinGroupSize: 2, MaxOverheadPercent: 50, MaxParityRows: 1}
+	config := FECConfig{MaxGroupSize: 8, MinGroupSize: 2, MaxOverheadPercent: 100, MaxParityRows: 1}
 	sender := newFECState(config)
 	frames, packets := buildFECGroup(t, sender, 4, 1, 4)
 	receiver := newFECState(config)
@@ -254,8 +254,35 @@ func TestFECIdleWithoutLoss(t *testing.T) {
 	}
 }
 
+// pumpFEC drives a realistic packet stream through the whole encoder send path -
+// loss feedback, group assembly, the flush deadline and the overhead budget - and
+// returns the resulting statistics. Traffic arrives in bursts; the flush deadline is
+// only reached between bursts, which is what produces partial groups.
+func pumpFEC(t *testing.T, config FECConfig, lossPercent uint64, packetCount, packetLength int) FECStats {
+	t.Helper()
+	const burstLength = 128
+	state := newFECState(config)
+	now := monotime.Now()
+	feedback := &wire.FECFeedbackFrame{}
+	for i := range packetCount {
+		now = now.Add(time.Millisecond)
+		feedback.ReceivedPackets += 100 - lossPercent
+		feedback.LostPackets += lossPercent
+		state.encoder.onFeedback(feedback, now)
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, packetLength), 1452, now)
+		flushTime := now
+		if (i+1)%burstLength == 0 {
+			// The burst ended: the open partial group passes its flush deadline.
+			flushTime = now.Add(10 * time.Millisecond)
+		}
+		for state.encoder.pendingRepair(flushTime, 1452) != nil {
+		}
+	}
+	return state.stats()
+}
+
 func TestFECEngagesOnLoss(t *testing.T) {
-	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 16, MinGroupSize: 2, MaxParityRows: 1}
+	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
 	for _, lossPercent := range []uint64{2, 5, 20, 50} {
 		state := newFECState(config)
 		now := monotime.Now()
@@ -270,9 +297,77 @@ func TestFECEngagesOnLoss(t *testing.T) {
 			t.Fatalf("FEC didn't engage at %d%% loss", lossPercent)
 		}
 		stats := state.stats()
-		if stats.SendOverhead > 0.10+1e-9 {
-			t.Fatalf("overhead %v exceeds the configured cap of 10%% at %d%% loss", stats.SendOverhead, lossPercent)
+		if stats.ConfiguredOverhead > 0.10+1e-9 {
+			t.Fatalf("configured overhead %v exceeds the cap of 10%% at %d%% loss", stats.ConfiguredOverhead, lossPercent)
 		}
+	}
+}
+
+// TestFECOverheadCapIsEnforced is the regression test for the production behaviour
+// that made the cap meaningless: a partial group used to be flushed with a full
+// parity packet, which cost up to 50% overhead on sparse traffic while the statistics
+// line kept reporting the configured 6.2%. The cap has to hold on the bytes actually
+// sent, for any packet size.
+func TestFECOverheadCapIsEnforced(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
+	for _, packetLength := range []int{60, 300, 1200, 1400} {
+		stats := pumpFEC(t, config, 5, 3000, packetLength)
+		if stats.ParityPacketsSent == 0 {
+			t.Fatalf("no parity was sent at all with %d byte packets", packetLength)
+		}
+		if stats.MeasuredOverhead > 0.10+1e-9 {
+			t.Fatalf("measured overhead %v exceeds the 10%% cap with %d byte packets (%d parity bytes / %d protected bytes)",
+				stats.MeasuredOverhead, packetLength, stats.ParityBytesSent, stats.ProtectedBytesSent)
+		}
+	}
+}
+
+// TestFECSkipsUnexpandableGroups checks the other half of the contract: when a group
+// is too small to pay for its own parity, it has to be left unprotected rather than
+// being protected over budget.
+func TestFECSkipsUnexpandableGroups(t *testing.T) {
+	// 20 byte packets can never fund a parity packet that has to carry the group
+	// header, so FEC has to leave groups unprotected instead of spending multiples of
+	// the traffic it protects.
+	stats := pumpFEC(t, FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}, 5, 500, 20)
+	if stats.SkippedGroups == 0 {
+		t.Fatal("expected groups to be skipped: 20 byte packets can't pay for their parity")
+	}
+	if stats.MeasuredOverhead > 0.10+1e-9 {
+		t.Fatalf("measured overhead %v exceeds the 10%% cap", stats.MeasuredOverhead)
+	}
+}
+
+// TestFECDoubleRowEngagesByDefault checks that the second parity row - which is what
+// makes a group survive two losses - is actually reachable with the default
+// configuration. It used to be dead code: the default group size was too small for
+// two rows to fit into the default overhead cap.
+func TestFECDoubleRowEngagesByDefault(t *testing.T) {
+	stats := pumpFEC(t, FECConfig{}, 20, 4000, 1200)
+	if stats.ParityRows != 2 {
+		t.Fatalf("expected 2 parity rows at 20%% loss with default settings, got %d", stats.ParityRows)
+	}
+	if stats.ParityPacketsSent == 0 {
+		t.Fatal("no parity was sent at all")
+	}
+	if stats.MeasuredOverhead > 0.10+1e-9 {
+		t.Fatalf("measured overhead %v exceeds the 10%% cap", stats.MeasuredOverhead)
+	}
+}
+
+// TestFECDefaultGroupSizeFitsTwoRows documents the relationship the defaults rely on:
+// MaxGroupSize has to be large enough to pay for MaxParityRows within
+// MaxOverheadPercent, otherwise the extra row is never used.
+func TestFECDefaultGroupSizeFitsTwoRows(t *testing.T) {
+	config := FECConfig{}.withDefaults()
+	if config.MaxParityRows != 2 {
+		t.Fatalf("expected the default parity rows to be 2, got %d", config.MaxParityRows)
+	}
+	state := newFECState(FECConfig{})
+	state.encoder.averageLength = 1200
+	if overhead := state.encoder.estimatedOverhead(config.MaxParityRows, config.MaxGroupSize); overhead > float64(config.MaxOverheadPercent)/100 {
+		t.Fatalf("default MaxGroupSize %d can't pay for %d parity rows within %d%% (overhead %v)",
+			config.MaxGroupSize, config.MaxParityRows, config.MaxOverheadPercent, overhead)
 	}
 }
 
@@ -323,7 +418,9 @@ func TestFECDecaysWithoutFeedback(t *testing.T) {
 }
 
 func TestFECReserveCoversRepairFrame(t *testing.T) {
-	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 16, MinGroupSize: 2, MaxParityRows: 1}
+	// The overhead cap is irrelevant here: this test checks the reserved MTU space,
+	// so it disables the budget by allowing any amount of parity.
+	config := FECConfig{MaxOverheadPercent: 100, MaxGroupSize: 16, MinGroupSize: 2, MaxParityRows: 1}
 	state := newFECState(config)
 	frames, packets := buildFECGroup(t, state, config.MaxGroupSize, 1, config.MaxGroupSize)
 	reserve := state.encoder.reserve()
