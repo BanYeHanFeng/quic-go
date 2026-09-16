@@ -75,6 +75,20 @@ const (
 
 	fecMaxPendingGroups = 8
 	fecCacheSlack       = 16
+	// fecMaxPacketOverhead bounds the space a parity packet spends besides its FEC_REPAIR
+	// frame: a short header (up to 1 + 20 byte connection ID + 4 byte packet number) plus
+	// the AEAD tag (up to 16 bytes). The encoder has to keep this much room in a datagram
+	// when it decides how large a protected packet may be and whether a parity frame
+	// fits. A frame that fits by its own length alone is dropped when it is packed, and
+	// the repair silently never happens - which is exactly what a saturated sender (a
+	// bulk transfer filling every packet to the limit) used to hit.
+	fecMaxPacketOverhead = 1 + 20 + 4 + 16
+	// fecMaxReadyFrames bounds the parity frames waiting to be sent. Parity is only
+	// enqueued when the send queue has room, so a sender that saturates its own send
+	// queue can fall behind. Parity for a group older than the receiver's pending group
+	// window can't be repaired from anymore, so the oldest frames are dropped instead of
+	// being held in memory.
+	fecMaxReadyFrames = 2 * fecMaxPendingGroups
 	// fecMaxPacketDelta is the maximum packet number distance inside one FEC group.
 	// Keeping it below 64 guarantees that packet number deltas fit into 1 byte varints.
 	fecMaxPacketDelta = 63
@@ -168,6 +182,11 @@ type FECStats struct {
 	// SkippedGroups is the number of groups that were left unprotected because their
 	// parity packets would have exceeded MaxOverheadPercent.
 	SkippedGroups uint64
+	// DroppedFrames is the number of parity frames that were discarded because the send
+	// queue stayed busy for too long. It should stay at zero; a growing value means the
+	// sender never gets a chance to send parity, so FEC is not protecting anything on
+	// that connection.
+	DroppedFrames uint64
 
 	// The remaining counters describe the direction we receive on: they are produced
 	// by the decoder and are independent of LossRate, which the peer measures on the
@@ -204,6 +223,9 @@ type fecState struct {
 	// exceeded the cap.
 	consideredBytes atomic.Uint64
 	skippedGroups   atomic.Uint64
+	// droppedFrames counts parity frames that had to be thrown away because the send
+	// queue stayed busy longer than fecMaxReadyFrames allows.
+	droppedFrames atomic.Uint64
 
 	protectedRecv atomic.Uint64
 	recoveredRecv atomic.Uint64
@@ -282,6 +304,7 @@ func (s *fecState) stats() FECStats {
 		ParityPacketsSent:        s.paritySent.Load(),
 		ParityBytesSent:          parityBytes,
 		SkippedGroups:            s.skippedGroups.Load(),
+		DroppedFrames:            s.droppedFrames.Load(),
 		ProtectedPacketsReceived: s.protectedRecv.Load(),
 		RecoveredPackets:         s.recoveredRecv.Load(),
 		FailedPackets:            s.failedRecv.Load(),
@@ -314,7 +337,10 @@ func (c *Conn) dataPacketSizeLimit() protocol.ByteCount {
 	if state == nil || !state.encoder.protecting() {
 		return maxPacketSize
 	}
-	reserve := state.encoder.reserve()
+	// The parity packet carries the longest protected packet plus the frame header, and
+	// spends a short header and an AEAD tag on top of the datagram. All three have to be
+	// kept free, otherwise the parity frame is dropped when it is packed.
+	reserve := state.encoder.reserve() + fecMaxPacketOverhead
 	if reserve >= maxPacketSize {
 		return maxPacketSize
 	}
@@ -418,6 +444,11 @@ func (c *Conn) sendFECFrame(state *fecState, frame wire.Frame, now monotime.Time
 	packet, buf, err := c.packer.PackFECPacket(frame, c.maxPacketSize(), now, c.version)
 	if err != nil {
 		if err == errNothingToPack || err == errFECFrameTooLarge {
+			// The frame was already taken off the encoder's queue, so this is a lost
+			// repair. It shouldn't happen for the encoder's own frames - they are sized
+			// to fit - but a feedback frame can be larger than expected, so it is worth
+			// seeing rather than dropping silently.
+			c.logger.Debugf("dropping FEC frame that doesn't fit into a datagram: %s", err)
 			return nil
 		}
 		return err
@@ -608,9 +639,10 @@ func (e *fecEncoder) closeGroup(group *fecGroup, maxPacketSize protocol.ByteCoun
 		return
 	}
 	headerReserve := e.repairHeaderReserve(len(group.packetNumbers))
-	if group.maxLength+headerReserve > maxPacketSize {
-		// The parity packet wouldn't fit into a datagram. Skip this group instead of
-		// sending a packet that can't be transmitted.
+	if group.maxLength+headerReserve+fecMaxPacketOverhead > maxPacketSize {
+		// The parity packet wouldn't fit into a datagram, short header and AEAD tag
+		// included. Skip this group instead of queueing a frame that has to be dropped
+		// again when it is packed.
 		return
 	}
 	var protectedBytes int
@@ -635,6 +667,14 @@ func (e *fecEncoder) closeGroup(group *fecGroup, maxPacketSize protocol.ByteCoun
 			Parity:            group.parity[row],
 		}
 		e.ready = append(e.ready, frame)
+	}
+	if len(e.ready) > fecMaxReadyFrames {
+		// The send queue stayed busy for long enough that parity frames piled up. Parity
+		// older than the receiver's pending group window can't be repaired from anymore,
+		// so drop the oldest instead of growing without bound.
+		dropped := len(e.ready) - fecMaxReadyFrames
+		e.ready = append(e.ready[:0], e.ready[dropped:]...)
+		e.state.droppedFrames.Add(uint64(dropped))
 	}
 	e.state.protectedSent.Add(uint64(len(group.packetNumbers)))
 	e.state.protectedBytes.Add(uint64(protectedBytes))

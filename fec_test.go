@@ -479,6 +479,41 @@ func TestFECReserveCoversRepairFrame(t *testing.T) {
 	}
 }
 
+// TestFECRepairFrameFitsIntoDatagram checks the invariant that made parity disappear on
+// a saturated sender. The encoder used to size protected packets so that the parity
+// frame filled the whole datagram by itself, leaving no room for the short header and
+// the AEAD tag that every packet spends on top of its frames. Those parity frames were
+// built, handed to the packer and dropped, so the repair silently never happened -
+// exactly when a bulk transfer was filling every packet to the limit.
+func TestFECRepairFrameFitsIntoDatagram(t *testing.T) {
+	const maxPacketSize protocol.ByteCount = 1252
+	config := FECConfig{MaxOverheadPercent: 100, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
+	state := newFECState(config)
+	// The largest packet the encoder advertises for protection.
+	protectedLimit := maxPacketSize - state.encoder.reserve() - fecMaxPacketOverhead
+	now := monotime.Now()
+	var frames []*wire.FECRepairFrame
+	for i := range config.MaxGroupSize {
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, int(protectedLimit)), maxPacketSize, now)
+		for {
+			frame := state.encoder.pendingRepair(now, maxPacketSize)
+			if frame == nil {
+				break
+			}
+			frames = append(frames, frame)
+		}
+	}
+	if len(frames) == 0 {
+		t.Fatal("no parity frame was produced")
+	}
+	for _, frame := range frames {
+		if size := frame.Length(protocol.Version1) + fecMaxPacketOverhead; size > maxPacketSize {
+			t.Fatalf("parity frame is %d bytes including the packet overhead, which doesn't fit into a %d byte datagram",
+				size, maxPacketSize)
+		}
+	}
+}
+
 func TestGF256Multiplication(t *testing.T) {
 	for a := range 256 {
 		for b := range 256 {
