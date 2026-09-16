@@ -312,6 +312,55 @@ func TestFECWindowReserveCoversRepairFrame(t *testing.T) {
 	}
 }
 
+// TestFECWindowDropsRowsItCannotEvaluate verifies that a repair row which protects
+// packets that were received and then left the decoder's cache is dropped instead of
+// being turned into an equation that can never be solved. Without the check, every such
+// row would also report the packets it can't evaluate as missing.
+func TestFECWindowDropsRowsItCannotEvaluate(t *testing.T) {
+	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 8, MaxOverheadPercent: 100, MaxParityRows: 1}
+	sender := newWindowTestSender(config, 1)
+	receiver := newFECWindowState(config)
+	var early []*wire.FECWindowRepairFrame
+	for i := 0; i < 200; i++ {
+		pn := protocol.PacketNumber(1000 + i)
+		data := randomPacket(t, 600)
+		rows := sender.send(t, pn, data)
+		if i < 20 {
+			early = append(early, rows...)
+		}
+		receiver.decoder.recordPacket(pn, data, protocol.KeyPhaseZero)
+	}
+	if len(early) == 0 {
+		t.Fatal("no repair row was emitted early in the transfer")
+	}
+	var recovered int
+	for _, row := range early {
+		recovered += len(receiver.decoder.handleRepair(row, sender.now))
+	}
+	if recovered != 0 {
+		t.Fatalf("rows over packets that left the cache reconstructed %d packets", recovered)
+	}
+	if len(receiver.decoder.missing) != 0 {
+		t.Fatalf("rows over packets that left the cache were kept as equations over %d missing packets", len(receiver.decoder.missing))
+	}
+}
+
+// TestFECWindowRateKeepsRowBasesDistinct verifies that the redundancy stays low enough
+// for a window larger than the number of row bases: two rows that share a member must
+// never use the same base, otherwise they are not linearly independent.
+func TestFECWindowRateKeepsRowBasesDistinct(t *testing.T) {
+	for _, windowSize := range []int{16, 64, 128} {
+		config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: windowSize, MaxOverheadPercent: 100}
+		state := newFECWindowState(config)
+		now := monotime.Now()
+		state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 1000, LostPackets: 500}, now)
+		coverage := state.encoder.rate * float64(windowSize)
+		if coverage > float64(fecWindowCauchyRows) {
+			t.Fatalf("window %d: a packet is covered by %v rows, but only %d row bases exist", windowSize, coverage, fecWindowCauchyRows)
+		}
+	}
+}
+
 // TestFECWindowCoefficientsAreMDS checks the property the sliding window code relies
 // on: any three rows reconstruct any three members of the window, whatever their
 // positions. It is the Cauchy determinant formula, checked on a few row and member

@@ -216,6 +216,8 @@ type fecScheme interface {
 	hasPending() bool
 	// frameSent accounts a frame that was handed to the send queue.
 	frameSent(frame wire.Frame, v protocol.Version)
+	// frameDropped accounts a frame that couldn't be sent at all.
+	frameDropped()
 	// flushDeadline is the time at which an idle sender protects the packets that are
 	// still pending, or a zero time if there is nothing to protect.
 	flushDeadline() monotime.Time
@@ -546,9 +548,11 @@ func (c *Conn) sendFECFrame(scheme fecScheme, frame wire.Frame, now monotime.Tim
 	if err != nil {
 		if err == errNothingToPack || err == errFECFrameTooLarge {
 			// The frame was already taken off the encoder's queue, so this is a lost
-			// repair. It shouldn't happen for the encoder's own frames - they are sized
-			// to fit - but a feedback frame can be larger than expected, so it is worth
-			// seeing rather than dropping silently.
+			// repair. The encoder sizes its frames to fit, so this shouldn't happen to
+			// them - but a feedback frame can be larger than expected, and a path MTU
+			// that shrank between building and packing a row makes it reachable for
+			// repair frames as well. It is counted rather than dropped silently.
+			scheme.frameDropped()
 			c.logger.Debugf("dropping FEC frame that doesn't fit into a datagram: %s", err)
 			return nil
 		}
@@ -608,6 +612,8 @@ func (s *fecState) frameSent(frame wire.Frame, v protocol.Version) {
 }
 
 func (s *fecState) flushDeadline() monotime.Time { return s.encoder.flushDeadline() }
+
+func (s *fecState) frameDropped() { s.droppedFrames.Add(1) }
 
 // fecGroup is an FEC group that is currently being filled.
 type fecGroup struct {

@@ -68,8 +68,9 @@ const (
 	fecWindowMaxReadyFrames = 8
 	// fecWindowMaxPendingRows bounds the equations the decoder keeps. A row whose
 	// unknowns never become solvable is useless, and the rows are superseded by the
-	// rows that follow them.
-	fecWindowMaxPendingRows = 24
+	// rows that follow them. It also bounds the work of one decoding pass, which is
+	// quadratic in the number of rows.
+	fecWindowMaxPendingRows = 16
 	// fecWindowCreditLimit bounds the parity bytes the sender may spend out of the
 	// credit it accumulated while the path looked lossless. The long term overhead
 	// stays within the cap because the credit accrues at the cap; the limit only keeps
@@ -236,6 +237,8 @@ func (s *fecWindowState) frameSent(frame wire.Frame, v protocol.Version) {
 }
 
 func (s *fecWindowState) flushDeadline() monotime.Time { return s.encoder.flushDeadline() }
+
+func (s *fecWindowState) frameDropped() { s.droppedFrames.Add(1) }
 
 // fecWindowMember is a packet that is currently protected: the bytes of the packet as
 // they were written to the wire, so that a parity row can be computed from them later.
@@ -406,6 +409,14 @@ func (e *fecWindowEncoder) updateRedundancy() {
 	if maxRate > 1 {
 		maxRate = 1
 	}
+	// Two rows whose numbers are congruent modulo fecWindowCauchyRows use the same row
+	// base, and a repair row is only invertible against rows with a different base. A
+	// packet is covered by about window*rate consecutive rows, so keeping that product
+	// below fecWindowCauchyRows guarantees that two rows that share a member always
+	// have different bases.
+	if sameBase := float64(fecWindowCauchyRows) / float64(e.windowSize); maxRate > sameBase {
+		maxRate = sameBase
+	}
 	rate := math.Min(required, maxRate)
 	if rate < 0 {
 		rate = 0
@@ -489,6 +500,13 @@ func (e *fecWindowEncoder) evict(newest protocol.PacketNumber) {
 // returns false when the row can't be built or can't be paid for out of the byte
 // budget, in which case the caller drops the row credit instead of saving it up.
 func (e *fecWindowEncoder) emitRow(maxPacketSize protocol.ByteCount) bool {
+	// The parity pass is the expensive part of a row. Refuse a row the byte budget
+	// can't pay for before computing it; the exact check below still runs on the frame
+	// that is actually built.
+	if length := e.estimatedRowLength(); length > 0 && float64(length) > e.credit {
+		e.state.skippedRows.Add(1)
+		return false
+	}
 	frame := e.buildRow(maxPacketSize)
 	if frame == nil {
 		e.state.skippedRows.Add(1)
@@ -511,6 +529,27 @@ func (e *fecWindowEncoder) emitRow(maxPacketSize protocol.ByteCount) bool {
 		e.state.droppedFrames.Add(uint64(dropped))
 	}
 	return true
+}
+
+// estimatedRowLength is a lower bound for the size of the next repair row: the header
+// that describes the current window plus its longest member. It is computed without any
+// GF arithmetic, so a row the byte budget can't pay for is refused before its parity is
+// computed.
+func (e *fecWindowEncoder) estimatedRowLength() protocol.ByteCount {
+	if len(e.members) < fecWindowMinMembers {
+		return 0
+	}
+	span := uint64(e.members[len(e.members)-1].packetNumber-e.members[0].packetNumber) + 1
+	if span > e.maxSpan {
+		span = e.maxSpan
+	}
+	var maxLength protocol.ByteCount
+	for _, member := range e.members {
+		if length := protocol.ByteCount(len(member.data)); length > maxLength {
+			maxLength = length
+		}
+	}
+	return maxLength + fecWindowFrameBytes(span)
 }
 
 // buildRow computes one parity row over the current window. It returns nil when the
@@ -622,6 +661,9 @@ type fecWindowDecoder struct {
 	config     FECConfig
 	windowSize int
 	cacheSize  int
+	// maxMissing bounds the packet numbers the decoder tracks as missing, which only
+	// feed the statistics.
+	maxMissing int
 
 	cache        map[protocol.PacketNumber][]byte
 	order        []protocol.PacketNumber
@@ -637,6 +679,13 @@ type fecWindowDecoder struct {
 	// (and FEC has not reconstructed) yet. Entries that stay missing for longer than
 	// fecWindowMissingTimeout are given up on and counted as unrecoverable.
 	missing map[protocol.PacketNumber]monotime.Time
+
+	// staleBefore is the highest packet number that left the cache (or that belongs to
+	// a key phase whose keys are gone). A repair row that references a packet below it
+	// that is no longer cached can't be evaluated - the contribution of a packet the
+	// decoder doesn't have is unknown - so the row is dropped instead of turning into
+	// an equation that can never be solved.
+	staleBefore protocol.PacketNumber
 
 	pending []*fecWindowPendingRow
 
@@ -662,6 +711,7 @@ func newFECWindowDecoder(state *fecWindowState, config FECConfig) *fecWindowDeco
 		config:     config,
 		windowSize: windowSize,
 		cacheSize:  2*windowSize + fecWindowCacheSlack,
+		maxMissing: 4 * (2*windowSize + fecWindowCacheSlack),
 	}
 }
 
@@ -680,7 +730,10 @@ func (d *fecWindowDecoder) reset() {
 func (d *fecWindowDecoder) recordPacket(pn protocol.PacketNumber, data []byte, keyPhase protocol.KeyPhaseBit) []fecRecoveredPacket {
 	d.tracker.record(pn)
 	if d.haveKeyPhase && keyPhase != d.keyPhase {
-		// Packets of the previous key phase can't be decrypted anymore.
+		// Packets of the previous key phase can't be decrypted anymore: everything the
+		// decoder holds is stale, and so is everything it might still reconstruct from
+		// the rows that protect the packets of that phase.
+		d.staleBefore = d.tracker.largest
 		d.reset()
 	}
 	d.keyPhase = keyPhase
@@ -705,6 +758,9 @@ func (d *fecWindowDecoder) cachePacket(pn protocol.PacketNumber, data []byte) {
 		evicted := d.order[0]
 		d.order = d.order[1:]
 		delete(d.cache, evicted)
+		if evicted > d.staleBefore {
+			d.staleBefore = evicted
+		}
 	}
 	delete(d.missing, pn)
 }
@@ -764,21 +820,37 @@ func (d *fecWindowDecoder) expireMissing(now monotime.Time) {
 // that the connection can process it like a packet that arrived on the wire.
 func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now monotime.Time) []fecRecoveredPacket {
 	d.state.parityRecv.Add(1)
-	if d.missing == nil {
-		d.missing = make(map[protocol.PacketNumber]monotime.Time)
-	}
 	missing := make([]int, 0, len(frame.PacketNumbers))
+	trackMissing := func(pn protocol.PacketNumber) {
+		// The set only feeds the statistics; the equation is built from the cache
+		// contents. It is bounded so that a peer can't make the decoder hold an
+		// unbounded number of packet numbers.
+		if len(d.missing) >= d.maxMissing {
+			return
+		}
+		if _, ok := d.missing[pn]; ok {
+			return
+		}
+		if d.missing == nil {
+			d.missing = make(map[protocol.PacketNumber]monotime.Time)
+		}
+		d.missing[pn] = now
+	}
 	for position, pn := range frame.PacketNumbers {
 		d.markProtected(pn)
 		if _, ok := d.cache[pn]; ok {
 			continue
 		}
-		if _, ok := d.missing[pn]; !ok {
-			d.missing[pn] = now
+		if pn <= d.staleBefore {
+			// The packet was received and then left the cache, or it belongs to a key
+			// phase whose keys are gone. The row can't be evaluated without it, and the
+			// packet itself is not something FEC can still reconstruct, so the row is
+			// dropped instead of becoming an equation that can never be solved.
+			return nil
 		}
+		trackMissing(pn)
 		missing = append(missing, position)
 	}
-	d.expireMissing(now)
 	if len(missing) == 0 {
 		return nil
 	}
@@ -882,7 +954,7 @@ func (d *fecWindowDecoder) pump() []fecRecoveredPacket {
 func (d *fecWindowDecoder) mergePivot(index int) bool {
 	row := d.pending[index]
 	for j, other := range d.pending {
-		if j == index || other.pivot != row.pivot {
+		if j == index || other.pivot != row.pivot || len(other.coeffs) == 0 {
 			continue
 		}
 		pivot := row.pivot
@@ -944,13 +1016,16 @@ func (d *fecWindowDecoder) solve(row *fecWindowPendingRow) (fecRecoveredPacket, 
 // of the path is measured locally (packet number gaps), so reports are sent even while
 // FEC is idle: they are what makes the sender engage FEC in the first place.
 func (d *fecWindowDecoder) pendingFeedback(now monotime.Time) *wire.FECFeedbackFrame {
-	d.expireMissing(now)
 	if !d.tracker.initialized {
 		return nil
 	}
 	if !d.feedbackTime.IsZero() && now.Sub(d.feedbackTime) < fecFeedbackInterval {
 		return nil
 	}
+	// Expiring the missing packets is rate limited with the reports: the decoder is
+	// asked for feedback on every send loop iteration, and the set can hold hundreds of
+	// packet numbers.
+	d.expireMissing(now)
 	if d.tracker.received == d.reportedReceived && d.tracker.lost == d.reportedLost {
 		return nil
 	}
