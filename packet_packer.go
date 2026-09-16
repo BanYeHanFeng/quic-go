@@ -519,7 +519,7 @@ func (p *packetPacker) AppendPacket(buf *packetBuffer, maxSize protocol.ByteCoun
 }
 
 // PackFECPacket packs a packet containing a single packet level FEC frame
-// (a FEC_REPAIR or FEC_FEEDBACK frame).
+// (a repair row or a FEC_FEEDBACK frame).
 func (p *packetPacker) PackFECPacket(frame wire.Frame, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
 	sealer, err := p.cryptoSetup.Get1RTTSealer()
 	if err != nil {

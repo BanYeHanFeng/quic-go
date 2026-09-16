@@ -188,29 +188,22 @@ func newFECTestPair(t *testing.T) *fecTestPair {
 // parity frames, the real send path.
 const fecTestOverheadCap = 25
 
+// enableFEC turns on packet level FEC with the configuration QUICX uses by default,
+// on both endpoints of the pair.
 func enableFEC(t *testing.T, conn *Conn, name string) {
 	t.Helper()
-	if err := conn.EnableFEC(FECConfig{MaxOverheadPercent: fecTestOverheadCap, MaxGroupSize: 8, MinGroupSize: 2, MaxParityRows: 1}); err != nil {
+	if err := conn.EnableFEC(FECConfig{MaxOverheadPercent: fecTestOverheadCap, MaxGroupSize: 32, MaxParityRows: 2}); err != nil {
 		t.Fatalf("enabling FEC on the %s failed: %v", name, err)
 	}
 }
 
-// enableWindowFEC enables the sliding window scheme, which is selected on both ends by
-// the QUICX handshake in production.
-func enableWindowFEC(t *testing.T, conn *Conn, name string) {
-	t.Helper()
-	if err := conn.EnableFEC(FECConfig{Scheme: FECSchemeWindow, MaxOverheadPercent: fecTestOverheadCap, MaxGroupSize: 32, MaxParityRows: 2}); err != nil {
-		t.Fatalf("enabling window FEC on the %s failed: %v", name, err)
-	}
-}
-
 // requireOverheadWithinCap fails when an endpoint spent more parity traffic than the
-// configured share of the traffic FEC evaluated.
+// configured share of the traffic FEC protected.
 func requireOverheadWithinCap(t *testing.T, name string, stats FECStats) {
 	t.Helper()
 	if stats.MeasuredOverhead > float64(fecTestOverheadCap)/100+1e-9 {
-		t.Fatalf("%s measured overhead %v exceeds the %d%% cap (%d parity bytes / %d considered bytes)",
-			name, stats.MeasuredOverhead, fecTestOverheadCap, stats.ParityBytesSent, stats.ConsideredBytesSent)
+		t.Fatalf("%s measured overhead %v exceeds the %d%% cap (%d parity bytes / %d protected bytes)",
+			name, stats.MeasuredOverhead, fecTestOverheadCap, stats.ParityBytesSent, stats.ProtectedBytesSent)
 	}
 }
 
@@ -290,8 +283,8 @@ func TestFECCleanPathSendsNoParity(t *testing.T) {
 	if stats.ParityPacketsSent != 0 {
 		t.Fatalf("FEC sent %d parity packets (%d bytes) on a lossless path", stats.ParityPacketsSent, stats.ParityBytesSent)
 	}
-	if stats.GroupSize != 0 {
-		t.Fatalf("FEC is active on a lossless path (group size %d)", stats.GroupSize)
+	if stats.WindowSize != 0 {
+		t.Fatalf("FEC is active on a lossless path (window size %d)", stats.WindowSize)
 	}
 }
 
@@ -504,15 +497,15 @@ func TestFECRecoversLostPacketsGSO(t *testing.T) {
 	requireOverheadWithinCap(t, "server (GSO)", serverStats)
 }
 
-// TestFECWindowRecoversLostPackets is the sliding window counterpart of
-// TestFECRecoversLostPackets: the packets lost on the wire are reconstructed from the
-// window repair rows, and the parity traffic stays within the configured cap.
-func TestFECWindowRecoversLostPackets(t *testing.T) {
+// TestFECRecoversLostPacketsLowerLoss runs the same transfer with a lower loss rate:
+// the redundancy the loss rate asks for still fits into the cap, and the window
+// reconstructs the losses without spending more than the cap allows.
+func TestFECRecoversLostPacketsLowerLoss(t *testing.T) {
 	pair := newFECTestPair(t)
 	defer pair.Close()
 	<-pair.clientConn.HandshakeComplete()
-	enableWindowFEC(t, pair.clientConn, "client")
-	enableWindowFEC(t, pair.serverConn, "server")
+	enableFEC(t, pair.clientConn, "client")
+	enableFEC(t, pair.serverConn, "server")
 
 	// Drop every 16th packet in both directions (about 12% when both drop points are
 	// counted): the redundancy the loss rate asks for fits into the 25% cap, so the
@@ -526,9 +519,6 @@ func TestFECWindowRecoversLostPackets(t *testing.T) {
 		t.Fatalf("payload mismatch: got %d bytes, expected %d", len(received), len(payload))
 	}
 	stats := pair.serverConn.FECStats()
-	if stats.Scheme != FECSchemeWindow {
-		t.Fatalf("unexpected FEC scheme: %v", stats.Scheme)
-	}
 	if stats.ParityPacketsReceived == 0 {
 		t.Fatal("the receiver didn't see any repair row")
 	}
@@ -539,16 +529,16 @@ func TestFECWindowRecoversLostPackets(t *testing.T) {
 	requireOverheadWithinCap(t, "server", stats)
 }
 
-// TestFECWindowRecoversBurstLossesPath drops bursts of consecutive packets on the
-// path: the whole burst lands in the same window, and the rows that cover it
-// reconstruct all of it. The block scheme can only repair a burst as long as the
-// number of parity rows of one group.
-func TestFECWindowRecoversBurstLossesPath(t *testing.T) {
+// TestFECRecoversBurstLossesPath drops bursts of consecutive packets on the path: the
+// whole burst lands in the same window, and the rows that cover it reconstruct all of
+// it. A block code could only repair a burst as long as the number of parity rows of
+// one group.
+func TestFECRecoversBurstLossesPath(t *testing.T) {
 	pair := newFECTestPair(t)
 	defer pair.Close()
 	<-pair.clientConn.HandshakeComplete()
-	enableWindowFEC(t, pair.clientConn, "client")
-	enableWindowFEC(t, pair.serverConn, "server")
+	enableFEC(t, pair.clientConn, "client")
+	enableFEC(t, pair.serverConn, "server")
 
 	// Three consecutive packets every 32 packets: about 9% loss, all of it in bursts.
 	// The redundancy the loss rate asks for gives the window enough rows over a burst

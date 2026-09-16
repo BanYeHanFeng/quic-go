@@ -167,10 +167,10 @@ type Conn struct {
 
 	maxPayloadSizeEstimate atomic.Uint32
 
-	// fecState holds the packet level FEC scheme of the connection, or nil while FEC is
+	// fecState holds the packet level FEC state of the connection, or nil while FEC is
 	// disabled. Only the connection's run loop goroutine reads and writes it; the
 	// statistics are read from other goroutines through FECStats.
-	fecState atomic.Pointer[fecScheme]
+	fecState atomic.Pointer[fecWindowState]
 
 	initialStream       *initialCryptoStream
 	handshakeStream     *cryptoStream
@@ -1989,7 +1989,7 @@ func (c *Conn) handleFrame(
 		err = c.connIDGenerator.Retire(frame.SequenceNumber, destConnID, rcvTime.Add(3*c.rttStats.PTO(false)))
 	case *wire.HandshakeDoneFrame:
 		err = c.handleHandshakeDoneFrame(rcvTime)
-	case *wire.FECRepairFrame, *wire.FECWindowRepairFrame, *wire.FECFeedbackFrame:
+	case *wire.FECWindowRepairFrame, *wire.FECFeedbackFrame:
 		err = c.handleFECFrame(frame, rcvTime)
 	default:
 		err = fmt.Errorf("unexpected frame type: %s", reflect.ValueOf(&frame).Elem().Type().Name())

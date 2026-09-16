@@ -7,126 +7,6 @@ import (
 	"github.com/sagernet/quic-go/internal/protocol"
 )
 
-func TestFECRepairFrameRoundTrip(t *testing.T) {
-	frame := &FECRepairFrame{
-		Group:             12,
-		Row:               0,
-		RowCount:          1,
-		PacketCount:       3,
-		FirstPacketNumber: 42,
-		PacketNumbers:     []protocol.PacketNumber{42, 43, 45},
-		Lengths:           []protocol.ByteCount{100, 120, 90},
-		Parity:            bytes.Repeat([]byte{0xab}, 120),
-	}
-	data, err := frame.Append(nil, protocol.Version1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if frame.Length(protocol.Version1) != protocol.ByteCount(len(data)) {
-		t.Fatalf("length mismatch: %d vs %d", frame.Length(protocol.Version1), len(data))
-	}
-	parsed, n, err := parseFECRepairFrame(data[1:], protocol.Version1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != len(data)-1 {
-		t.Fatalf("expected to consume %d bytes, consumed %d", len(data)-1, n)
-	}
-	if parsed.Group != frame.Group || parsed.Row != frame.Row || parsed.RowCount != frame.RowCount {
-		t.Fatalf("unexpected group/row: %+v", parsed)
-	}
-	if parsed.PacketCount != frame.PacketCount || parsed.FirstPacketNumber != frame.FirstPacketNumber {
-		t.Fatalf("unexpected packet count / first packet number: %+v", parsed)
-	}
-	if len(parsed.PacketNumbers) != len(frame.PacketNumbers) {
-		t.Fatalf("unexpected packet numbers: %v", parsed.PacketNumbers)
-	}
-	for i := range frame.PacketNumbers {
-		if parsed.PacketNumbers[i] != frame.PacketNumbers[i] {
-			t.Fatalf("unexpected packet number at index %d: %d", i, parsed.PacketNumbers[i])
-		}
-	}
-	for i := range frame.Lengths {
-		if parsed.Lengths[i] != frame.Lengths[i] {
-			t.Fatalf("unexpected length at index %d: %d", i, parsed.Lengths[i])
-		}
-	}
-	if !bytes.Equal(parsed.Parity, frame.Parity) {
-		t.Fatal("parity mismatch")
-	}
-	reencoded, err := parsed.Append(nil, protocol.Version1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(reencoded, data) {
-		t.Fatal("re-encoding mismatch")
-	}
-}
-
-func TestFECRepairFrameTruncated(t *testing.T) {
-	frame := &FECRepairFrame{
-		Group:             1,
-		Row:               0,
-		RowCount:          1,
-		PacketCount:       2,
-		FirstPacketNumber: 10,
-		PacketNumbers:     []protocol.PacketNumber{10, 11},
-		Lengths:           []protocol.ByteCount{50, 60},
-		Parity:            bytes.Repeat([]byte{1}, 60),
-	}
-	data, err := frame.Append(nil, protocol.Version1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 1; i < len(data); i++ {
-		if _, _, err := parseFECRepairFrame(data[1:i], protocol.Version1); err == nil {
-			t.Fatalf("expected an error for a truncated frame of %d bytes", i)
-		}
-	}
-}
-
-func TestFECRepairFrameInvalid(t *testing.T) {
-	valid := &FECRepairFrame{
-		Group:             1,
-		Row:               0,
-		RowCount:          1,
-		PacketCount:       2,
-		FirstPacketNumber: 10,
-		PacketNumbers:     []protocol.PacketNumber{10, 11},
-		Lengths:           []protocol.ByteCount{50, 60},
-		Parity:            bytes.Repeat([]byte{1}, 60),
-	}
-	data, err := valid.Append(nil, protocol.Version1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// parity length doesn't match the longest protected packet
-	invalid := *valid
-	invalid.Parity = bytes.Repeat([]byte{1}, 59)
-	invalidData, err := invalid.Append(nil, protocol.Version1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := parseFECRepairFrame(invalidData[1:], protocol.Version1); err == nil {
-		t.Fatal("expected an error for a mismatching parity length")
-	}
-	// a single protected packet is invalid
-	invalid = *valid
-	invalid.PacketCount = 1
-	invalid.PacketNumbers = []protocol.PacketNumber{10}
-	invalid.Lengths = []protocol.ByteCount{50}
-	invalidData, err = invalid.Append(nil, protocol.Version1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := parseFECRepairFrame(invalidData[1:], protocol.Version1); err == nil {
-		t.Fatal("expected an error for a single protected packet")
-	}
-	if len(data) == 0 {
-		t.Fatal("unreachable")
-	}
-}
-
 func TestFECFeedbackFrameRoundTrip(t *testing.T) {
 	frame := &FECFeedbackFrame{
 		ReceivedPackets:  1234,
@@ -156,7 +36,7 @@ func TestFECFeedbackFrameRoundTrip(t *testing.T) {
 
 func TestFECFrameTypesAccepted(t *testing.T) {
 	parser := NewFrameParser(false, false, false)
-	for _, frameType := range []FrameType{FrameTypeFECRepair, FrameTypeFECFeedback, FrameTypeFECWindowRepair} {
+	for _, frameType := range []FrameType{FrameTypeFECFeedback, FrameTypeFECWindowRepair} {
 		typ, _, err := parser.ParseType([]byte{byte(frameType)}, protocol.Encryption1RTT)
 		if err != nil {
 			t.Fatalf("frame type %#x rejected at 1-RTT: %v", frameType, err)

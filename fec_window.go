@@ -12,20 +12,21 @@ import (
 
 // Sliding window (convolutional) packet level forward error correction.
 //
-// This is the second packet level FEC scheme of the fork, used by sing-box QUICX. It
-// exists because a block code has two structural weaknesses on the paths QUICX is used
-// on:
+// This is the packet level FEC scheme of the fork, used by sing-box QUICX. It
+// replaced the group based block scheme the fork used to have, which had two
+// structural weaknesses on the paths QUICX is used on:
 //
-//   - All or nothing per group. The sender protects a closed group of k packets with a
-//     fixed number of parity rows m. A group that loses more than m packets is not
-//     partly repaired, it is not repaired at all: every missing packet of the group
-//     falls back to a retransmission. Mobile paths lose packets in bursts, so the
-//     number of unrecoverable packets stays high even though most groups only lose one
-//     or two packets.
-//   - Cost of the group tail. A group is only worth protecting when its parity fits
+//   - All or nothing per group. The sender protected a closed group of k packets with
+//     a fixed number of parity rows m. A group that lost more than m packets was not
+//     partly repaired, it was not repaired at all: every missing packet of the group
+//     fell back to a retransmission. Mobile paths lose packets in bursts, so the
+//     number of unrecoverable packets stayed high even though most groups only lost
+//     one or two packets.
+//   - Cost of the group tail. A group was only worth protecting when its parity fit
 //     into the overhead cap. The last packets before an idle period, and the packets of
-//     a low rate flow, end up in small groups that cannot pay for their own parity, so
-//     they are skipped - on a path that is losing packets exactly at those moments.
+//     a low rate flow, ended up in small groups that could not pay for their own
+//     parity, so they were skipped - on a path that is losing packets exactly at those
+//     moments.
 //
 // The sliding window scheme replaces the group with a window of the most recent
 // packets and emits one repair row for it at the configured redundancy. Successive
@@ -51,9 +52,9 @@ import (
 
 const (
 	// defaultFECWindowSize is the number of packets one window protects, unless the
-	// configuration asks for another size. It is larger than the block scheme's default
-	// group size: a window row is superseded by the rows that follow it, so a large
-	// window trades memory for burst tolerance, not recovery latency.
+	// configuration asks for another size. A window row is superseded by the rows that
+	// follow it, so a large window trades memory for burst tolerance, not recovery
+	// latency.
 	defaultFECWindowSize = 64
 	// fecWindowMaxFlushRows bounds the number of rows an idle sender emits for the tail
 	// of its window.
@@ -135,13 +136,12 @@ type fecWindowState struct {
 	lossBits   atomic.Uint64 // math.Float64bits of the smoothed loss rate
 	windowSize atomic.Int64  // configured window size while FEC is active, 0 while idle
 
-	protectedSent   atomic.Uint64
-	protectedBytes  atomic.Uint64
-	paritySent      atomic.Uint64
-	parityBytes     atomic.Uint64
-	consideredBytes atomic.Uint64
-	skippedRows     atomic.Uint64
-	droppedFrames   atomic.Uint64
+	protectedSent  atomic.Uint64
+	protectedBytes atomic.Uint64
+	paritySent     atomic.Uint64
+	parityBytes    atomic.Uint64
+	skippedRows    atomic.Uint64
+	droppedFrames  atomic.Uint64
 
 	protectedRecv atomic.Uint64
 	recoveredRecv atomic.Uint64
@@ -171,16 +171,14 @@ func (s *fecWindowState) stats() FECStats {
 	parityBytes := s.parityBytes.Load()
 	stats := FECStats{
 		Enabled:                  true,
-		Scheme:                   FECSchemeWindow,
-		GroupSize:                int(s.windowSize.Load()),
+		WindowSize:               int(s.windowSize.Load()),
 		LossRate:                 s.lossRate(),
-		ConfiguredOverhead:       rate,
+		RedundancyRate:           rate,
 		ProtectedPacketsSent:     s.protectedSent.Load(),
 		ProtectedBytesSent:       protectedBytes,
-		ConsideredBytesSent:      s.consideredBytes.Load(),
 		ParityPacketsSent:        s.paritySent.Load(),
 		ParityBytesSent:          parityBytes,
-		SkippedGroups:            s.skippedRows.Load(),
+		SkippedRows:              s.skippedRows.Load(),
 		DroppedFrames:            s.droppedFrames.Load(),
 		ProtectedPacketsReceived: s.protectedRecv.Load(),
 		RecoveredPackets:         s.recoveredRecv.Load(),
@@ -453,7 +451,6 @@ func (e *fecWindowEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxP
 	// Every protected packet adds to the budget of the overhead cap, whether or not a
 	// row is sent for it: that is what makes the measured overhead comparable to the
 	// cap.
-	e.state.consideredBytes.Add(uint64(len(data)))
 	e.state.protectedSent.Add(1)
 	e.state.protectedBytes.Add(uint64(len(data)))
 	e.credit = math.Min(e.credit+e.overheadCap*float64(len(data)), fecWindowCreditLimit)

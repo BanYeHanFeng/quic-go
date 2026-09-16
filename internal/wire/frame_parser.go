@@ -170,8 +170,6 @@ func (p *FrameParser) ParseLessCommonFrame(frameType FrameType, data []byte, v p
 		frame, l, err = parseAckFrequencyFrame(data, v)
 	case FrameTypeImmediateAck:
 		frame = &ImmediateAckFrame{}
-	case FrameTypeFECRepair:
-		frame, l, err = parseFECRepairFrame(data, v)
 	case FrameTypeFECFeedback:
 		frame, l, err = parseFECFeedbackFrame(data, v)
 	case FrameTypeFECWindowRepair:

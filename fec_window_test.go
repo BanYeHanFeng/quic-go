@@ -93,27 +93,27 @@ func windowTestTransfer(t *testing.T, config FECConfig, rate float64, count int,
 	return packets, recovered, receiver
 }
 
-func TestFECWindowRecoversSingleLoss(t *testing.T) {
+func TestFECRecoversSingleLoss(t *testing.T) {
 	for _, packetCount := range []int{8, 40, 200} {
-		config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
+		config := FECConfig{MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
 		lost := map[protocol.PacketNumber]bool{1007: true}
 		packets, recovered, _ := windowTestTransfer(t, config, 0.5, packetCount, lost)
 		requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{1007})
 	}
 }
 
-func TestFECWindowRecoversBurstLosses(t *testing.T) {
-	// A burst of four consecutive packets. The block scheme can only repair a burst
-	// smaller than the number of parity rows of the group; the window rows that cover
-	// the burst are independent of each other, so the whole burst is reconstructed.
-	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
+func TestFECRecoversBurstLosses(t *testing.T) {
+	// A burst of four consecutive packets. The rows that cover the burst are
+	// independent of each other - each of them protects the whole window - so the
+	// whole burst is reconstructed.
+	config := FECConfig{MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
 	lost := map[protocol.PacketNumber]bool{1005: true, 1006: true, 1007: true, 1008: true}
 	packets, recovered, _ := windowTestTransfer(t, config, 0.5, 120, lost)
 	requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{1005, 1006, 1007, 1008})
 }
 
-func TestFECWindowNothingToRecover(t *testing.T) {
-	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
+func TestFECNothingToRecover(t *testing.T) {
+	config := FECConfig{MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
 	_, recovered, receiver := windowTestTransfer(t, config, 0.5, 60, nil)
 	if len(recovered) != 0 {
 		t.Fatalf("packets were reconstructed although nothing was lost: %v", recovered)
@@ -123,11 +123,11 @@ func TestFECWindowNothingToRecover(t *testing.T) {
 	}
 }
 
-// TestFECWindowLatePacketCompletesEquation verifies the on-the-fly part of the decoder:
+// TestFECLatePacketCompletesEquation verifies the on-the-fly part of the decoder:
 // an equation that two lost packets leave underdetermined is solved as soon as one of
 // them arrives late.
-func TestFECWindowLatePacketCompletesEquation(t *testing.T) {
-	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 16, MaxOverheadPercent: 100, MaxParityRows: 2}
+func TestFECLatePacketCompletesEquation(t *testing.T) {
+	config := FECConfig{MaxGroupSize: 16, MaxOverheadPercent: 100, MaxParityRows: 2}
 	sender := newWindowTestSender(config, 0.25)
 	packets := make(map[protocol.PacketNumber][]byte)
 	var rows []*wire.FECWindowRepairFrame
@@ -153,15 +153,15 @@ func TestFECWindowLatePacketCompletesEquation(t *testing.T) {
 	requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{2002})
 }
 
-func TestFECWindowIdleWithoutLoss(t *testing.T) {
-	config := FECConfig{Scheme: FECSchemeWindow, MaxOverheadPercent: 10}
+func TestFECIdleWithoutLoss(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 10}
 	state := newFECWindowState(config)
 	now := monotime.Now()
 	for i := 0; i < 500; i++ {
 		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now, true)
 	}
 	if state.encoder.protecting() {
-		t.Fatal("window FEC engaged on a path without a loss report")
+		t.Fatal("FEC engaged on a path without a loss report")
 	}
 	if frame := state.encoder.pendingFrame(now.Add(time.Second), 1452); frame != nil {
 		t.Fatal("a repair row was sent on a path without a loss report")
@@ -171,11 +171,11 @@ func TestFECWindowIdleWithoutLoss(t *testing.T) {
 	}
 }
 
-// TestFECWindowIgnoresAcknowledgementOnlyPackets verifies that the window doesn't
+// TestFECIgnoresAcknowledgementOnlyPackets verifies that the window doesn't
 // spend its budget on packets that carry nothing but acknowledgements: they protect
 // nothing, and they would make every row as long as the data packets next to them.
-func TestFECWindowIgnoresAcknowledgementOnlyPackets(t *testing.T) {
-	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 32, MaxOverheadPercent: 100}
+func TestFECIgnoresAcknowledgementOnlyPackets(t *testing.T) {
+	config := FECConfig{MaxGroupSize: 32, MaxOverheadPercent: 100}
 	state := newFECWindowState(config)
 	state.encoder.setRate(0.5)
 	now := monotime.Now()
@@ -188,7 +188,7 @@ func TestFECWindowIgnoresAcknowledgementOnlyPackets(t *testing.T) {
 			t.Fatalf("an acknowledgement packet of %d bytes ended up in the window", len(member.data))
 		}
 	}
-	if stats := state.stats(); stats.ConsideredBytesSent != 20*1200 {
+	if stats := state.stats(); stats.ProtectedBytesSent != 20*1200 {
 		t.Fatalf("the acknowledged packets were counted against the overhead budget: %+v", stats)
 	}
 	if stats := state.stats(); stats.ProtectedPacketsSent != 20 {
@@ -196,18 +196,18 @@ func TestFECWindowIgnoresAcknowledgementOnlyPackets(t *testing.T) {
 	}
 }
 
-func TestFECWindowEngagesAndDisengages(t *testing.T) {
-	config := FECConfig{Scheme: FECSchemeWindow, MaxOverheadPercent: 10}
+func TestFECEngagesAndDisengages(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 10}
 	state := newFECWindowState(config)
 	now := monotime.Now()
 	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 100, LostPackets: 5}, now)
 	if !state.encoder.protecting() {
-		t.Fatal("window FEC did not engage on a 5% loss report")
+		t.Fatal("FEC did not engage on a 5% loss report")
 	}
 	if rate := state.encoder.rate; rate <= 0 || rate > 0.1 {
 		t.Fatalf("unexpected redundancy %v", rate)
 	}
-	if stats := state.stats(); stats.GroupSize == 0 {
+	if stats := state.stats(); stats.WindowSize == 0 {
 		t.Fatal("the statistics don't report the active window")
 	}
 	if !state.encoder.flushDeadline().IsZero() {
@@ -218,16 +218,16 @@ func TestFECWindowEngagesAndDisengages(t *testing.T) {
 		state.encoder.tick(now)
 	}
 	if state.encoder.protecting() {
-		t.Fatalf("window FEC stayed engaged without fresh loss reports (rate %v)", state.encoder.rate)
+		t.Fatalf("FEC stayed engaged without fresh loss reports (rate %v)", state.encoder.rate)
 	}
-	if stats := state.stats(); stats.GroupSize != 0 {
+	if stats := state.stats(); stats.WindowSize != 0 {
 		t.Fatalf("the statistics still report an active window: %+v", stats)
 	}
 }
 
-func TestFECWindowOverheadStaysWithinCap(t *testing.T) {
+func TestFECOverheadStaysWithinCap(t *testing.T) {
 	for _, lossPercent := range []uint64{1, 2, 10, 25} {
-		config := FECConfig{Scheme: FECSchemeWindow, MaxOverheadPercent: 10, MaxGroupSize: 32, MaxParityRows: 2}
+		config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MaxParityRows: 2}
 		state := newFECWindowState(config)
 		now := monotime.Now()
 		var received, lost uint64
@@ -252,14 +252,14 @@ func TestFECWindowOverheadStaysWithinCap(t *testing.T) {
 			t.Fatalf("%d%% loss: no repair row was ever sent", lossPercent)
 		}
 		if stats.MeasuredOverhead > float64(config.MaxOverheadPercent)/100+1e-9 {
-			t.Fatalf("%d%% loss: measured overhead %v exceeds the %d%% cap (%d parity bytes / %d considered bytes)",
-				lossPercent, stats.MeasuredOverhead, config.MaxOverheadPercent, stats.ParityBytesSent, stats.ConsideredBytesSent)
+			t.Fatalf("%d%% loss: measured overhead %v exceeds the %d%% cap (%d parity bytes / %d protected bytes)",
+				lossPercent, stats.MeasuredOverhead, config.MaxOverheadPercent, stats.ParityBytesSent, stats.ProtectedBytesSent)
 		}
 	}
 }
 
-func TestFECWindowProtectsTheIdleTail(t *testing.T) {
-	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 16, MaxOverheadPercent: 100, MaxParityRows: 2, FlushDelay: 2 * time.Millisecond}
+func TestFECProtectsTheIdleTail(t *testing.T) {
+	config := FECConfig{MaxGroupSize: 16, MaxOverheadPercent: 100, MaxParityRows: 2, FlushDelay: 2 * time.Millisecond}
 	sender := newWindowTestSender(config, 0.05)
 	var rows []*wire.FECWindowRepairFrame
 	for i := 0; i < 3; i++ {
@@ -285,8 +285,8 @@ func TestFECWindowProtectsTheIdleTail(t *testing.T) {
 	}
 }
 
-func TestFECWindowReserveCoversRepairFrame(t *testing.T) {
-	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: wire.MaxFECWindowSize, MaxOverheadPercent: 100, MaxParityRows: 2}
+func TestFECReserveCoversRepairFrame(t *testing.T) {
+	config := FECConfig{MaxGroupSize: wire.MaxFECWindowSize, MaxOverheadPercent: 100, MaxParityRows: 2}
 	sender := newWindowTestSender(config, 1)
 	maxPacketSize := protocol.ByteCount(1452)
 	protectedLimit := maxPacketSize - sender.state.encoder.reserve() - fecMaxPacketOverhead
@@ -312,12 +312,12 @@ func TestFECWindowReserveCoversRepairFrame(t *testing.T) {
 	}
 }
 
-// TestFECWindowDropsRowsItCannotEvaluate verifies that a repair row which protects
+// TestFECDropsRowsItCannotEvaluate verifies that a repair row which protects
 // packets that were received and then left the decoder's cache is dropped instead of
 // being turned into an equation that can never be solved. Without the check, every such
 // row would also report the packets it can't evaluate as missing.
-func TestFECWindowDropsRowsItCannotEvaluate(t *testing.T) {
-	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 8, MaxOverheadPercent: 100, MaxParityRows: 1}
+func TestFECDropsRowsItCannotEvaluate(t *testing.T) {
+	config := FECConfig{MaxGroupSize: 8, MaxOverheadPercent: 100, MaxParityRows: 1}
 	sender := newWindowTestSender(config, 1)
 	receiver := newFECWindowState(config)
 	var early []*wire.FECWindowRepairFrame
@@ -345,12 +345,12 @@ func TestFECWindowDropsRowsItCannotEvaluate(t *testing.T) {
 	}
 }
 
-// TestFECWindowRateKeepsRowBasesDistinct verifies that the redundancy stays low enough
+// TestFECRateKeepsRowBasesDistinct verifies that the redundancy stays low enough
 // for a window larger than the number of row bases: two rows that share a member must
 // never use the same base, otherwise they are not linearly independent.
-func TestFECWindowRateKeepsRowBasesDistinct(t *testing.T) {
+func TestFECRateKeepsRowBasesDistinct(t *testing.T) {
 	for _, windowSize := range []int{16, 64, 128} {
-		config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: windowSize, MaxOverheadPercent: 100}
+		config := FECConfig{MaxGroupSize: windowSize, MaxOverheadPercent: 100}
 		state := newFECWindowState(config)
 		now := monotime.Now()
 		state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 1000, LostPackets: 500}, now)
@@ -361,11 +361,11 @@ func TestFECWindowRateKeepsRowBasesDistinct(t *testing.T) {
 	}
 }
 
-// TestFECWindowCoefficientsAreMDS checks the property the sliding window code relies
+// TestFECCoefficientsAreMDS checks the property the sliding window code relies
 // on: any three rows reconstruct any three members of the window, whatever their
 // positions. It is the Cauchy determinant formula, checked on a few row and member
 // combinations instead of being taken on faith.
-func TestFECWindowCoefficientsAreMDS(t *testing.T) {
+func TestFECCoefficientsAreMDS(t *testing.T) {
 	members := []int{0, 1, 2, 5, 9, 17, 33, 64, 90, 127}
 	rowSets := [][3]uint64{{0, 1, 2}, {3, 17, 40}, {7, 8, 9}, {13, 29, 61}, {64, 65, 66}}
 	for _, rowSet := range rowSets {

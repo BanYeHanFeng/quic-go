@@ -1,7 +1,6 @@
 package quic
 
 import (
-	"bytes"
 	"crypto/rand"
 	"testing"
 	"time"
@@ -18,179 +17,6 @@ func randomPacket(t *testing.T, length int) []byte {
 		t.Fatal(err)
 	}
 	return data
-}
-
-// buildFECGroup feeds packets into the encoder and returns the parity frames.
-//
-// The packets are MTU sized, like the ones a real connection protects: with small
-// packets the FEC_REPAIR header alone can be larger than the protected traffic, and
-// the overhead cap would - correctly - refuse to protect the group.
-func buildFECGroup(t *testing.T, state *fecState, groupSize, rows int, packetCount int) ([]*wire.FECRepairFrame, map[protocol.PacketNumber][]byte) {
-	t.Helper()
-	state.encoder.groupSize = groupSize
-	state.encoder.rows = rows
-	state.targetGroupSize.Store(int64(groupSize))
-	state.parityRows.Store(int64(rows))
-	now := monotime.Now()
-	packets := make(map[protocol.PacketNumber][]byte, packetCount)
-	for i := range packetCount {
-		pn := protocol.PacketNumber(100 + i)
-		data := randomPacket(t, 1024+i*8)
-		packets[pn] = data
-		state.encoder.addPacket(pn, data, 1452, now)
-	}
-	frames := make([]*wire.FECRepairFrame, 0, rows)
-	for range rows {
-		frame := state.encoder.pendingRepair(now, 1452)
-		if frame == nil {
-			t.Fatalf("expected %d parity frames, got %d", rows, len(frames))
-		}
-		frames = append(frames, frame)
-	}
-	if frame := state.encoder.pendingRepair(now, 1452); frame != nil {
-		t.Fatal("unexpected extra parity frame")
-	}
-	return frames, packets
-}
-
-func TestFECRecoversSingleLoss(t *testing.T) {
-	// The cap is irrelevant here: this test checks recovery for small groups, and a two
-	// packet group costs more than 50% parity once the FEC_REPAIR header is counted.
-	config := FECConfig{MaxGroupSize: 16, MinGroupSize: 2, MaxOverheadPercent: 100, MaxParityRows: 1}
-	for _, groupSize := range []int{2, 3, 8, 16} {
-		sender := newFECState(config)
-		frames, packets := buildFECGroup(t, sender, groupSize, 1, groupSize)
-		for lostPacket := range packets {
-			receiver := newFECState(config)
-			for pn, data := range packets {
-				if pn == lostPacket {
-					continue
-				}
-				receiver.decoder.recordPacket(pn, data, protocol.KeyPhaseZero)
-			}
-			recovered := receiver.decoder.handleRepair(frames[0], monotime.Now())
-			if len(recovered) != 1 {
-				t.Fatalf("group size %d: expected 1 recovered packet, got %d", groupSize, len(recovered))
-			}
-			if recovered[0].packetNumber != lostPacket {
-				t.Fatalf("group size %d: recovered the wrong packet: %d", groupSize, recovered[0].packetNumber)
-			}
-			if !bytes.Equal(recovered[0].data, packets[lostPacket]) {
-				t.Fatalf("group size %d: recovered data doesn't match", groupSize)
-			}
-		}
-	}
-}
-
-func TestFECRecoversTwoLosses(t *testing.T) {
-	config := FECConfig{MaxGroupSize: 16, MinGroupSize: 2, MaxOverheadPercent: 100, MaxParityRows: 2}
-	sender := newFECState(config)
-	frames, packets := buildFECGroup(t, sender, 8, 2, 8)
-	if len(frames) != 2 {
-		t.Fatalf("expected 2 parity frames, got %d", len(frames))
-	}
-	packetNumbers := make([]protocol.PacketNumber, 0, len(packets))
-	for pn := range packets {
-		packetNumbers = append(packetNumbers, pn)
-	}
-	// lose two packets: the first and the last one of the group
-	lost := map[protocol.PacketNumber]bool{packetNumbers[0]: true, packetNumbers[len(packetNumbers)-1]: true}
-	receiver := newFECState(config)
-	for pn, data := range packets {
-		if lost[pn] {
-			continue
-		}
-		receiver.decoder.recordPacket(pn, data, protocol.KeyPhaseZero)
-	}
-	// the first parity row arrives: not enough to repair two losses
-	if recovered := receiver.decoder.handleRepair(frames[0], monotime.Now()); len(recovered) != 0 {
-		t.Fatalf("expected no recovery with a single parity row, got %d packets", len(recovered))
-	}
-	recovered := receiver.decoder.handleRepair(frames[1], monotime.Now())
-	if len(recovered) != 2 {
-		t.Fatalf("expected 2 recovered packets, got %d", len(recovered))
-	}
-	for _, packet := range recovered {
-		if !lost[packet.packetNumber] {
-			t.Fatalf("recovered an unexpected packet: %d", packet.packetNumber)
-		}
-		if !bytes.Equal(packet.data, packets[packet.packetNumber]) {
-			t.Fatalf("recovered data of packet %d doesn't match", packet.packetNumber)
-		}
-	}
-}
-
-func TestFECRecoversWithUnequalPacketSizes(t *testing.T) {
-	config := FECConfig{MaxGroupSize: 8, MinGroupSize: 2, MaxOverheadPercent: 100, MaxParityRows: 1}
-	sender := newFECState(config)
-	sender.encoder.groupSize = 4
-	sender.encoder.rows = 1
-	now := monotime.Now()
-	// The largest packet is bounded by what still leaves room for the parity packet in a
-	// 1452 byte datagram: 1452 - headerReserve(4) - the packet overhead.
-	packets := map[protocol.PacketNumber][]byte{
-		10: randomPacket(t, 1300),
-		11: randomPacket(t, 17),
-		12: randomPacket(t, 900),
-		13: randomPacket(t, 1),
-	}
-	for pn := protocol.PacketNumber(10); pn <= 13; pn++ {
-		sender.encoder.addPacket(pn, packets[pn], 1452, now)
-	}
-	frame := sender.encoder.pendingRepair(now, 1452)
-	if frame == nil {
-		t.Fatal("expected a parity frame")
-	}
-	for lostPacket := range packets {
-		receiver := newFECState(config)
-		for pn, data := range packets {
-			if pn == lostPacket {
-				continue
-			}
-			receiver.decoder.recordPacket(pn, data, protocol.KeyPhaseZero)
-		}
-		recovered := receiver.decoder.handleRepair(frame, monotime.Now())
-		if len(recovered) != 1 {
-			t.Fatalf("expected 1 recovered packet, got %d", len(recovered))
-		}
-		if !bytes.Equal(recovered[0].data, packets[lostPacket]) {
-			t.Fatalf("recovered data of packet %d doesn't match (%d vs %d bytes)", lostPacket, len(recovered[0].data), len(packets[lostPacket]))
-		}
-	}
-}
-
-func TestFECNothingToRecover(t *testing.T) {
-	config := FECConfig{MaxGroupSize: 8, MinGroupSize: 2, MaxOverheadPercent: 100, MaxParityRows: 1}
-	sender := newFECState(config)
-	frames, packets := buildFECGroup(t, sender, 4, 1, 4)
-	receiver := newFECState(config)
-	for pn, data := range packets {
-		receiver.decoder.recordPacket(pn, data, protocol.KeyPhaseZero)
-	}
-	if recovered := receiver.decoder.handleRepair(frames[0], monotime.Now()); len(recovered) != 0 {
-		t.Fatalf("expected no recovery, got %d packets", len(recovered))
-	}
-}
-
-func TestFECUnrecoverableLossIsCounted(t *testing.T) {
-	config := FECConfig{MaxGroupSize: 8, MinGroupSize: 2, MaxOverheadPercent: 100, MaxParityRows: 1}
-	sender := newFECState(config)
-	frames, packets := buildFECGroup(t, sender, 4, 1, 4)
-	receiver := newFECState(config)
-	var received int
-	for pn, data := range packets {
-		// lose two packets: XOR parity can only repair one
-		if received < 2 {
-			receiver.decoder.recordPacket(pn, data, protocol.KeyPhaseZero)
-			received++
-		}
-	}
-	if recovered := receiver.decoder.handleRepair(frames[0], monotime.Now()); len(recovered) != 0 {
-		t.Fatalf("expected no recovery, got %d packets", len(recovered))
-	}
-	if stats := receiver.stats(); stats.FailedPackets != 2 {
-		t.Fatalf("expected 2 failed packets, got %d", stats.FailedPackets)
-	}
 }
 
 func TestFECLossTracker(t *testing.T) {
@@ -241,214 +67,9 @@ func TestFECLossTracker(t *testing.T) {
 	}
 }
 
-func TestFECIdleWithoutLoss(t *testing.T) {
-	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 16, MinGroupSize: 2, MaxParityRows: 1}
-	state := newFECState(config)
-	now := monotime.Now()
-	// no loss at all: FEC must stay idle
-	for range 20 {
-		now = now.Add(100 * time.Millisecond)
-		state.encoder.tick(now)
-	}
-	if state.encoder.protecting() {
-		t.Fatalf("FEC engaged on a lossless path (group size %d)", state.encoder.groupSize)
-	}
-	if state.encoder.pendingRepair(now, 1400) != nil {
-		t.Fatal("parity frame emitted on a lossless path")
-	}
-	stats := state.stats()
-	if stats.GroupSize != 0 || stats.ParityPacketsSent != 0 {
-		t.Fatalf("unexpected stats on a lossless path: %+v", stats)
-	}
-}
-
-// pumpFEC drives a realistic packet stream through the whole encoder send path -
-// loss feedback, group assembly, the flush deadline and the overhead cap - and
-// returns the resulting statistics together with the parity bytes that were queued.
-//
-// Parity bytes are counted from the frames themselves: FECStats.ParityBytesSent is
-// incremented when a frame is handed to the wire, which happens in the connection's
-// send loop and is not part of the encoder.
-func pumpFEC(t *testing.T, config FECConfig, lossPercent uint64, packetCount, packetLength int) (FECStats, protocol.ByteCount) {
-	t.Helper()
-	const (
-		burstLength = 128
-		// fecTestPacketInterval is how much time passes between two packets inside a
-		// burst. It has to stay well below FlushDelay (2ms), otherwise the flush
-		// deadline would cut every group short and no group would ever fill up.
-		fecTestPacketInterval = 10 * time.Microsecond
-	)
-	state := newFECState(config)
-	now := monotime.Now()
-	feedback := &wire.FECFeedbackFrame{}
-	var parityBytes protocol.ByteCount
-	for i := range packetCount {
-		now = now.Add(fecTestPacketInterval)
-		feedback.ReceivedPackets += 100 - lossPercent
-		feedback.LostPackets += lossPercent
-		state.encoder.onFeedback(feedback, now)
-		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, packetLength), 1452, now)
-		flushTime := now
-		if (i+1)%burstLength == 0 {
-			// The burst ended: the open partial group passes its flush deadline.
-			flushTime = now.Add(10 * time.Millisecond)
-		}
-		for {
-			frame := state.encoder.pendingRepair(flushTime, 1452)
-			if frame == nil {
-				break
-			}
-			parityBytes += frame.Length(protocol.Version1)
-		}
-	}
-	return state.stats(), parityBytes
-}
-
-// measuredOverhead is the parity/protected byte ratio of a pumpFEC run. It is the
-// quantity MaxOverheadPercent bounds, per group and therefore for any aggregation.
-func measuredOverhead(parityBytes protocol.ByteCount, stats FECStats) float64 {
-	if stats.ProtectedBytesSent == 0 {
-		return 0
-	}
-	return float64(parityBytes) / float64(stats.ProtectedBytesSent)
-}
-
-func TestFECEngagesOnLoss(t *testing.T) {
-	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
-	for _, lossPercent := range []uint64{2, 5, 20, 50} {
-		state := newFECState(config)
-		now := monotime.Now()
-		feedback := &wire.FECFeedbackFrame{}
-		for range 20 {
-			now = now.Add(100 * time.Millisecond)
-			feedback.ReceivedPackets += 100 - lossPercent
-			feedback.LostPackets += lossPercent
-			state.encoder.onFeedback(feedback, now)
-		}
-		if !state.encoder.protecting() {
-			t.Fatalf("FEC didn't engage at %d%% loss", lossPercent)
-		}
-		stats := state.stats()
-		if stats.ConfiguredOverhead > 0.10+1e-9 {
-			t.Fatalf("configured overhead %v exceeds the cap of 10%% at %d%% loss", stats.ConfiguredOverhead, lossPercent)
-		}
-	}
-}
-
-// TestFECOverheadCapIsEnforced is the regression test for the production behaviour
-// that made the cap meaningless: a partial group used to be flushed with a full
-// parity packet, which cost up to 50% overhead on sparse traffic while the statistics
-// line kept reporting the configured 6.2%. The cap has to hold on the bytes actually
-// sent, for any packet size.
-func TestFECOverheadCapIsEnforced(t *testing.T) {
-	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
-	// The largest case stays below what a 1452 byte datagram can protect: the parity
-	// packet needs room for the packet itself, the frame header and the packet overhead.
-	for _, packetLength := range []int{60, 300, 1200, 1280} {
-		stats, parityBytes := pumpFEC(t, config, 5, 3000, packetLength)
-		if parityBytes == 0 {
-			t.Fatalf("no parity was sent at all with %d byte packets", packetLength)
-		}
-		if overhead := measuredOverhead(parityBytes, stats); overhead > 0.10+1e-9 {
-			t.Fatalf("measured overhead %v exceeds the 10%% cap with %d byte packets (%d parity bytes / %d protected bytes)",
-				overhead, packetLength, parityBytes, stats.ProtectedBytesSent)
-		}
-	}
-}
-
-// TestFECSkipsGroupsThatCannotPayForThemselves is the regression test for what the
-// first production run of the overhead budget exposed. A running budget keeps the long
-// run ratio within the cap, but it lets credit earned by earlier (or skipped) groups pay
-// for a group whose parity costs far more than the traffic it protects: the log showed
-// 2 packets (54 B) protected by 1 parity packet (41 B), and in the window with the most
-// losses 94 packets that FEC failed to repair anyway. A group now has to pay for its own
-// parity, so tiny packets and burst tails are left unprotected instead of being funded
-// by credit.
-func TestFECSkipsGroupsThatCannotPayForThemselves(t *testing.T) {
-	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
-	// 27 bytes was the average protected packet size in the production window that
-	// exposed this: the FEC_REPAIR header alone costs more than 10% of such a group.
-	stats, parityBytes := pumpFEC(t, config, 22, 2000, 27)
-	if parityBytes != 0 {
-		t.Fatalf("27 byte packets cannot fund their own parity within 10%%, but %d parity bytes were sent", parityBytes)
-	}
-	if stats.SkippedGroups == 0 {
-		t.Fatal("expected the groups to be counted as skipped")
-	}
-	// Packets that are large enough for a full group to pay for its parity are still
-	// protected, and the cap still holds.
-	for _, packetLength := range []int{400, 1200} {
-		stats, parityBytes := pumpFEC(t, config, 22, 2000, packetLength)
-		if parityBytes == 0 {
-			t.Fatalf("no parity was sent with %d byte packets", packetLength)
-		}
-		if overhead := measuredOverhead(parityBytes, stats); overhead > 0.10+1e-9 {
-			t.Fatalf("measured overhead %v exceeds the 10%% cap with %d byte packets", overhead, packetLength)
-		}
-	}
-}
-
-// TestFECDoubleRowEngagesByDefault checks that the second parity row - which is what
-// makes a group survive two losses - is actually reachable with the default
-// configuration. It used to be dead code: the default group size was too small for
-// two rows to fit into the default overhead cap.
-func TestFECDoubleRowEngagesByDefault(t *testing.T) {
-	stats, parityBytes := pumpFEC(t, FECConfig{}, 20, 4000, 1200)
-	if stats.ParityRows != 2 {
-		t.Fatalf("expected 2 parity rows at 20%% loss with default settings, got %d", stats.ParityRows)
-	}
-	if parityBytes == 0 {
-		t.Fatal("no parity was sent at all")
-	}
-	if overhead := measuredOverhead(parityBytes, stats); overhead > 0.10+1e-9 {
-		t.Fatalf("measured overhead %v exceeds the 10%% cap", overhead)
-	}
-}
-
-// TestFECDefaultGroupSizeFitsTwoRows documents the relationship the defaults rely on:
-// MaxGroupSize has to be large enough to pay for MaxParityRows within
-// MaxOverheadPercent, otherwise the extra row is never used.
-func TestFECDefaultGroupSizeFitsTwoRows(t *testing.T) {
-	config := FECConfig{}.withDefaults()
-	if config.MaxParityRows != 2 {
-		t.Fatalf("expected the default parity rows to be 2, got %d", config.MaxParityRows)
-	}
-	state := newFECState(FECConfig{})
-	state.encoder.averageLength = 1200
-	if overhead := state.encoder.estimatedOverhead(config.MaxParityRows, config.MaxGroupSize); overhead > float64(config.MaxOverheadPercent)/100 {
-		t.Fatalf("default MaxGroupSize %d can't pay for %d parity rows within %d%% (overhead %v)",
-			config.MaxGroupSize, config.MaxParityRows, config.MaxOverheadPercent, overhead)
-	}
-}
-
-func TestFECDisengagesAgain(t *testing.T) {
-	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 16, MinGroupSize: 2, MaxParityRows: 1}
-	state := newFECState(config)
-	now := monotime.Now()
-	feedback := &wire.FECFeedbackFrame{}
-	for range 10 {
-		now = now.Add(100 * time.Millisecond)
-		feedback.ReceivedPackets += 90
-		feedback.LostPackets += 10
-		state.encoder.onFeedback(feedback, now)
-	}
-	if !state.encoder.protecting() {
-		t.Fatal("FEC didn't engage on a lossy path")
-	}
-	// the path recovers: no new losses are reported
-	for range 40 {
-		now = now.Add(100 * time.Millisecond)
-		feedback.ReceivedPackets += 100
-		state.encoder.onFeedback(feedback, now)
-	}
-	if state.encoder.protecting() {
-		t.Fatalf("FEC stayed engaged on a recovered path (group size %d, loss rate %v)", state.encoder.groupSize, state.encoder.lossEWMA)
-	}
-}
-
 func TestFECDecaysWithoutFeedback(t *testing.T) {
-	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 16, MinGroupSize: 2, MaxParityRows: 1}
-	state := newFECState(config)
+	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 16, MaxParityRows: 1}
+	state := newFECWindowState(config)
 	now := monotime.Now()
 	// the first report only establishes the baseline of the cumulative counters
 	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 100, LostPackets: 20}, now)
@@ -465,58 +86,8 @@ func TestFECDecaysWithoutFeedback(t *testing.T) {
 	if state.encoder.protecting() {
 		t.Fatalf("FEC stayed engaged without fresh loss reports (loss rate %v)", state.encoder.lossEWMA)
 	}
-}
-
-func TestFECReserveCoversRepairFrame(t *testing.T) {
-	// The overhead cap is irrelevant here: this test checks the reserved MTU space,
-	// so it disables the cap by allowing any amount of parity.
-	config := FECConfig{MaxOverheadPercent: 100, MaxGroupSize: 16, MinGroupSize: 2, MaxParityRows: 1}
-	state := newFECState(config)
-	frames, packets := buildFECGroup(t, state, config.MaxGroupSize, 1, config.MaxGroupSize)
-	reserve := state.encoder.reserve()
-	headerLength := frames[0].Length(protocol.Version1) - protocol.ByteCount(len(frames[0].Parity))
-	if headerLength > reserve {
-		t.Fatalf("repair frame header is larger (%d) than the reserved space (%d)", headerLength, reserve)
-	}
-	if len(packets) != config.MaxGroupSize {
-		t.Fatal("unexpected number of protected packets")
-	}
-}
-
-// TestFECRepairFrameFitsIntoDatagram checks the invariant that made parity disappear on
-// a saturated sender. The encoder used to size protected packets so that the parity
-// frame filled the whole datagram by itself, leaving no room for the short header and
-// the AEAD tag that every packet spends on top of its frames. Those parity frames were
-// built, handed to the packer and dropped, so the repair silently never happened -
-// exactly when a bulk transfer was filling every packet to the limit.
-func TestFECRepairFrameFitsIntoDatagram(t *testing.T) {
-	const maxPacketSize protocol.ByteCount = 1252
-	config := FECConfig{MaxOverheadPercent: 100, MaxGroupSize: 32, MinGroupSize: 2, MaxParityRows: 2}
-	state := newFECState(config)
-	state.encoder.groupSize = config.MaxGroupSize
-	state.encoder.rows = config.MaxParityRows
-	// The largest packet the encoder advertises for protection.
-	protectedLimit := maxPacketSize - state.encoder.reserve() - fecMaxPacketOverhead
-	now := monotime.Now()
-	var frames []*wire.FECRepairFrame
-	for i := range config.MaxGroupSize {
-		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, int(protectedLimit)), maxPacketSize, now)
-		for {
-			frame := state.encoder.pendingRepair(now, maxPacketSize)
-			if frame == nil {
-				break
-			}
-			frames = append(frames, frame)
-		}
-	}
-	if len(frames) == 0 {
-		t.Fatal("no parity frame was produced")
-	}
-	for _, frame := range frames {
-		if size := frame.Length(protocol.Version1) + fecMaxPacketOverhead; size > maxPacketSize {
-			t.Fatalf("parity frame is %d bytes including the packet overhead, which doesn't fit into a %d byte datagram",
-				size, maxPacketSize)
-		}
+	if stats := state.stats(); stats.WindowSize != 0 {
+		t.Fatalf("the statistics still report an active window: %+v", stats)
 	}
 }
 
@@ -534,5 +105,62 @@ func TestGF256Multiplication(t *testing.T) {
 				t.Fatalf("division of %d * %d by %d doesn't yield %d", a, b, a, b)
 			}
 		}
+	}
+}
+
+// fecSolve solves the linear system matrix * X = rhs over GF(2^8) in place.
+// On success, rhs holds the solution.
+//
+// It is not used by the connection: the decoder of the window scheme reduces its
+// equations incrementally (fecWindowDecoder.pump). The test that asserts the MDS
+// property of the Cauchy coefficients uses it to invert arbitrary submatrices.
+func fecSolve(matrix [][]byte, rhs [][]byte) bool {
+	size := len(matrix)
+	for col := range size {
+		pivot := -1
+		for row := col; row < size; row++ {
+			if matrix[row][col] != 0 {
+				pivot = row
+				break
+			}
+		}
+		if pivot < 0 {
+			return false
+		}
+		if pivot != col {
+			matrix[pivot], matrix[col] = matrix[col], matrix[pivot]
+			rhs[pivot], rhs[col] = rhs[col], rhs[pivot]
+		}
+		if factor := matrix[col][col]; factor != 1 {
+			inverse := gfInv(factor)
+			for j := col; j < size; j++ {
+				matrix[col][j] = gfMul(matrix[col][j], inverse)
+			}
+			fecScaleSlice(rhs[col], inverse)
+		}
+		for row := range size {
+			if row == col {
+				continue
+			}
+			factor := matrix[row][col]
+			if factor == 0 {
+				continue
+			}
+			for j := col; j < size; j++ {
+				matrix[row][j] ^= gfMul(factor, matrix[col][j])
+			}
+			fecXORScaled(rhs[row], rhs[col], factor)
+		}
+	}
+	return true
+}
+
+// fecScaleSlice multiplies a byte slice in place.
+func fecScaleSlice(data []byte, factor byte) {
+	if factor == 1 {
+		return
+	}
+	for i, b := range data {
+		data[i] = gfMul(factor, b)
 	}
 }
