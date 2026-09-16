@@ -692,6 +692,12 @@ func (d *fecWindowDecoder) noteKnown(pn protocol.PacketNumber, data []byte) {
 		if !ok {
 			continue
 		}
+		if len(data) > len(row.rhs) {
+			// A packet is never longer than the parity symbol of a row that protects it.
+			// Growing the symbol keeps the arithmetic of a row that was built from a
+			// frame this decoder accepted consistent instead of panicking.
+			row.rhs = append(row.rhs, make([]byte, len(data)-len(row.rhs))...)
+		}
 		delete(row.coeffs, pn)
 		fecXORScaled(row.rhs, data, coefficient)
 		row.lenRHS[0] ^= gfMul(coefficient, byte(length>>8))
@@ -786,6 +792,12 @@ func (d *fecWindowDecoder) buildRow(frame *wire.FECWindowRepairFrame, missing []
 			// equation can't be evaluated.
 			return nil
 		}
+		if len(data) > len(row.rhs) {
+			// A protected packet can't be longer than the parity symbol of its own row.
+			// A frame that says otherwise is inconsistent: don't build an equation from
+			// it instead of recovering packets from it.
+			return nil
+		}
 		fecXORScaled(row.rhs, data, coefficient)
 		length := uint16(len(data))
 		row.lenRHS[0] ^= gfMul(coefficient, byte(length>>8))
@@ -849,6 +861,13 @@ func (d *fecWindowDecoder) mergePivot(index int) bool {
 		}
 		pivot := row.pivot
 		factor := gfMul(row.coeffs[pivot], gfInv(other.coeffs[other.pivot]))
+		if len(other.rhs) > len(row.rhs) {
+			// Two rows of overlapping windows can have parity symbols of different
+			// lengths: a symbol is as long as the longest packet its row protects.
+			// Combining them works on the longer symbol, with the shorter one
+			// zero-extended - which is exactly what the encoder did.
+			row.rhs = append(row.rhs, make([]byte, len(other.rhs)-len(row.rhs))...)
+		}
 		fecXORScaled(row.rhs, other.rhs, factor)
 		row.lenRHS[0] ^= gfMul(factor, other.lenRHS[0])
 		row.lenRHS[1] ^= gfMul(factor, other.lenRHS[1])
