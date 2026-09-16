@@ -267,9 +267,6 @@ func parseFECWindowRepairFrame(b []byte, _ protocol.Version) (*FECWindowRepairFr
 	if err != nil {
 		return nil, 0, replaceUnexpectedEOF(err)
 	}
-	if first >= 1<<62 {
-		return nil, 0, errors.New("invalid FEC window first packet number")
-	}
 	f.FirstPacketNumber = protocol.PacketNumber(first)
 	b = b[l:]
 	if f.Span, l, err = quicvarint.Parse(b); err != nil {

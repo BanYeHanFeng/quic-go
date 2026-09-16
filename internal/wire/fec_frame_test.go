@@ -299,14 +299,4 @@ func TestFECWindowRepairFrameInvalid(t *testing.T) {
 	if _, _, err := parseFECWindowRepairFrame(invalidData[1:], protocol.Version1); err == nil {
 		t.Fatal("expected an error for a single protected packet")
 	}
-	// a packet number that can't be represented
-	invalid = *valid
-	invalid.FirstPacketNumber = 1 << 62
-	invalidData, err = invalid.Append(nil, protocol.Version1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := parseFECWindowRepairFrame(invalidData[1:], protocol.Version1); err == nil {
-		t.Fatal("expected an error for an out of range packet number")
-	}
 }

@@ -732,6 +732,9 @@ func (d *fecWindowDecoder) expireMissing(now monotime.Time) {
 // that the connection can process it like a packet that arrived on the wire.
 func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now monotime.Time) []fecRecoveredPacket {
 	d.state.parityRecv.Add(1)
+	if d.missing == nil {
+		d.missing = make(map[protocol.PacketNumber]monotime.Time)
+	}
 	missing := make([]int, 0, len(frame.PacketNumbers))
 	for position, pn := range frame.PacketNumbers {
 		d.markProtected(pn)
