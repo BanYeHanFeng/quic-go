@@ -2812,9 +2812,9 @@ func (c *Conn) appendOneShortHeaderPacket(buf *packetBuffer, maxSize protocol.By
 	c.logShortHeaderPacket(p, ecn, size)
 	c.registerPackedShortHeaderPacket(p, ecn, now)
 	// Hand the packet to the FEC encoder. The encoder only reads the packet here
-	// (before the buffer is handed over to the send queue) and accumulates the
-	// parity of the current FEC group.
-	c.fecRecordSentPacket(p.PacketNumber, buf.Data[int(startLen):int(startLen+size)], c.maxPacketSize(), now)
+	// (before the buffer is handed over to the send queue) and accumulates the state of
+	// the current FEC group or window.
+	c.fecRecordSentPacket(p.PacketNumber, buf.Data[int(startLen):int(startLen+size)], c.maxPacketSize(), now, fecProtectsPacket(p))
 	return size, nil
 }
 

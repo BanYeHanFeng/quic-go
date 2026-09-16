@@ -198,8 +198,8 @@ func (s *fecWindowState) reserve() protocol.ByteCount { return s.encoder.reserve
 
 func (s *fecWindowState) tick(now monotime.Time) { s.encoder.tick(now) }
 
-func (s *fecWindowState) addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time) {
-	s.encoder.addPacket(pn, data, maxPacketSize, now)
+func (s *fecWindowState) addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time, carriesData bool) {
+	s.encoder.addPacket(pn, data, maxPacketSize, now, carriesData)
 }
 
 func (s *fecWindowState) recordPacket(pn protocol.PacketNumber, data []byte, keyPhase protocol.KeyPhaseBit) []fecRecoveredPacket {
@@ -272,6 +272,10 @@ type fecWindowEncoder struct {
 
 	lastAdd      monotime.Time
 	rowsSinceAdd int
+	// tailFlushed says that the tail of the current window was already offered to the
+	// byte budget. A flush the budget refused must not be retried on every send loop
+	// iteration; the next packet resets it.
+	tailFlushed bool
 
 	lastEvaluation monotime.Time
 	feedbackSeen   bool
@@ -325,7 +329,7 @@ func (e *fecWindowEncoder) reserve() protocol.ByteCount {
 func (e *fecWindowEncoder) hasPending() bool { return len(e.ready) > 0 }
 
 func (e *fecWindowEncoder) flushDeadline() monotime.Time {
-	if !e.protecting() || e.rowsSinceAdd > 0 || e.lastAdd.IsZero() || len(e.members) < fecWindowMinMembers {
+	if e.tailFlushed || !e.protecting() || e.rowsSinceAdd > 0 || e.lastAdd.IsZero() || len(e.members) < fecWindowMinMembers {
 		return 0
 	}
 	return e.lastAdd.Add(e.config.FlushDelay)
@@ -422,14 +426,25 @@ func (e *fecWindowEncoder) setRate(rate float64) {
 // addPacket adds a packet that was just sent to the window, and emits the repair rows
 // that are due. maxPacketSize is the maximum size of a QUIC packet (the MTU), not the
 // (smaller) size limit that applies to FEC protected packets.
-func (e *fecWindowEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time) {
+func (e *fecWindowEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time, carriesData bool) {
 	if len(data) == 0 || protocol.ByteCount(len(data)) > maxPacketSize {
 		return
 	}
-	// Every packet FEC sees adds to the budget of the overhead cap, whether or not a
+	if !carriesData {
+		// A packet that only acknowledges packets or updates flow control state carries
+		// information the peer can reconstruct from its own state: spending parity on it
+		// protects nothing. It would also be expensive, because the parity symbol of a
+		// window is as long as the longest packet in it, and a stream of short
+		// acknowledgement packets next to full data packets would make every row as long
+		// as a data packet while paying for it out of the bytes of both.
+		return
+	}
+	// Every protected packet adds to the budget of the overhead cap, whether or not a
 	// row is sent for it: that is what makes the measured overhead comparable to the
 	// cap.
 	e.state.consideredBytes.Add(uint64(len(data)))
+	e.state.protectedSent.Add(1)
+	e.state.protectedBytes.Add(uint64(len(data)))
 	e.credit = math.Min(e.credit+e.overheadCap*float64(len(data)), fecWindowCreditLimit)
 	if !e.protecting() {
 		return
@@ -438,11 +453,10 @@ func (e *fecWindowEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxP
 	copy(packet, data)
 	e.members = append(e.members, fecWindowMember{packetNumber: pn, data: packet})
 	e.averageLength = fecWindowLengthEWMAAlpha*float64(len(data)) + (1-fecWindowLengthEWMAAlpha)*e.averageLength
-	e.evict()
+	e.evict(pn)
 	e.lastAdd = now
 	e.rowsSinceAdd = 0
-	e.state.protectedSent.Add(1)
-	e.state.protectedBytes.Add(uint64(len(data)))
+	e.tailFlushed = false
 	e.rowCredit += e.rate
 	for e.rowCredit >= 1 {
 		if !e.emitRow(maxPacketSize) {
@@ -453,9 +467,17 @@ func (e *fecWindowEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxP
 	}
 }
 
-// evict drops the packets that left the window.
-func (e *fecWindowEncoder) evict() {
-	for len(e.members) > e.windowSize {
+// evict drops the packets that left the window: the ones that don't fit into the
+// window any more, and the ones whose packet number is more than maxSpan behind the
+// newest member - a repair row couldn't describe a window that wide. The second rule
+// is what keeps the window useful when only some of the packets carry data: a sender
+// that spends most of its packet numbers on acknowledgements would otherwise fill the
+// window with packets the peer already has (or that the decoder no longer caches).
+func (e *fecWindowEncoder) evict(newest protocol.PacketNumber) {
+	for len(e.members) > 0 {
+		if len(e.members) <= e.windowSize && uint64(newest-e.members[0].packetNumber) < e.maxSpan {
+			return
+		}
 		// Clear the slot before it is resliced away, so that the packet it points to can
 		// be collected while the array is still in use.
 		e.members[0] = fecWindowMember{}
@@ -556,17 +578,21 @@ func (e *fecWindowEncoder) pendingFrame(now monotime.Time, maxPacketSize protoco
 	if !e.protecting() || len(e.members) < fecWindowMinMembers {
 		return nil
 	}
-	if e.rowsSinceAdd == 0 && !e.lastAdd.IsZero() && !now.Before(e.lastAdd.Add(e.config.FlushDelay)) {
-		for i := 0; i < e.flushRows; i++ {
-			if !e.emitRow(maxPacketSize) {
-				break
-			}
+	if e.tailFlushed || e.rowsSinceAdd > 0 || e.lastAdd.IsZero() || now.Before(e.lastAdd.Add(e.config.FlushDelay)) {
+		return nil
+	}
+	// The tail is offered to the byte budget once per packet: a flush the budget refused
+	// must not be retried on every iteration of the send loop.
+	e.tailFlushed = true
+	for i := 0; i < e.flushRows; i++ {
+		if !e.emitRow(maxPacketSize) {
+			break
 		}
-		if len(e.ready) > 0 {
-			frame := e.ready[0]
-			e.ready = e.ready[1:]
-			return frame
-		}
+	}
+	if len(e.ready) > 0 {
+		frame := e.ready[0]
+		e.ready = e.ready[1:]
+		return frame
 	}
 	return nil
 }

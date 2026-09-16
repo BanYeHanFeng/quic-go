@@ -199,7 +199,10 @@ type fecScheme interface {
 	// tick re-evaluates the amount of redundancy to send.
 	tick(now monotime.Time)
 	// addPacket hands a packet that was just written to the wire to the encoder.
-	addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time)
+	// carriesData says whether the packet carries application data: a packet that only
+	// acknowledges packets is not worth protecting, and the schemes are free to ignore
+	// it.
+	addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time, carriesData bool)
 	// recordPacket caches a received packet so that it can be used to reconstruct a lost
 	// packet of the same code. It returns the packets that this packet made recoverable.
 	recordPacket(pn protocol.PacketNumber, data []byte, keyPhase protocol.KeyPhaseBit) []fecRecoveredPacket
@@ -436,13 +439,29 @@ func (c *Conn) dataPacketSizeLimit() protocol.ByteCount {
 
 // fecRecordSentPacket hands a packet that was just written to the wire to the FEC
 // encoder, and lets the encoder re-evaluate the loss rate.
-func (c *Conn) fecRecordSentPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time) {
+func (c *Conn) fecRecordSentPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time, carriesData bool) {
 	scheme := c.loadFEC()
 	if scheme == nil {
 		return
 	}
 	scheme.tick(now)
-	scheme.addPacket(pn, data, maxPacketSize, now)
+	scheme.addPacket(pn, data, maxPacketSize, now, carriesData)
+}
+
+// fecProtectsPacket says whether a packet carries application data, and is therefore
+// worth protecting. A packet that only acknowledges packets, or that only updates flow
+// control state, carries information the peer can reconstruct from its own state:
+// spending parity on it protects nothing.
+func fecProtectsPacket(p shortHeaderPacket) bool {
+	if len(p.StreamFrames) > 0 {
+		return true
+	}
+	for _, frame := range p.Frames {
+		if _, ok := frame.Frame.(*wire.DatagramFrame); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // fecRecordReceivedPacket caches a received packet for FEC recovery. A packet that
@@ -550,7 +569,7 @@ func (s *fecState) reserve() protocol.ByteCount { return s.encoder.reserve() }
 
 func (s *fecState) tick(now monotime.Time) { s.encoder.tick(now) }
 
-func (s *fecState) addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time) {
+func (s *fecState) addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time, _ bool) {
 	s.encoder.addPacket(pn, data, maxPacketSize, now)
 }
 

@@ -27,7 +27,7 @@ func newWindowTestSender(config FECConfig, rate float64) *windowTestSender {
 
 func (s *windowTestSender) send(t *testing.T, pn protocol.PacketNumber, data []byte) []*wire.FECWindowRepairFrame {
 	t.Helper()
-	s.state.encoder.addPacket(pn, data, 1452, s.now)
+	s.state.encoder.addPacket(pn, data, 1452, s.now, true)
 	var rows []*wire.FECWindowRepairFrame
 	for {
 		frame := s.state.encoder.pendingFrame(s.now, 1452)
@@ -64,33 +64,31 @@ func requireFECWindowRecovered(t *testing.T, packets map[protocol.PacketNumber][
 
 // windowTestTransfer runs the whole chain: it sends count packets of varying sizes
 // through the encoder, drops the packets in lost, and returns everything the decoder
-// reconstructed.
+// reconstructed. Packets and repair rows are handed to the decoder in the order they
+// would arrive on the wire.
 func windowTestTransfer(t *testing.T, config FECConfig, rate float64, count int, lost map[protocol.PacketNumber]bool) (map[protocol.PacketNumber][]byte, []fecRecoveredPacket, *fecWindowState) {
 	t.Helper()
 	sender := newWindowTestSender(config, rate)
+	receiver := newFECWindowState(config)
 	packets := make(map[protocol.PacketNumber][]byte, count)
-	var rows []*wire.FECWindowRepairFrame
+	var recovered []fecRecoveredPacket
+	rows := 0
 	for i := 0; i < count; i++ {
 		pn := protocol.PacketNumber(1000 + i)
 		// Varying sizes: the lengths are part of the code, not part of the header.
 		data := randomPacket(t, 900+(i%7)*40)
 		packets[pn] = data
-		rows = append(rows, sender.send(t, pn, data)...)
-	}
-	if len(rows) == 0 {
-		t.Fatal("no repair row was emitted")
-	}
-	receiver := newFECWindowState(config)
-	var recovered []fecRecoveredPacket
-	for i := 0; i < count; i++ {
-		pn := protocol.PacketNumber(1000 + i)
-		if lost[pn] {
-			continue
+		emitted := sender.send(t, pn, data)
+		if !lost[pn] {
+			recovered = append(recovered, receiver.decoder.recordPacket(pn, data, protocol.KeyPhaseZero)...)
 		}
-		recovered = append(recovered, receiver.decoder.recordPacket(pn, packets[pn], protocol.KeyPhaseZero)...)
+		for _, row := range emitted {
+			rows++
+			recovered = append(recovered, receiver.decoder.handleRepair(row, sender.now)...)
+		}
 	}
-	for _, row := range rows {
-		recovered = append(recovered, receiver.decoder.handleRepair(row, sender.now)...)
+	if rows == 0 {
+		t.Fatal("no repair row was emitted")
 	}
 	return packets, recovered, receiver
 }
@@ -160,7 +158,7 @@ func TestFECWindowIdleWithoutLoss(t *testing.T) {
 	state := newFECWindowState(config)
 	now := monotime.Now()
 	for i := 0; i < 500; i++ {
-		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now)
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now, true)
 	}
 	if state.encoder.protecting() {
 		t.Fatal("window FEC engaged on a path without a loss report")
@@ -170,6 +168,31 @@ func TestFECWindowIdleWithoutLoss(t *testing.T) {
 	}
 	if stats := state.stats(); stats.ParityPacketsSent != 0 || stats.ParityBytesSent != 0 {
 		t.Fatalf("unexpected parity traffic on a lossless path: %+v", stats)
+	}
+}
+
+// TestFECWindowIgnoresAcknowledgementOnlyPackets verifies that the window doesn't
+// spend its budget on packets that carry nothing but acknowledgements: they protect
+// nothing, and they would make every row as long as the data packets next to them.
+func TestFECWindowIgnoresAcknowledgementOnlyPackets(t *testing.T) {
+	config := FECConfig{Scheme: FECSchemeWindow, MaxGroupSize: 32, MaxOverheadPercent: 100}
+	state := newFECWindowState(config)
+	state.encoder.setRate(0.5)
+	now := monotime.Now()
+	for i := 0; i < 20; i++ {
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now, true)
+		state.encoder.addPacket(protocol.PacketNumber(1000+i), randomPacket(t, 35), 1452, now, false)
+	}
+	for _, member := range state.encoder.members {
+		if len(member.data) < 1200 {
+			t.Fatalf("an acknowledgement packet of %d bytes ended up in the window", len(member.data))
+		}
+	}
+	if stats := state.stats(); stats.ConsideredBytesSent != 20*1200 {
+		t.Fatalf("the acknowledged packets were counted against the overhead budget: %+v", stats)
+	}
+	if stats := state.stats(); stats.ProtectedPacketsSent != 20 {
+		t.Fatalf("unexpected number of protected packets: %+v", stats)
 	}
 }
 
@@ -209,7 +232,7 @@ func TestFECWindowOverheadStaysWithinCap(t *testing.T) {
 		now := monotime.Now()
 		var received, lost uint64
 		for i := 0; i < 4000; i++ {
-			state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now)
+			state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now, true)
 			for {
 				frame := state.encoder.pendingFrame(now, 1452)
 				if frame == nil {
@@ -220,7 +243,7 @@ func TestFECWindowOverheadStaysWithinCap(t *testing.T) {
 			// The peer reports every 50 packets, like a real feedback frame.
 			if i%50 == 49 {
 				received += 50
-				lost += lossPercent * 50 / 100
+				lost = received * lossPercent / 100
 				state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: received, LostPackets: lost}, now)
 			}
 		}

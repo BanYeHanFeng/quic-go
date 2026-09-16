@@ -514,9 +514,11 @@ func TestFECWindowRecoversLostPackets(t *testing.T) {
 	enableWindowFEC(t, pair.clientConn, "client")
 	enableWindowFEC(t, pair.serverConn, "server")
 
-	// Drop every 8th packet in both directions (12.5% loss).
-	pair.clientLossy.dropEvery.Store(8)
-	pair.serverLossy.dropEvery.Store(8)
+	// Drop every 16th packet in both directions (about 12% when both drop points are
+	// counted): the redundancy the loss rate asks for fits into the 25% cap, so the
+	// window is expected to reconstruct the losses.
+	pair.clientLossy.dropEvery.Store(16)
+	pair.serverLossy.dropEvery.Store(16)
 
 	payload := randomPacket(t, 4*1024*1024)
 	received := transfer(t, pair.clientConn, pair.serverConn, payload)
@@ -548,11 +550,13 @@ func TestFECWindowRecoversBurstLossesPath(t *testing.T) {
 	enableWindowFEC(t, pair.clientConn, "client")
 	enableWindowFEC(t, pair.serverConn, "server")
 
-	// Three consecutive packets every 64 packets: 4.7% loss, all of it in bursts.
+	// Three consecutive packets every 32 packets: about 9% loss, all of it in bursts.
+	// The redundancy the loss rate asks for gives the window enough rows over a burst
+	// to reconstruct all of it.
 	pair.clientLossy.burstLength.Store(3)
-	pair.clientLossy.burstPeriod.Store(64)
+	pair.clientLossy.burstPeriod.Store(32)
 	pair.serverLossy.burstLength.Store(3)
-	pair.serverLossy.burstPeriod.Store(64)
+	pair.serverLossy.burstPeriod.Store(32)
 
 	payload := randomPacket(t, 4*1024*1024)
 	received := transfer(t, pair.clientConn, pair.serverConn, payload)
