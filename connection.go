@@ -167,7 +167,10 @@ type Conn struct {
 
 	maxPayloadSizeEstimate atomic.Uint32
 
-	fecState atomic.Pointer[fecState]
+	// fecState holds the packet level FEC scheme of the connection, or nil while FEC is
+	// disabled. Only the connection's run loop goroutine reads and writes it; the
+	// statistics are read from other goroutines through FECStats.
+	fecState atomic.Pointer[fecScheme]
 
 	initialStream       *initialCryptoStream
 	handshakeStream     *cryptoStream
@@ -927,7 +930,8 @@ func (c *Conn) maybeResetTimer() {
 	if !c.pacingDeadline.IsZero() && c.pacingDeadline.Before(deadline) {
 		deadline = c.pacingDeadline
 	}
-	// A partial FEC group is protected once it has been idle for the flush delay.
+	// Packets an idle FEC encoder is still holding are protected once they have been
+	// idle for the flush delay.
 	if t := c.fecFlushDeadline(); !t.IsZero() && t.Before(deadline) {
 		deadline = t
 	}
@@ -1245,8 +1249,9 @@ func (c *Conn) handleShortHeaderPacket(
 	}
 	c.largestRcvdAppData = max(c.largestRcvdAppData, pn)
 	// Keep the packet around: if packet level FEC is enabled, it may be needed to
-	// reconstruct a lost packet of the same FEC group.
-	c.fecRecordReceivedPacket(pn, p.data, keyPhase)
+	// reconstruct a lost packet of the same code - and it may make a packet that was
+	// lost before it recoverable right away.
+	c.fecRecordReceivedPacket(pn, p.data, keyPhase, p.rcvTime)
 
 	if c.logger.Debug() {
 		c.logger.Debugf("<- Reading packet %d (%d bytes) for connection %s, 1-RTT", pn, p.Size(), destConnID)
@@ -1984,10 +1989,8 @@ func (c *Conn) handleFrame(
 		err = c.connIDGenerator.Retire(frame.SequenceNumber, destConnID, rcvTime.Add(3*c.rttStats.PTO(false)))
 	case *wire.HandshakeDoneFrame:
 		err = c.handleHandshakeDoneFrame(rcvTime)
-	case *wire.FECRepairFrame:
-		err = c.handleFECRepairFrame(frame, rcvTime)
-	case *wire.FECFeedbackFrame:
-		c.handleFECFeedbackFrame(frame, rcvTime)
+	case *wire.FECRepairFrame, *wire.FECWindowRepairFrame, *wire.FECFeedbackFrame:
+		err = c.handleFECFrame(frame, rcvTime)
 	default:
 		err = fmt.Errorf("unexpected frame type: %s", reflect.ValueOf(&frame).Elem().Type().Name())
 	}

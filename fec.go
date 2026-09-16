@@ -95,10 +95,17 @@ const (
 )
 
 // FECConfig configures packet level forward error correction for a connection.
-// The zero value is a valid configuration: MaxOverheadPercent defaults to 10%,
-// MaxGroupSize to 32, MinGroupSize to 2 and MaxParityRows to 2 (Reed-Solomon parity
-// over GF(2^8), which survives two losses per group).
+// The zero value is a valid configuration: the block scheme (Scheme FECSchemeBlock)
+// with MaxOverheadPercent defaulting to 10%, MaxGroupSize to 32, MinGroupSize to 2 and
+// MaxParityRows to 2 (Reed-Solomon parity over GF(2^8), which survives two losses per
+// group). With Scheme FECSchemeWindow the same fields configure the sliding window
+// scheme: MaxGroupSize is the number of packets in the window (default 64) and
+// MaxParityRows is the number of repair rows an idle sender emits for the tail
+// (default 2).
 type FECConfig struct {
+	// Scheme selects the FEC scheme. Defaults to FECSchemeBlock. Both endpoints have to
+	// use the same scheme; QUICX negotiates it during its handshake.
+	Scheme FECScheme
 	// MaxOverheadPercent caps the parity traffic as a percentage of the protected
 	// traffic. It bounds the bandwidth FEC is allowed to spend, no matter how high
 	// the measured loss rate is. The cap is enforced on the bytes actually sent: a
@@ -131,10 +138,17 @@ func (c FECConfig) withDefaults() FECConfig {
 		c.MaxOverheadPercent = 100
 	}
 	if c.MaxGroupSize <= 0 {
-		c.MaxGroupSize = defaultFECMaxGroupSize
+		if c.Scheme == FECSchemeWindow {
+			c.MaxGroupSize = defaultFECWindowSize
+		} else {
+			c.MaxGroupSize = defaultFECMaxGroupSize
+		}
 	}
-	if c.MaxGroupSize > wire.MaxFECGroupSize {
+	if c.MaxGroupSize > wire.MaxFECGroupSize && c.Scheme != FECSchemeWindow {
 		c.MaxGroupSize = wire.MaxFECGroupSize
+	}
+	if c.MaxGroupSize > wire.MaxFECWindowSize {
+		c.MaxGroupSize = wire.MaxFECWindowSize
 	}
 	if c.MinGroupSize <= 0 {
 		c.MinGroupSize = defaultFECMinGroupSize
@@ -154,11 +168,66 @@ func (c FECConfig) withDefaults() FECConfig {
 	return c
 }
 
+// FECScheme selects the packet level FEC scheme of a connection.
+type FECScheme uint8
+
+const (
+	// FECSchemeBlock is the group based scheme: the sender closes a group of packets
+	// and protects it with a fixed number of parity rows. It is the original scheme,
+	// and the one used when the peer only supports it.
+	FECSchemeBlock FECScheme = iota
+	// FECSchemeWindow is the sliding window (convolutional) scheme: every repair row
+	// protects the sender's current window of packets, so a lost packet is covered by
+	// every row generated while it stays in the window instead of by the fixed number
+	// of rows of one group.
+	FECSchemeWindow
+)
+
+// fecScheme is the connection facing part of a packet level FEC implementation. The
+// block scheme (fecState) and the sliding window scheme (fecWindowState) implement it;
+// the connection hooks only talk to this interface, so both schemes share the send
+// path, the packet cache and the statistics plumbing.
+type fecScheme interface {
+	// stats returns a snapshot of the scheme's statistics.
+	stats() FECStats
+	// protecting says whether outgoing packets are currently protected. When it is
+	// false no parity is sent, and protected packets don't have to leave room for one.
+	protecting() bool
+	// reserve is the number of bytes a parity frame needs in a datagram on top of the
+	// protected packet (the frame header in the worst case).
+	reserve() protocol.ByteCount
+	// tick re-evaluates the amount of redundancy to send.
+	tick(now monotime.Time)
+	// addPacket hands a packet that was just written to the wire to the encoder.
+	addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time)
+	// recordPacket caches a received packet so that it can be used to reconstruct a lost
+	// packet of the same code. It returns the packets that this packet made recoverable.
+	recordPacket(pn protocol.PacketNumber, data []byte, keyPhase protocol.KeyPhaseBit) []fecRecoveredPacket
+	// handleFrame processes an incoming FEC frame and returns the packets that were
+	// reconstructed from it.
+	handleFrame(frame wire.Frame, now monotime.Time) []fecRecoveredPacket
+	// pendingFrame returns the next frame to send: a parity frame, or a feedback frame
+	// for the peer. It returns nil when there is nothing to send.
+	pendingFrame(now monotime.Time, maxPacketSize protocol.ByteCount) wire.Frame
+	// hasPending says whether another frame is already waiting to be sent.
+	hasPending() bool
+	// frameSent accounts a frame that was handed to the send queue.
+	frameSent(frame wire.Frame, v protocol.Version)
+	// flushDeadline is the time at which an idle sender protects the packets that are
+	// still pending, or a zero time if there is nothing to protect.
+	flushDeadline() monotime.Time
+}
+
 // FECStats reports the state of the packet level FEC of a connection.
 type FECStats struct {
-	Enabled    bool
-	GroupSize  int     // current target group size, 0 if FEC is currently idle
-	ParityRows int     // number of parity rows per group
+	Enabled bool
+	Scheme  FECScheme
+	// GroupSize is the current target group size of the block scheme, or the window
+	// size of the sliding window scheme. It is 0 while FEC is idle.
+	GroupSize int
+	// ParityRows is the number of parity rows per group (block scheme). The sliding
+	// window scheme doesn't use it.
+	ParityRows int
 	LossRate   float64 // smoothed loss rate observed by the peer on the path we send on
 	// ConfiguredOverhead is the parity/protected ratio the current group size and
 	// parity row count aim for. It is a configuration value, not a measurement.
@@ -254,12 +323,13 @@ func (s *fecState) lossRate() float64 {
 	return math.Float64frombits(s.lossBits.Load())
 }
 
-// EnableFEC enables packet level forward error correction for this connection.
+// EnableFEC enables packet level forward error correction for this connection. The
+// scheme is selected by config.Scheme.
 //
-// Both peers need to enable FEC. Enablement is not negotiated by quic-go itself
-// (QUICX negotiates it in its own handshake), so that no additional transport
-// parameter shows up in the ClientHello and the HTTP/3 fingerprint is preserved.
-// FEC_FEEDBACK and FEC_REPAIR frames of a peer that enabled FEC earlier are ignored,
+// Both peers need to enable FEC, and they need to use the same scheme. Enablement is
+// not negotiated by quic-go itself (QUICX negotiates it in its own handshake), so that
+// no additional transport parameter shows up in the ClientHello and the HTTP/3
+// fingerprint is preserved. FEC frames of a peer that enabled FEC earlier are ignored,
 // so enabling FEC on one side only does not break the connection.
 func (c *Conn) EnableFEC(config FECConfig) error {
 	select {
@@ -267,7 +337,15 @@ func (c *Conn) EnableFEC(config FECConfig) error {
 	default:
 		return &FECError{Message: "FEC can only be enabled after the handshake completed"}
 	}
-	c.fecState.Store(newFECState(config))
+	var scheme fecScheme
+	switch config.Scheme {
+	case FECSchemeWindow:
+		scheme = newFECWindowState(config)
+	default:
+		config.Scheme = FECSchemeBlock
+		scheme = newFECState(config)
+	}
+	c.fecState.Store(&scheme)
 	c.scheduleSending()
 	return nil
 }
@@ -280,11 +358,19 @@ func (c *Conn) DisableFEC() {
 
 // FECStats returns the current FEC statistics of the connection.
 func (c *Conn) FECStats() FECStats {
-	state := c.fecState.Load()
-	if state == nil {
+	scheme := c.loadFEC()
+	if scheme == nil {
 		return FECStats{}
 	}
-	return state.stats()
+	return scheme.stats()
+}
+
+// loadFEC returns the FEC scheme of the connection, or nil while FEC is disabled.
+func (c *Conn) loadFEC() fecScheme {
+	if scheme := c.fecState.Load(); scheme != nil {
+		return *scheme
+	}
+	return nil
 }
 
 func (s *fecState) stats() FECStats {
@@ -295,6 +381,7 @@ func (s *fecState) stats() FECStats {
 	consideredBytes := s.consideredBytes.Load()
 	stats := FECStats{
 		Enabled:                  true,
+		Scheme:                   FECSchemeBlock,
 		GroupSize:                groupSize,
 		ParityRows:               rows,
 		LossRate:                 s.lossRate(),
@@ -329,18 +416,18 @@ func (e *FECError) Error() string { return "quic: " + e.Message }
 var errFECFrameTooLarge = errors.New("FEC frame too large")
 
 // dataPacketSizeLimit returns the maximum size of a packet that may be protected by
-// FEC. FEC_REPAIR frames are at most as long as the longest protected packet plus the
-// header that describes the group, so protected packets have to leave room for it.
+// FEC. A parity frame is at most as long as the longest protected packet plus the
+// header that describes the code, so protected packets have to leave room for it.
 func (c *Conn) dataPacketSizeLimit() protocol.ByteCount {
 	maxPacketSize := c.maxPacketSize()
-	state := c.fecState.Load()
-	if state == nil || !state.encoder.protecting() {
+	scheme := c.loadFEC()
+	if scheme == nil || !scheme.protecting() {
 		return maxPacketSize
 	}
 	// The parity packet carries the longest protected packet plus the frame header, and
 	// spends a short header and an AEAD tag on top of the datagram. All three have to be
 	// kept free, otherwise the parity frame is dropped when it is packed.
-	reserve := state.encoder.reserve() + fecMaxPacketOverhead
+	reserve := scheme.reserve() + fecMaxPacketOverhead
 	if reserve >= maxPacketSize {
 		return maxPacketSize
 	}
@@ -350,36 +437,46 @@ func (c *Conn) dataPacketSizeLimit() protocol.ByteCount {
 // fecRecordSentPacket hands a packet that was just written to the wire to the FEC
 // encoder, and lets the encoder re-evaluate the loss rate.
 func (c *Conn) fecRecordSentPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time) {
-	state := c.fecState.Load()
-	if state == nil {
+	scheme := c.loadFEC()
+	if scheme == nil {
 		return
 	}
-	state.encoder.tick(now)
-	if !state.encoder.protecting() {
-		return
-	}
-	state.encoder.addPacket(pn, data, maxPacketSize, now)
+	scheme.tick(now)
+	scheme.addPacket(pn, data, maxPacketSize, now)
 }
 
-// fecRecordReceivedPacket caches a received packet for FEC recovery.
-func (c *Conn) fecRecordReceivedPacket(pn protocol.PacketNumber, data []byte, keyPhase protocol.KeyPhaseBit) {
-	state := c.fecState.Load()
-	if state == nil {
+// fecRecordReceivedPacket caches a received packet for FEC recovery. A packet that
+// arrives late can make a packet that was lost before it recoverable, so the packets
+// the cache reconstructs are handed to the connection right away.
+func (c *Conn) fecRecordReceivedPacket(pn protocol.PacketNumber, data []byte, keyPhase protocol.KeyPhaseBit, rcvTime monotime.Time) {
+	scheme := c.loadFEC()
+	if scheme == nil {
 		return
 	}
-	state.decoder.recordPacket(pn, data, keyPhase)
+	c.handleRecoveredFECPackets(scheme.recordPacket(pn, data, keyPhase), rcvTime)
 }
 
-func (c *Conn) handleFECRepairFrame(frame *wire.FECRepairFrame, rcvTime monotime.Time) error {
-	state := c.fecState.Load()
-	if state == nil {
+// handleFECFrame processes an incoming FEC frame: a repair frame of the scheme that is
+// enabled for this connection, or a feedback frame of the peer. Frames of the other
+// scheme, and all FEC frames while FEC is disabled locally, are ignored.
+func (c *Conn) handleFECFrame(frame wire.Frame, rcvTime monotime.Time) error {
+	scheme := c.loadFEC()
+	if scheme == nil {
 		// FEC wasn't enabled (locally): ignore the parity packet. This happens when
 		// the peer enabled FEC before we did, or when one side is misconfigured.
 		return nil
 	}
-	for _, recovered := range state.decoder.handleRepair(frame, rcvTime) {
+	c.handleRecoveredFECPackets(scheme.handleFrame(frame, rcvTime), rcvTime)
+	return nil
+}
+
+// handleRecoveredFECPackets feeds packets that FEC reconstructed into the regular
+// packet processing path. They are acknowledged like packets that arrived on the wire,
+// so the congestion controller doesn't see the loss as a retransmission.
+func (c *Conn) handleRecoveredFECPackets(recovered []fecRecoveredPacket, rcvTime monotime.Time) {
+	for _, packet := range recovered {
 		buffer := getPacketBuffer()
-		buffer.Data = append(buffer.Data, recovered.data...)
+		buffer.Data = append(buffer.Data, packet.data...)
 		c.handlePacket(receivedPacket{
 			buffer:     buffer,
 			data:       buffer.Data,
@@ -388,32 +485,23 @@ func (c *Conn) handleFECRepairFrame(frame *wire.FECRepairFrame, rcvTime monotime
 			ecn:        protocol.ECNNon,
 		})
 	}
-	return nil
 }
 
-func (c *Conn) handleFECFeedbackFrame(frame *wire.FECFeedbackFrame, rcvTime monotime.Time) {
-	state := c.fecState.Load()
-	if state == nil {
-		return
-	}
-	state.encoder.onFeedback(frame, rcvTime)
-}
-
-// fecFlushDeadline returns the time at which an open (partial) FEC group should be
-// protected, or a zero time if no group is open.
+// fecFlushDeadline returns the time at which an idle sender protects the packets it is
+// still holding, or a zero time if there is nothing to protect.
 func (c *Conn) fecFlushDeadline() monotime.Time {
-	state := c.fecState.Load()
-	if state == nil {
+	scheme := c.loadFEC()
+	if scheme == nil {
 		return 0
 	}
-	return state.encoder.flushDeadline()
+	return scheme.flushDeadline()
 }
 
 // maybeSendFECPackets sends at most one pending FEC packet (a parity packet or a
 // feedback frame). It reports whether a packet was sent.
 func (c *Conn) maybeSendFECPackets(now monotime.Time) (bool, error) {
-	state := c.fecState.Load()
-	if state == nil {
+	scheme := c.loadFEC()
+	if scheme == nil {
 		return false, nil
 	}
 	// The send queue is bounded. FEC packets are only enqueued when the caller is
@@ -421,25 +509,19 @@ func (c *Conn) maybeSendFECPackets(now monotime.Time) (bool, error) {
 	if c.sendQueue.WouldBlock() {
 		return false, nil
 	}
-	if frame := state.encoder.pendingRepair(now, c.maxPacketSize()); frame != nil {
-		if err := c.sendFECFrame(state, frame, now); err != nil {
+	if frame := scheme.pendingFrame(now, c.maxPacketSize()); frame != nil {
+		if err := c.sendFECFrame(scheme, frame, now); err != nil {
 			return false, err
 		}
-		if state.encoder.hasPendingRepair() {
+		if scheme.hasPending() {
 			c.scheduleSending()
-		}
-		return true, nil
-	}
-	if frame := state.decoder.pendingFeedback(now); frame != nil {
-		if err := c.sendFECFrame(state, frame, now); err != nil {
-			return false, err
 		}
 		return true, nil
 	}
 	return false, nil
 }
 
-func (c *Conn) sendFECFrame(state *fecState, frame wire.Frame, now monotime.Time) error {
+func (c *Conn) sendFECFrame(scheme fecScheme, frame wire.Frame, now monotime.Time) error {
 	ecn := c.sentPacketHandler.ECNMode(true)
 	packet, buf, err := c.packer.PackFECPacket(frame, c.maxPacketSize(), now, c.version)
 	if err != nil {
@@ -456,12 +538,57 @@ func (c *Conn) sendFECFrame(state *fecState, frame wire.Frame, now monotime.Time
 	c.logShortHeaderPacket(packet, ecn, buf.Len())
 	c.registerPackedShortHeaderPacket(packet, ecn, now)
 	c.sendQueue.Send(buf, 0, ecn)
-	if repair, ok := frame.(*wire.FECRepairFrame); ok {
-		state.paritySent.Add(1)
-		state.parityBytes.Add(uint64(repair.Length(c.version)))
+	scheme.frameSent(frame, c.version)
+	return nil
+}
+
+// The block scheme implements the fecScheme interface. The scheme's state and its
+// encoder and decoder are only accessed from the connection's run loop goroutine.
+func (s *fecState) protecting() bool { return s.encoder.protecting() }
+
+func (s *fecState) reserve() protocol.ByteCount { return s.encoder.reserve() }
+
+func (s *fecState) tick(now monotime.Time) { s.encoder.tick(now) }
+
+func (s *fecState) addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time) {
+	s.encoder.addPacket(pn, data, maxPacketSize, now)
+}
+
+func (s *fecState) recordPacket(pn protocol.PacketNumber, data []byte, keyPhase protocol.KeyPhaseBit) []fecRecoveredPacket {
+	s.decoder.recordPacket(pn, data, keyPhase)
+	return nil
+}
+
+func (s *fecState) handleFrame(frame wire.Frame, now monotime.Time) []fecRecoveredPacket {
+	switch f := frame.(type) {
+	case *wire.FECRepairFrame:
+		return s.decoder.handleRepair(f, now)
+	case *wire.FECFeedbackFrame:
+		s.encoder.onFeedback(f, now)
 	}
 	return nil
 }
+
+func (s *fecState) pendingFrame(now monotime.Time, maxPacketSize protocol.ByteCount) wire.Frame {
+	if frame := s.encoder.pendingRepair(now, maxPacketSize); frame != nil {
+		return frame
+	}
+	if frame := s.decoder.pendingFeedback(now); frame != nil {
+		return frame
+	}
+	return nil
+}
+
+func (s *fecState) hasPending() bool { return s.encoder.hasPendingRepair() }
+
+func (s *fecState) frameSent(frame wire.Frame, v protocol.Version) {
+	if repair, ok := frame.(*wire.FECRepairFrame); ok {
+		s.paritySent.Add(1)
+		s.parityBytes.Add(uint64(repair.Length(v)))
+	}
+}
+
+func (s *fecState) flushDeadline() monotime.Time { return s.encoder.flushDeadline() }
 
 // fecGroup is an FEC group that is currently being filled.
 type fecGroup struct {
