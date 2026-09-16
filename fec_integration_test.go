@@ -537,10 +537,11 @@ func TestFECWindowRecoversLostPackets(t *testing.T) {
 	requireOverheadWithinCap(t, "server", stats)
 }
 
-// TestFECWindowRecoversBurstLosses drops bursts of consecutive packets: the whole burst
-// lands in the same window, and the rows that cover it reconstruct all of it. The block
-// scheme can only repair a burst as long as the number of parity rows of one group.
-func TestFECWindowRecoversBurstLosses(t *testing.T) {
+// TestFECWindowRecoversBurstLossesPath drops bursts of consecutive packets on the
+// path: the whole burst lands in the same window, and the rows that cover it
+// reconstruct all of it. The block scheme can only repair a burst as long as the
+// number of parity rows of one group.
+func TestFECWindowRecoversBurstLossesPath(t *testing.T) {
 	pair := newFECTestPair(t)
 	defer pair.Close()
 	<-pair.clientConn.HandshakeComplete()

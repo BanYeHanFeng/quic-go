@@ -301,7 +301,7 @@ func TestFECWindowRepairFrameInvalid(t *testing.T) {
 	}
 	// a packet number that can't be represented
 	invalid = *valid
-	invalid.FirstPacketNumber = 1 << 63
+	invalid.FirstPacketNumber = 1 << 62
 	invalidData, err = invalid.Append(nil, protocol.Version1)
 	if err != nil {
 		t.Fatal(err)
