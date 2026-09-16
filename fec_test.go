@@ -21,6 +21,10 @@ func randomPacket(t *testing.T, length int) []byte {
 }
 
 // buildFECGroup feeds packets into the encoder and returns the parity frames.
+//
+// The packets are MTU sized, like the ones a real connection protects: with small
+// packets the FEC_REPAIR header alone can be larger than the protected traffic, and
+// the overhead budget would - correctly - refuse to protect the group.
 func buildFECGroup(t *testing.T, state *fecState, groupSize, rows int, packetCount int) ([]*wire.FECRepairFrame, map[protocol.PacketNumber][]byte) {
 	t.Helper()
 	state.encoder.groupSize = groupSize
@@ -31,7 +35,7 @@ func buildFECGroup(t *testing.T, state *fecState, groupSize, rows int, packetCou
 	packets := make(map[protocol.PacketNumber][]byte, packetCount)
 	for i := range packetCount {
 		pn := protocol.PacketNumber(100 + i)
-		data := randomPacket(t, 20+i*37)
+		data := randomPacket(t, 1024+i*8)
 		packets[pn] = data
 		state.encoder.addPacket(pn, data, 1452, now)
 	}
@@ -50,7 +54,9 @@ func buildFECGroup(t *testing.T, state *fecState, groupSize, rows int, packetCou
 }
 
 func TestFECRecoversSingleLoss(t *testing.T) {
-	config := FECConfig{MaxGroupSize: 16, MinGroupSize: 2, MaxOverheadPercent: 50, MaxParityRows: 1}
+	// The cap is irrelevant here: this test checks recovery for small groups, and a two
+	// packet group costs more than 50% parity once the FEC_REPAIR header is counted.
+	config := FECConfig{MaxGroupSize: 16, MinGroupSize: 2, MaxOverheadPercent: 100, MaxParityRows: 1}
 	for _, groupSize := range []int{2, 3, 8, 16} {
 		sender := newFECState(config)
 		frames, packets := buildFECGroup(t, sender, groupSize, 1, groupSize)
@@ -260,12 +266,18 @@ func TestFECIdleWithoutLoss(t *testing.T) {
 // only reached between bursts, which is what produces partial groups.
 func pumpFEC(t *testing.T, config FECConfig, lossPercent uint64, packetCount, packetLength int) FECStats {
 	t.Helper()
-	const burstLength = 128
+	const (
+		burstLength = 128
+		// fecTestPacketInterval is how much time passes between two packets inside a
+		// burst. It has to stay well below FlushDelay (2ms), otherwise the flush
+		// deadline would cut every group short and no group would ever fill up.
+		fecTestPacketInterval = 10 * time.Microsecond
+	)
 	state := newFECState(config)
 	now := monotime.Now()
 	feedback := &wire.FECFeedbackFrame{}
 	for i := range packetCount {
-		now = now.Add(time.Millisecond)
+		now = now.Add(fecTestPacketInterval)
 		feedback.ReceivedPackets += 100 - lossPercent
 		feedback.LostPackets += lossPercent
 		state.encoder.onFeedback(feedback, now)
