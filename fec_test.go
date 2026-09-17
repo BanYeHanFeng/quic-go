@@ -250,10 +250,14 @@ func benchmarkFECRepairRow(b *testing.B, xorScaled func(dst, src []byte, coeffic
 	}
 }
 
-func BenchmarkFECRepairRowTable(b *testing.B) {
-	benchmarkFECRepairRow(b, fecXORScaled)
-}
-
 func BenchmarkFECRepairRowLogExp(b *testing.B) {
 	benchmarkFECRepairRow(b, fecXORScaledLogExp)
+}
+
+func BenchmarkFECRepairRowTableOnly(b *testing.B) {
+	benchmarkFECRepairRow(b, fecXORScaledTable)
+}
+
+func BenchmarkFECRepairRowProduction(b *testing.B) {
+	benchmarkFECRepairRow(b, fecXORScaled)
 }

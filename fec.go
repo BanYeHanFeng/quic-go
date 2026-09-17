@@ -386,6 +386,7 @@ func init() {
 			gfMulTable[a][b] = gfExp[int(gfLog[a])+int(gfLog[b])]
 		}
 	}
+	initFECSIMDTables()
 }
 
 func gfMul(a, b byte) byte {
@@ -408,7 +409,15 @@ func fecXORScaled(dst, src []byte, coefficient byte) {
 		}
 		return
 	}
+	fecXORScaledImpl(dst, src, coefficient)
+}
+
+// fecXORScaledTable is the portable implementation: every byte is multiplied
+// through the per-coefficient 256 byte row of gfMulTable. It is also the fallback
+// of the optional SIMD build (see fec_xor_simd_amd64.go).
+func fecXORScaledTable(dst, src []byte, coefficient byte) {
 	table := &gfMulTable[coefficient]
+	dst = dst[:len(src)]
 	for i, b := range src {
 		dst[i] ^= table[b]
 	}
