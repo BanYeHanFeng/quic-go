@@ -92,6 +92,13 @@ type FECConfig struct {
 	// middle, so a connection that stops sending would leave them unprotected
 	// otherwise. Defaults to 2.
 	MaxParityRows int
+	// BaselineRedundancyPercent keeps a small fixed redundancy on the wire even while
+	// the path looks lossless. A purely reactive sender only starts protecting after
+	// the peer reports the first loss, which costs roughly 0.5*RTT plus the feedback
+	// interval; on a high-RTT or low-rate path the first burst can already be gone from
+	// the window by then. The baseline is subject to MaxOverheadPercent like any other
+	// redundancy. Defaults to 0: a clean path then spends no byte on FEC at all.
+	BaselineRedundancyPercent int
 	// FlushDelay is how long the sender waits after the last packet before it emits
 	// the repair rows for the tail of the window. Defaults to 2ms.
 	FlushDelay time.Duration
@@ -118,6 +125,12 @@ func (c FECConfig) withDefaults() FECConfig {
 	}
 	if c.FlushDelay <= 0 {
 		c.FlushDelay = defaultFECFlushDelay
+	}
+	if c.BaselineRedundancyPercent < 0 {
+		c.BaselineRedundancyPercent = 0
+	}
+	if c.BaselineRedundancyPercent > 100 {
+		c.BaselineRedundancyPercent = 100
 	}
 	return c
 }

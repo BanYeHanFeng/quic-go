@@ -539,3 +539,77 @@ func TestFECHoldCoversTheWindowSpan(t *testing.T) {
 		t.Fatalf("the hold does not follow the packet rate: %v", hold)
 	}
 }
+
+// TestFECBaselineRedundancyWithoutLoss verifies that a configured baseline keeps repair
+// rows flowing on a path that never reports a loss, within the overhead cap, and that it
+// stays engaged when the peer's reports stop: that is the "the first row must not wait
+// for feedback" property of the baseline.
+func TestFECBaselineRedundancyWithoutLoss(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MaxParityRows: 1, BaselineRedundancyPercent: 3}
+	state := newFECWindowState(config)
+	if !state.encoder.protecting() {
+		t.Fatal("the configured baseline didn't engage before the first packet")
+	}
+	if rate := state.encoder.rate; rate <= 0 || rate > 0.031 {
+		t.Fatalf("unexpected baseline redundancy %v", rate)
+	}
+	now := monotime.Now()
+	var rows int
+	for i := 0; i < 2000; i++ {
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now, true)
+		for {
+			frame := state.encoder.pendingFrame(now, 1452)
+			if frame == nil {
+				break
+			}
+			state.frameSent(frame, protocol.Version1)
+			rows++
+		}
+		now = now.Add(time.Millisecond)
+	}
+	if rows == 0 {
+		t.Fatal("the baseline sent no repair row on a clean path")
+	}
+	if stats := state.stats(); stats.MeasuredOverhead > 0.10+1e-9 {
+		t.Fatalf("baseline overhead %v exceeds the 10%% cap: %+v", stats.MeasuredOverhead, stats)
+	}
+	// The baseline is not driven by feedback: it survives a peer that goes quiet.
+	for i := 0; i < 20; i++ {
+		now = now.Add(fecEvaluationInterval)
+		state.encoder.tick(now)
+	}
+	if !state.encoder.protecting() {
+		t.Fatal("the baseline decayed after the feedback stream stopped")
+	}
+}
+
+// TestFECBaselineIsClampedByOverheadCap verifies that a baseline larger than the overhead
+// cap is clamped by the same byte budget as the reactive scheme.
+func TestFECBaselineIsClampedByOverheadCap(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32, MaxParityRows: 1, BaselineRedundancyPercent: 90}
+	state := newFECWindowState(config)
+	if rate := state.encoder.rate; rate <= 0 || rate > 0.0951 {
+		t.Fatalf("baseline rate %v is not clamped to the 10%% cap", rate)
+	}
+	now := monotime.Now()
+	var rows int
+	for i := 0; i < 4000; i++ {
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now, true)
+		for {
+			frame := state.encoder.pendingFrame(now, 1452)
+			if frame == nil {
+				break
+			}
+			state.frameSent(frame, protocol.Version1)
+			rows++
+		}
+		now = now.Add(time.Millisecond)
+	}
+	if rows == 0 {
+		t.Fatal("no repair row was sent")
+	}
+	stats := state.stats()
+	if stats.MeasuredOverhead > 0.10+1e-9 {
+		t.Fatalf("measured overhead %v exceeds the 10%% cap: %+v", stats.MeasuredOverhead, stats)
+	}
+}

@@ -218,6 +218,11 @@ func newFECWindowState(config FECConfig) *fecWindowState {
 	state := &fecWindowState{config: config}
 	state.encoder = newFECWindowEncoder(state, config)
 	state.decoder = newFECWindowDecoder(state, config)
+	// Install the baseline immediately, before the first packet: waiting for the first
+	// periodic evaluation would leave the opening burst of the connection unprotected.
+	if state.encoder.baselineRate > 0 {
+		state.encoder.updateRedundancyFor(0)
+	}
 	return state
 }
 
@@ -332,6 +337,7 @@ type fecWindowEncoder struct {
 
 	rate          float64
 	rateBits      atomic.Uint64
+	baselineRate  float64
 	lossEWMA      float64
 	averageLength float64
 
@@ -400,12 +406,13 @@ func newFECWindowEncoder(state *fecWindowState, config FECConfig) *fecWindowEnco
 		flushRows = 1
 	}
 	return &fecWindowEncoder{
-		state:       state,
-		config:      config,
-		windowSize:  windowSize,
-		maxSpan:     maxSpan,
-		flushRows:   flushRows,
-		overheadCap: float64(config.MaxOverheadPercent) / 100,
+		state:        state,
+		config:       config,
+		windowSize:   windowSize,
+		maxSpan:      maxSpan,
+		flushRows:    flushRows,
+		overheadCap:  float64(config.MaxOverheadPercent) / 100,
+		baselineRate: float64(config.BaselineRedundancyPercent) / 100,
 	}
 }
 
@@ -568,12 +575,21 @@ func (e *fecWindowEncoder) accumulateLossSample(received, lost uint64, now monot
 // cost of a row would push the parity traffic over the cap, the rate is reduced until
 // it fits.
 func (e *fecWindowEncoder) updateRedundancyFor(lossRate float64) {
-	if lossRate < fecMinLossRate {
-		// The path looks lossless: don't spend a single byte on redundancy.
+	// The baseline keeps FEC engaged while the path looks lossless. It is what lets a
+	// row cover the first loss before the peer's feedback could have reported it; the
+	// overhead cap bounds what that costs on a clean path.
+	required := e.baselineRate
+	if lossRate >= fecMinLossRate {
+		if reactive := lossRate * fecLossSafetyFactor; reactive > required {
+			required = reactive
+		}
+	}
+	if required <= 0 {
+		// The path looks lossless and no baseline was configured: don't spend a single
+		// byte on redundancy.
 		e.setRate(0)
 		return
 	}
-	required := lossRate * fecLossSafetyFactor
 	maxRate := e.overheadCap
 	if e.averageLength > 0 {
 		// A row costs the longest packet of its window plus the frame header, so a row
