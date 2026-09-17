@@ -398,7 +398,9 @@ func gfInv(a byte) byte {
 }
 
 // fecXORScaled computes dst ^= coefficient * src. src may be shorter than dst, which
-// realizes the zero-extension to the parity length.
+// realizes the zero-extension to the parity length. Only len(src) bytes are visited:
+// the cost of a variable-length row scales with the sum of the member lengths, not
+// with the longest member times the number of members.
 func fecXORScaled(dst, src []byte, coefficient byte) {
 	if coefficient == 0 {
 		return

@@ -228,36 +228,61 @@ func TestFECXORScaledMatchesLogExp(t *testing.T) {
 	}
 }
 
-// benchmarkFECRepairRow mirrors the cost of one repair row: 128 members of 1200
-// bytes each, all multiplied by the same row coefficient - the layout the C
-// benchmark in the FEC report measured.
-func benchmarkFECRepairRow(b *testing.B, xorScaled func(dst, src []byte, coefficient byte)) {
-	const members = 128
-	const memberLen = 1200
-	src := make([]byte, members*memberLen)
+// benchmarkFECRepairRow mirrors the cost of one repair row: all members multiplied
+// by the same row coefficient, exactly as fecWindowEncoder.buildRow does it.
+func benchmarkFECRepairRow(b *testing.B, xorScaled func(dst, src []byte, coefficient byte), lengths []int, maxLen int) {
+	total := 0
+	for _, length := range lengths {
+		total += length
+	}
+	src := make([]byte, total)
 	for i := range src {
 		src[i] = byte(i*7 + 13)
 	}
-	dst := make([]byte, memberLen)
-	b.SetBytes(members * memberLen)
+	dst := make([]byte, maxLen)
+	b.SetBytes(int64(total))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		coefficient := byte(i%255 + 1)
-		for m := 0; m < members; m++ {
-			xorScaled(dst, src[m*memberLen:(m+1)*memberLen], coefficient)
+		offset := 0
+		for _, length := range lengths {
+			xorScaled(dst, src[offset:offset+length], coefficient)
+			offset += length
 		}
 	}
 }
 
+func uniformRowLengths() []int {
+	lengths := make([]int, 128)
+	for i := range lengths {
+		lengths[i] = 1200
+	}
+	return lengths
+}
+
+// BenchmarkFECRepairRowMixedTableOnly is the adversarial variable-length row from
+// the FEC report: 127 members of 60 bytes and one of 1400 bytes. The work must scale
+// with the sum of the member lengths (fecXORScaled only iterates len(src)), not with
+// members times the longest member: if the latter were true, MB/s would collapse by
+// roughly 17x compared to the uniform row.
+func BenchmarkFECRepairRowMixedTableOnly(b *testing.B) {
+	lengths := make([]int, 128)
+	for i := range lengths {
+		lengths[i] = 60
+	}
+	lengths[0] = 1400
+	benchmarkFECRepairRow(b, fecXORScaledTable, lengths, 1400)
+}
+
 func BenchmarkFECRepairRowLogExp(b *testing.B) {
-	benchmarkFECRepairRow(b, fecXORScaledLogExp)
+	benchmarkFECRepairRow(b, fecXORScaledLogExp, uniformRowLengths(), 1200)
 }
 
 func BenchmarkFECRepairRowTableOnly(b *testing.B) {
-	benchmarkFECRepairRow(b, fecXORScaledTable)
+	benchmarkFECRepairRow(b, fecXORScaledTable, uniformRowLengths(), 1200)
 }
 
 func BenchmarkFECRepairRowProduction(b *testing.B) {
-	benchmarkFECRepairRow(b, fecXORScaled)
+	benchmarkFECRepairRow(b, fecXORScaled, uniformRowLengths(), 1200)
 }
