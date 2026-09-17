@@ -392,6 +392,56 @@ func TestFECRecoversLostPackets(t *testing.T) {
 	requireOverheadWithinCap(t, "server", stats)
 }
 
+// TestFECRecoveredPacketsAreReportedToTheSender verifies the opt-in FEC_RECOVERED
+// feedback end to end: the receiver that reconstructed packets tells the sender about
+// them, and the sender hands them to its congestion controller. The payload still
+// arrives, because the recovered packets are acknowledged like packets that arrived
+// on the wire.
+func TestFECRecoveredPacketsAreReportedToTheSender(t *testing.T) {
+	pair := newFECTestPair(t)
+	defer pair.Close()
+	<-pair.clientConn.HandshakeComplete()
+	config := FECConfig{
+		MaxOverheadPercent:      fecTestOverheadCap,
+		MaxGroupSize:            32,
+		MaxParityRows:           2,
+		RecoveredPacketFeedback: true,
+	}
+	if err := pair.clientConn.EnableFEC(config); err != nil {
+		t.Fatalf("enabling FEC on the client failed: %v", err)
+	}
+	if err := pair.serverConn.EnableFEC(config); err != nil {
+		t.Fatalf("enabling FEC on the server failed: %v", err)
+	}
+	pair.clientLossy.dropEvery.Store(16)
+	pair.serverLossy.dropEvery.Store(16)
+
+	payload := randomPacket(t, 2*1024*1024)
+	received := transfer(t, pair.clientConn, pair.serverConn, payload)
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("payload mismatch: got %d bytes, expected %d", len(received), len(payload))
+	}
+	serverStats := pair.serverConn.FECStats()
+	if serverStats.RecoveredPackets == 0 || serverStats.RecoveredPacketsReported == 0 {
+		t.Fatalf("the server recovered %d packets and reported %d of them",
+			serverStats.RecoveredPackets, serverStats.RecoveredPacketsReported)
+	}
+	var clientStats FECStats
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		clientStats = pair.clientConn.FECStats()
+		if clientStats.RecoveredPacketsReceived > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if clientStats.RecoveredPacketsReceived == 0 {
+		t.Fatalf("the client didn't receive any recovered packet report: %+v", clientStats)
+	}
+	requireOverheadWithinCap(t, "client", clientStats)
+	requireOverheadWithinCap(t, "server", serverStats)
+}
+
 // gsoTestPair sets up a client and a server on real UDP sockets (which enables GSO on
 // Linux), with a userspace UDP relay in between that drops every n-th packet in both
 // directions. Unlike lossyPacketConn (which hides the socket optimizations from

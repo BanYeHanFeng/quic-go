@@ -174,6 +174,8 @@ func (p *FrameParser) ParseLessCommonFrame(frameType FrameType, data []byte, v p
 		frame, l, err = parseFECFeedbackFrame(data, v)
 	case FrameTypeFECWindowRepair:
 		frame, l, err = parseFECWindowRepairFrame(data, v)
+	case FrameTypeFECRecovered:
+		frame, l, err = parseFECRecoveredFrame(data, v)
 	default:
 		err = errUnknownFrameType
 	}

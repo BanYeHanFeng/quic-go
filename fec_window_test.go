@@ -105,6 +105,49 @@ func TestFECRecoversSingleLoss(t *testing.T) {
 	}
 }
 
+// TestFECReportsRecoveredPackets verifies that recovered packets are queued as an
+// FEC_RECOVERED frame when the option is on, including the wire length the sender
+// needs to report the loss to its congestion controller.
+func TestFECReportsRecoveredPackets(t *testing.T) {
+	config := FECConfig{MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2, RecoveredPacketFeedback: true}
+	lost := map[protocol.PacketNumber]bool{1007: true}
+	packets, recovered, receiver := windowTestTransfer(t, config, 0.5, 40, lost)
+	requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{1007})
+	if stats := receiver.stats(); stats.RecoveredPacketsReported != 1 {
+		t.Fatalf("recovered packets reported = %d, want 1: %+v", stats.RecoveredPacketsReported, stats)
+	}
+	pending := receiver.pendingFrame(monotime.Now(), 1452)
+	frame, ok := pending.(*wire.FECRecoveredFrame)
+	if !ok {
+		t.Fatalf("expected a recovered frame, got %T", pending)
+	}
+	if len(frame.Packets) != 1 || frame.Packets[0].PacketNumber != 1007 {
+		t.Fatalf("unexpected recovered packets: %+v", frame.Packets)
+	}
+	if frame.Packets[0].Length != protocol.ByteCount(len(packets[1007])) {
+		t.Fatalf("recovered length = %d, want %d", frame.Packets[0].Length, len(packets[1007]))
+	}
+	if next := receiver.pendingFrame(monotime.Now(), 1452); next != nil {
+		if _, ok := next.(*wire.FECRecoveredFrame); ok {
+			t.Fatal("the recovered report was not consumed")
+		}
+	}
+}
+
+// TestFECDoesNotReportRecoveredPacketsByDefault guards the default: without the
+// option no recovered frame is generated.
+func TestFECDoesNotReportRecoveredPacketsByDefault(t *testing.T) {
+	config := FECConfig{MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
+	packets, recovered, receiver := windowTestTransfer(t, config, 0.5, 40, map[protocol.PacketNumber]bool{1007: true})
+	requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{1007})
+	if stats := receiver.stats(); stats.RecoveredPacketsReported != 0 {
+		t.Fatalf("recovered packets were reported without the option: %+v", stats)
+	}
+	if frame, ok := receiver.pendingFrame(monotime.Now(), 1452).(*wire.FECRecoveredFrame); ok {
+		t.Fatalf("unexpected recovered frame: %+v", frame)
+	}
+}
+
 func TestFECRecoversBurstLosses(t *testing.T) {
 	// A burst of four consecutive packets. The rows that cover the burst are
 	// independent of each other - each of them protects the whole window - so the

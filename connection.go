@@ -1991,6 +1991,8 @@ func (c *Conn) handleFrame(
 		err = c.handleHandshakeDoneFrame(rcvTime)
 	case *wire.FECWindowRepairFrame, *wire.FECFeedbackFrame:
 		err = c.handleFECFrame(frame, rcvTime)
+	case *wire.FECRecoveredFrame:
+		err = c.handleFECRecoveredFrame(frame, rcvTime)
 	default:
 		err = fmt.Errorf("unexpected frame type: %s", reflect.ValueOf(&frame).Elem().Type().Name())
 	}

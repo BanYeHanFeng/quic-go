@@ -107,6 +107,13 @@ type FECConfig struct {
 	// the window by then. The baseline is subject to MaxOverheadPercent like any other
 	// redundancy. Defaults to 0: a clean path then spends no byte on FEC at all.
 	BaselineRedundancyPercent int
+	// RecoveredPacketFeedback reports packets the decoder reconstructed with FEC back to
+	// the sender (FEC_RECOVERED), so that the sender can tell its congestion controller
+	// about the loss without retransmitting the packet. This keeps FEC from hiding the
+	// congestion signal (RFC 9265, with the exception for a path that is known to be
+	// lossy). It is off by default: it requires both ends to understand the frame, and
+	// enabling it deliberately makes the connection react to the losses FEC repairs.
+	RecoveredPacketFeedback bool
 	// FlushDelay is how long the sender waits after the last packet before it emits
 	// the repair rows for the tail of the window. Defaults to 2ms.
 	FlushDelay time.Duration
@@ -198,6 +205,12 @@ type FECStats struct {
 	// DuplicateRows is the number of repair rows dropped because an equation with the
 	// same row number was already pending. Re-adding it can't add rank, only work.
 	DuplicateRows uint64
+	// RecoveredPacketsReported is the number of locally recovered packets that were
+	// queued into FEC_RECOVERED frames for the peer (only with RecoveredPacketFeedback).
+	RecoveredPacketsReported uint64
+	// RecoveredPacketsReceived is the number of packets the peer reported as recovered
+	// and that were handed to the congestion controller.
+	RecoveredPacketsReceived uint64
 
 	// SmoothedRTT, MinRTT and RTTInflation are the connection's RTT estimates at the
 	// time the statistics were read. While FEC is recovering packets, RTTInflation
@@ -334,6 +347,26 @@ func (c *Conn) handleFECFrame(frame wire.Frame, rcvTime monotime.Time) error {
 		return nil
 	}
 	c.handleRecoveredFECPackets(state.handleFrame(frame, rcvTime), rcvTime)
+	return nil
+}
+
+// handleFECRecoveredFrame processes a report of packets the peer reconstructed with
+// FEC. The packets were acknowledged like packets that arrived on the wire, so they
+// are not retransmitted; their loss is reported to the congestion controller instead,
+// so that FEC doesn't hide the congestion signal (RFC 9265, with the exception for a
+// path that is known to be lossy).
+func (c *Conn) handleFECRecoveredFrame(frame *wire.FECRecoveredFrame, rcvTime monotime.Time) error {
+	state := c.loadFEC()
+	if state == nil {
+		// FEC wasn't enabled (locally): ignore the report. This happens when one side is
+		// misconfigured, like with the other FEC frames.
+		return nil
+	}
+	if len(frame.Packets) == 0 {
+		return nil
+	}
+	state.recoveredReceived.Add(uint64(len(frame.Packets)))
+	c.sentPacketHandler.OnFECRecoveredPackets(frame.Packets, rcvTime)
 	return nil
 }
 

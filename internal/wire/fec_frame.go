@@ -21,7 +21,14 @@ import (
 const (
 	FrameTypeFECFeedback     FrameType = 0x33
 	FrameTypeFECWindowRepair FrameType = 0x34
+	// FrameTypeFECRecovered reports packets that were reconstructed by FEC back to the
+	// sender. 0x35 is not reused: it was taken by the experimental streaming scheme.
+	FrameTypeFECRecovered FrameType = 0x36
 )
+
+// maxFECRecoveredFramePackets bounds the packets one recovered frame may report. It
+// keeps a malformed peer from allocating an unbounded slice while parsing.
+const maxFECRecoveredFramePackets = 256
 
 // MaxFECWindowSize is the maximum number of packets a sliding window repair row
 // protects. A sliding window row is superseded by the rows that follow it, so a large
@@ -39,7 +46,7 @@ const maxFECProtectedPacketLength = 16383
 
 // IsFECFrameType says if this is a packet level FEC frame.
 func (t FrameType) IsFECFrameType() bool {
-	return t == FrameTypeFECWindowRepair || t == FrameTypeFECFeedback
+	return t == FrameTypeFECWindowRepair || t == FrameTypeFECFeedback || t == FrameTypeFECRecovered
 }
 
 // A FECWindowRepairFrame carries one repair row of the sliding window
@@ -253,4 +260,107 @@ func (f *FECFeedbackFrame) Length(_ protocol.Version) protocol.ByteCount {
 			quicvarint.Len(f.FailedPackets) +
 			quicvarint.Len(f.ParityPackets),
 	)
+}
+
+// A FECRecoveredPacket is one packet the receiver reconstructed from a repair row.
+type FECRecoveredPacket struct {
+	PacketNumber protocol.PacketNumber
+	// Length is the wire length of the reconstructed packet. The sender needs it to
+	// report the packet as lost to the congestion controller: the packet was already
+	// acknowledged, so it has left the sender's packet history and its length is not
+	// available there anymore.
+	Length protocol.ByteCount
+}
+
+// A FECRecoveredFrame reports packets that the receiver reconstructed with FEC back
+// to the sender. The packets were acknowledged on arrival (as recovered packets are
+// ACKed like packets that arrived on the wire), so the sender doesn't need to
+// retransmit them; it reports them as lost to the congestion controller instead, so
+// that FEC doesn't hide the congestion signal (RFC 9265, with the exception for a
+// path that is known to be lossy). The frame only carries data for a receiver that
+// enabled the option, and a sender that doesn't understand it ignores it.
+//
+// Wire format (all integers are QUIC varints):
+//
+//	0x36 | count | first packet number | (pn delta, wire length) * count
+//
+// Packets are sorted by packet number, so the first packet's delta is zero.
+type FECRecoveredFrame struct {
+	Packets []FECRecoveredPacket
+}
+
+func parseFECRecoveredFrame(b []byte, _ protocol.Version) (*FECRecoveredFrame, int, error) {
+	startLen := len(b)
+	count, l, err := quicvarint.Parse(b)
+	if err != nil {
+		return nil, 0, replaceUnexpectedEOF(err)
+	}
+	b = b[l:]
+	if count > maxFECRecoveredFramePackets {
+		return nil, 0, errors.New("recovered frame reports too many packets")
+	}
+	f := &FECRecoveredFrame{}
+	if count == 0 {
+		return f, startLen - len(b), nil
+	}
+	first, l, err := quicvarint.Parse(b)
+	if err != nil {
+		return nil, 0, replaceUnexpectedEOF(err)
+	}
+	b = b[l:]
+	f.Packets = make([]FECRecoveredPacket, 0, count)
+	previous := first
+	for i := uint64(0); i < count; i++ {
+		delta, l, err := quicvarint.Parse(b)
+		if err != nil {
+			return nil, 0, replaceUnexpectedEOF(err)
+		}
+		b = b[l:]
+		length, l, err := quicvarint.Parse(b)
+		if err != nil {
+			return nil, 0, replaceUnexpectedEOF(err)
+		}
+		b = b[l:]
+		if i > 0 && delta == 0 {
+			return nil, 0, errors.New("recovered frame packet numbers are not increasing")
+		}
+		packetNumber := first + delta
+		if packetNumber < previous {
+			return nil, 0, errors.New("recovered frame packet numbers overflow")
+		}
+		previous = packetNumber
+		if length == 0 || protocol.ByteCount(length) > maxFECProtectedPacketLength {
+			return nil, 0, errors.New("recovered frame has an invalid packet length")
+		}
+		f.Packets = append(f.Packets, FECRecoveredPacket{PacketNumber: packetNumber, Length: protocol.ByteCount(length)})
+	}
+	return f, startLen - len(b), nil
+}
+
+func (f *FECRecoveredFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
+	b = quicvarint.Append(b, uint64(FrameTypeFECRecovered))
+	b = quicvarint.Append(b, uint64(len(f.Packets)))
+	if len(f.Packets) == 0 {
+		return b, nil
+	}
+	first := f.Packets[0].PacketNumber
+	b = quicvarint.Append(b, uint64(first))
+	for _, packet := range f.Packets {
+		b = quicvarint.Append(b, uint64(packet.PacketNumber-first))
+		b = quicvarint.Append(b, uint64(packet.Length))
+	}
+	return b, nil
+}
+
+func (f *FECRecoveredFrame) Length(_ protocol.Version) protocol.ByteCount {
+	length := protocol.ByteCount(quicvarint.Len(uint64(FrameTypeFECRecovered)) + quicvarint.Len(uint64(len(f.Packets))))
+	if len(f.Packets) == 0 {
+		return length
+	}
+	first := f.Packets[0].PacketNumber
+	length += protocol.ByteCount(quicvarint.Len(uint64(first)))
+	for _, packet := range f.Packets {
+		length += protocol.ByteCount(quicvarint.Len(uint64(packet.PacketNumber-first)) + quicvarint.Len(uint64(packet.Length)))
+	}
+	return length
 }

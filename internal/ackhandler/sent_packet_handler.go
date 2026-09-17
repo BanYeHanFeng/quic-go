@@ -214,6 +214,31 @@ func (h *sentPacketHandler) notifyLeastUnacked(cc congestionControl) {
 	cc.extended.OnPacketsLost(leastUnacked)
 }
 
+// OnFECRecoveredPackets reports packets that the peer reconstructed with FEC as losses
+// to the congestion controller, without retransmitting them: the packets arrived (and
+// were acknowledged) as recovered packets, so the only signal still owed to
+// congestion control is that the path lost them.
+//
+// An injected congestion controller (SetCongestionControl) numbers packets in its own
+// space; once the acknowledged packet has left the history that mapping is gone, so
+// those controllers keep their own accounting and are not notified here.
+func (h *sentPacketHandler) OnFECRecoveredPackets(packets []wire.FECRecoveredPacket, _ monotime.Time) {
+	if len(packets) == 0 {
+		return
+	}
+	cc := h.getCongestionControl()
+	if cc.injected {
+		return
+	}
+	priorInFlight := h.bytesInFlight
+	for _, packet := range packets {
+		if packet.Length == 0 {
+			continue
+		}
+		cc.OnCongestionEvent(packet.PacketNumber, packet.Length, priorInFlight)
+	}
+}
+
 // neuterPacket reports a packet that leaves the connection without being either
 // acknowledged or lost, matching quiche's SendAlgorithmInterface::OnPacketNeutered.
 func (h *sentPacketHandler) neuterPacket(cc congestionControl, p *packet) {

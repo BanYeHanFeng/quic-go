@@ -2,6 +2,7 @@ package quic
 
 import (
 	"math"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -157,6 +158,12 @@ const (
 	// visible: packets expiring unrecovered while no repair row has arrived for a whole
 	// missing timeout mean the peer stopped protecting this direction.
 	fecWindowStallWarnInterval = 10 * time.Second
+	// fecWindowMaxRecoveredPending bounds the recovered packets the decoder queues for
+	// reporting to the peer; the oldest is dropped when the peer doesn't drain them.
+	fecWindowMaxRecoveredPending = 256
+	// fecWindowMaxRecoveredFramePackets bounds the packets one recovered frame carries,
+	// so that a report still fits into a datagram.
+	fecWindowMaxRecoveredFramePackets = 64
 	// fecWindowCacheSlack is the number of packets the decoder caches on top of two
 	// windows: rows can only reference packets that are still in the sender's window,
 	// but packets arrive out of order.
@@ -228,6 +235,9 @@ type fecWindowState struct {
 	parityRecv    atomic.Uint64
 	missingGauge  atomic.Uint64
 	duplicateRows atomic.Uint64
+
+	recoveredReported atomic.Uint64
+	recoveredReceived atomic.Uint64
 }
 
 func newFECWindowState(config FECConfig) *fecWindowState {
@@ -281,6 +291,8 @@ func (s *fecWindowState) stats() FECStats {
 		ParityPacketsReceived:    s.parityRecv.Load(),
 		MissingPackets:           s.missingGauge.Load(),
 		DuplicateRows:            s.duplicateRows.Load(),
+		RecoveredPacketsReported: s.recoveredReported.Load(),
+		RecoveredPacketsReceived: s.recoveredReceived.Load(),
 	}
 	if protectedBytes > 0 {
 		stats.MeasuredOverhead = float64(parityBytes) / float64(protectedBytes)
@@ -313,6 +325,11 @@ func (s *fecWindowState) handleFrame(frame wire.Frame, now monotime.Time) []fecR
 }
 
 func (s *fecWindowState) pendingFrame(now monotime.Time, maxPacketSize protocol.ByteCount) wire.Frame {
+	// Recovered packet reports go first: they tell the peer about losses it has already
+	// repaired, and delaying them delays the congestion controller's view of the path.
+	if frame := s.decoder.pendingRecoveredFrame(maxPacketSize); frame != nil {
+		return frame
+	}
 	if frame := s.encoder.pendingFrame(now, maxPacketSize); frame != nil {
 		return frame
 	}
@@ -939,6 +956,10 @@ type fecWindowDecoder struct {
 	// "missing packets expired while no repair row arrives" log line.
 	lastParity    monotime.Time
 	lastStallWarn monotime.Time
+
+	// pendingRecovered holds recovered packets that still have to be reported to the
+	// peer with FEC_RECOVERED, in recovery order.
+	pendingRecovered []wire.FECRecoveredPacket
 }
 
 func newFECWindowDecoder(state *fecWindowState, config FECConfig) *fecWindowDecoder {
@@ -1225,6 +1246,7 @@ func (d *fecWindowDecoder) pump() []fecRecoveredPacket {
 					recovered = append(recovered, packet)
 					d.cachePacket(packet.packetNumber, packet.data)
 					d.noteKnown(packet.packetNumber, packet.data)
+					d.queueRecoveredReport(packet)
 				}
 				continue
 			}
@@ -1300,6 +1322,53 @@ func (d *fecWindowDecoder) solve(row *fecWindowPendingRow) (fecRecoveredPacket, 
 	}
 	d.state.recoveredRecv.Add(1)
 	return fecRecoveredPacket{packetNumber: packetNumber, data: data}, true
+}
+
+// queueRecoveredReport remembers a recovered packet for the FEC_RECOVERED frame that
+// tells the sender about it. It is only called when RecoveredPacketFeedback is on.
+func (d *fecWindowDecoder) queueRecoveredReport(packet fecRecoveredPacket) {
+	if !d.config.RecoveredPacketFeedback {
+		return
+	}
+	if len(d.pendingRecovered) >= fecWindowMaxRecoveredPending {
+		// The peer is not draining the reports. Keep the newest packets, which are the
+		// ones the congestion controller can still act on.
+		d.pendingRecovered = d.pendingRecovered[1:]
+	}
+	d.pendingRecovered = append(d.pendingRecovered, wire.FECRecoveredPacket{
+		PacketNumber: packet.packetNumber,
+		Length:       protocol.ByteCount(len(packet.data)),
+	})
+	d.state.recoveredReported.Add(1)
+}
+
+// pendingRecoveredFrame returns the next FEC_RECOVERED frame, or nil when there is
+// nothing to report. The frame is built from the oldest queued recoveries, sorted by
+// packet number and bounded so that it fits into a datagram.
+func (d *fecWindowDecoder) pendingRecoveredFrame(maxPacketSize protocol.ByteCount) *wire.FECRecoveredFrame {
+	if len(d.pendingRecovered) == 0 {
+		return nil
+	}
+	count := min(len(d.pendingRecovered), fecWindowMaxRecoveredFramePackets)
+	for count > 0 {
+		frame := &wire.FECRecoveredFrame{Packets: append([]wire.FECRecoveredPacket(nil), d.pendingRecovered[:count]...)}
+		slices.SortFunc(frame.Packets, func(a, b wire.FECRecoveredPacket) int {
+			switch {
+			case a.PacketNumber < b.PacketNumber:
+				return -1
+			case a.PacketNumber > b.PacketNumber:
+				return 1
+			default:
+				return 0
+			}
+		})
+		if frame.Length(protocol.Version1)+fecMaxPacketOverhead <= maxPacketSize {
+			d.pendingRecovered = d.pendingRecovered[count:]
+			return frame
+		}
+		count--
+	}
+	return nil
 }
 
 // pendingFeedback returns a feedback frame if a new loss report is due. The loss rate

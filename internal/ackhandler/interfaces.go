@@ -16,6 +16,11 @@ type SentPacketHandler interface {
 	ReceivedAck(f *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) (bool /* 1-RTT packet acked */, error)
 	ReceivedPacket(protocol.EncryptionLevel, monotime.Time)
 	ReceivedBytes(_ protocol.ByteCount, rcvTime monotime.Time)
+	// OnFECRecoveredPackets is called for packets the peer reconstructed with FEC. The
+	// packets were already acknowledged, so they must not be retransmitted; their loss
+	// is reported to the congestion controller instead (RFC 9265, with the exception
+	// for a path that is known to be lossy).
+	OnFECRecoveredPackets(packets []wire.FECRecoveredPacket, now monotime.Time)
 	DropPackets(_ protocol.EncryptionLevel, rcvTime monotime.Time)
 	ResetForRetry(rcvTime monotime.Time)
 

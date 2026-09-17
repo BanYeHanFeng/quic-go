@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/sagernet/quic-go/internal/protocol"
+	"github.com/sagernet/quic-go/quicvarint"
 )
 
 func TestFECFeedbackFrameRoundTrip(t *testing.T) {
@@ -36,7 +37,7 @@ func TestFECFeedbackFrameRoundTrip(t *testing.T) {
 
 func TestFECFrameTypesAccepted(t *testing.T) {
 	parser := NewFrameParser(false, false, false)
-	for _, frameType := range []FrameType{FrameTypeFECFeedback, FrameTypeFECWindowRepair} {
+	for _, frameType := range []FrameType{FrameTypeFECFeedback, FrameTypeFECWindowRepair, FrameTypeFECRecovered} {
 		typ, _, err := parser.ParseType([]byte{byte(frameType)}, protocol.Encryption1RTT)
 		if err != nil {
 			t.Fatalf("frame type %#x rejected at 1-RTT: %v", frameType, err)
@@ -178,5 +179,71 @@ func TestFECWindowRepairFrameInvalid(t *testing.T) {
 	}
 	if _, _, err := parseFECWindowRepairFrame(invalidData[1:], protocol.Version1); err == nil {
 		t.Fatal("expected an error for a single protected packet")
+	}
+}
+
+func TestFECRecoveredFrameRoundTrip(t *testing.T) {
+	for _, packets := range [][]FECRecoveredPacket{
+		nil,
+		{{PacketNumber: 42, Length: 1200}},
+		{
+			{PacketNumber: 100, Length: 1200},
+			{PacketNumber: 102, Length: 60},
+			{PacketNumber: 200, Length: 33},
+			{PacketNumber: 1000, Length: 1452},
+		},
+	} {
+		frame := &FECRecoveredFrame{Packets: packets}
+		data, err := frame.Append(nil, protocol.Version1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frame.Length(protocol.Version1) != protocol.ByteCount(len(data)) {
+			t.Fatalf("%d packets: length mismatch: %d vs %d", len(packets), frame.Length(protocol.Version1), len(data))
+		}
+		parsed, n, err := parseFECRecoveredFrame(data[1:], protocol.Version1)
+		if err != nil {
+			t.Fatalf("%d packets: %v", len(packets), err)
+		}
+		if n != len(data)-1 {
+			t.Fatalf("%d packets: expected to consume %d bytes, consumed %d", len(packets), len(data)-1, n)
+		}
+		if len(parsed.Packets) != len(packets) {
+			t.Fatalf("%d packets: parsed %d", len(packets), len(parsed.Packets))
+		}
+		for i, packet := range packets {
+			if parsed.Packets[i] != packet {
+				t.Fatalf("%d packets: packet %d = %+v, want %+v", len(packets), i, parsed.Packets[i], packet)
+			}
+		}
+	}
+}
+
+func TestFECRecoveredFrameRejectsInvalid(t *testing.T) {
+	// count larger than the bound
+	data := quicvarint.Append(nil, uint64(maxFECRecoveredFramePackets+1))
+	if _, _, err := parseFECRecoveredFrame(data, protocol.Version1); err == nil {
+		t.Fatal("an oversized recovered frame was accepted")
+	}
+	// non-increasing packet numbers
+	frame := &FECRecoveredFrame{Packets: []FECRecoveredPacket{
+		{PacketNumber: 10, Length: 100},
+		{PacketNumber: 10, Length: 100},
+	}}
+	data, err := frame.Append(nil, protocol.Version1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := parseFECRecoveredFrame(data[1:], protocol.Version1); err == nil {
+		t.Fatal("a duplicate recovered packet number was accepted")
+	}
+	// zero wire length
+	frame = &FECRecoveredFrame{Packets: []FECRecoveredPacket{{PacketNumber: 7, Length: 0}}}
+	data, err = frame.Append(nil, protocol.Version1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := parseFECRecoveredFrame(data[1:], protocol.Version1); err == nil {
+		t.Fatal("a zero length recovered packet was accepted")
 	}
 }
