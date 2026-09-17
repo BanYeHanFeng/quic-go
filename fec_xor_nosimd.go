@@ -1,4 +1,4 @@
-//go:build !(amd64 && fec_simd)
+//go:build !(fec_simd && (amd64 || arm64))
 
 package quic
 

@@ -28,7 +28,7 @@ jobs:
           cache: true
       - name: 格式检查（仅报告）
         run: |
-          files="fec.go fec_window.go fec_test.go fec_window_test.go fec_integration_test.go fec_xor_nosimd.go fec_xor_simd_amd64.go fec_xor_simd_amd64_test.go internal/wire/fec_frame.go internal/wire/fec_frame_test.go"
+          files="fec.go fec_window.go fec_test.go fec_window_test.go fec_integration_test.go fec_xor_nosimd.go fec_xor_simd_amd64.go fec_xor_simd_amd64_test.go fec_xor_simd_arm64.go fec_xor_simd_arm64_test.go internal/wire/fec_frame.go internal/wire/fec_frame_test.go"
           echo "::group::gofmt 差异"
           gofmt -l ${files} || true
           gofmt -d ${files} || true
@@ -68,5 +68,13 @@ jobs:
         run: go test -tags fec_simd -count=1 -run '^$' -bench 'BenchmarkFECRepairRow' -benchtime=2s -benchmem ./
       - name: FEC 集成测试（fec_simd，含竞态检测）
         run: go test -tags fec_simd -count=1 -race -v -run 'TestFEC.*(Path|LostPackets|Burst)' -timeout 30m ./
-      - name: 交叉编译检查（linux/arm64 + fec_simd，回退到查表）
+      - name: 交叉编译检查（linux/arm64 + fec_simd）
         run: GOOS=linux GOARCH=arm64 go build -tags fec_simd ./...
+      - name: 安装 qemu-user-static（arm64 测试）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+      - name: arm64 NEON 等价性测试（qemu）
+        run: |
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -tags fec_simd -o /tmp/fec-arm64.test ./
+          qemu-aarch64-static /tmp/fec-arm64.test -test.run 'TestGF256TableMatchesLogExp|TestFECXORScaledMatchesLogExp|TestFECSIMDAvailableARM64' -test.v
