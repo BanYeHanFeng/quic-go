@@ -8,7 +8,7 @@
 // PSHUFB split-table technique from fecMulLo/fecMulHi. The trailing bytes go
 // through the full 256 byte gfMulTable row. The caller guarantees
 // len(dst) >= len(src) and 0 < coefficient < 256.
-TEXT ·fecXORScaledSSSE3(SB), NOSPLIT, $0-56
+TEXT ·fecXORScaledSSSE3(SB), NOSPLIT, $0-49
 	MOVQ dst_base+0(FP), DI
 	MOVQ src_base+24(FP), SI
 	MOVQ src_len+32(FP), CX
