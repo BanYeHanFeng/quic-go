@@ -636,12 +636,19 @@ func (l *recordingLogger) Debugf(string, ...any) {}
 // TestFECSkipReasons verifies that the two skip causes are counted separately: the byte
 // budget refusing a row, and a row that can't be built to fit a datagram.
 func TestFECSkipReasons(t *testing.T) {
-	// A 1% cap can never pay for a 1200 byte parity row out of 1200 byte packets.
-	state := newFECWindowState(FECConfig{MaxOverheadPercent: 1, MaxGroupSize: 32})
-	state.encoder.setRate(1)
 	now := monotime.Now()
-	for i := 0; i < 50; i++ {
+
+	// A 1% cap can never pay for a 1200 byte parity row out of 1200 byte packets. Fill
+	// the window at a tiny rate first, so every refused row has a full window and the
+	// first-packet "window too small" case can't pollute the counters.
+	state := newFECWindowState(FECConfig{MaxOverheadPercent: 1, MaxGroupSize: 32})
+	state.encoder.setRate(0.001)
+	for i := 0; i < 10; i++ {
 		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now, true)
+	}
+	state.encoder.setRate(1)
+	for i := 0; i < 50; i++ {
+		state.encoder.addPacket(protocol.PacketNumber(11+i), randomPacket(t, 1200), 1452, now, true)
 	}
 	stats := state.stats()
 	if stats.SkippedRowsBudget == 0 {
@@ -652,10 +659,15 @@ func TestFECSkipReasons(t *testing.T) {
 	}
 
 	// A full-size packet plus the repair header doesn't fit into the same datagram.
+	// Fill the window first again, then pre-pay the row so only the size check fails.
 	state = newFECWindowState(FECConfig{MaxOverheadPercent: 100, MaxGroupSize: 32})
+	state.encoder.setRate(0.001)
+	for i := 0; i < 4; i++ {
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1452), 1452, now, true)
+	}
 	state.encoder.setRate(1)
 	state.encoder.credit = 1 << 20 // pre-pay the row so the budget check passes
-	state.encoder.addPacket(7, randomPacket(t, 1452), 1452, now, true)
+	state.encoder.addPacket(9, randomPacket(t, 1452), 1452, now, true)
 	stats = state.stats()
 	if stats.SkippedRowsUnbuildable == 0 {
 		t.Fatalf("unbuildable rows were not counted: %+v", stats)
@@ -680,11 +692,12 @@ func TestFECMissingGauge(t *testing.T) {
 	}
 	state.decoder.handleRepair(frame, now)
 	if got := state.stats().MissingPackets; got != 2 {
-		t.Fatalf("missing gauge = %d after a row over two unseen packets, want 2", got)
+		t.Fatalf("missing gauge = %d after a row over two unseen packets, want 2 (map=%v)", got, state.decoder.missing)
 	}
 	state.decoder.recordPacket(1, randomPacket(t, 64), protocol.KeyPhaseZero)
 	if got := state.stats().MissingPackets; got != 1 {
-		t.Fatalf("missing gauge = %d after packet 1 arrived, want 1", got)
+		t.Fatalf("missing gauge = %d after packet 1 arrived, want 1 (map=%v, len=%d, pending=%d)",
+			got, state.decoder.missing, len(state.decoder.missing), len(state.decoder.pending))
 	}
 	state.decoder.expireMissing(now.Add(fecWindowMissingTimeout))
 	if got := state.stats().MissingPackets; got != 0 {
