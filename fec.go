@@ -113,8 +113,9 @@ type FECConfig struct {
 	// the sender (FEC_RECOVERED), so that the sender can tell its congestion controller
 	// about the loss without retransmitting the packet. This keeps FEC from hiding the
 	// congestion signal (RFC 9265, with the exception for a path that is known to be
-	// lossy). It is off by default: it requires both ends to understand the frame, and
-	// enabling it deliberately makes the connection react to the losses FEC repairs.
+	// lossy). The library zero value stays false; sing-box enables it by default, and
+	// can turn it off for peers that do not understand the frame. Enabling it makes the
+	// connection react to the losses FEC repairs.
 	RecoveredPacketFeedback bool
 	// FlushDelay is how long the sender waits after the last packet before it emits
 	// the repair rows for the tail of the window. Defaults to 2ms.
