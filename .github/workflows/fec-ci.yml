@@ -28,7 +28,7 @@ jobs:
           cache: true
       - name: 格式检查（仅报告）
         run: |
-          files="fec.go fec_window.go fec_test.go fec_window_test.go fec_integration_test.go fec_xor_nosimd.go fec_xor_simd_amd64.go fec_xor_simd_amd64_test.go fec_xor_simd_arm64.go fec_xor_simd_arm64_test.go internal/wire/fec_frame.go internal/wire/fec_frame_test.go"
+          files="fec.go fec_window.go fec_test.go fec_window_test.go fec_integration_test.go internal/wire/fec_frame.go internal/wire/fec_frame_test.go"
           echo "::group::gofmt 差异"
           gofmt -l ${files} || true
           gofmt -d ${files} || true
@@ -46,8 +46,8 @@ jobs:
       - name: 全部测试
         run: go test -count=1 ./... || true
 
-  fec-simd:
-    name: SIMD 可选构建（fec_simd）
+  arm64:
+    name: arm64 交叉编译与等价性（qemu）
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -58,23 +58,13 @@ jobs:
         with:
           go-version: 1.26.5
           cache: true
-      - name: go vet（fec_simd）
-        run: go vet -tags fec_simd ./ ./internal/wire/
-      - name: 构建（默认，无标签）
-        run: go build ./...
-      - name: FEC 单元测试（fec_simd，SSSE3 路径等价性）
-        run: go test -tags fec_simd -count=1 -v -run 'FEC|Fec|GF256' ./internal/wire/ ./
-      - name: FEC 基准（fec_simd：SIMD / 表 / log-exp）
-        run: go test -tags fec_simd -count=1 -run '^$' -bench 'BenchmarkFECRepairRow' -benchtime=2s -benchmem ./
-      - name: FEC 集成测试（fec_simd，含竞态检测）
-        run: go test -tags fec_simd -count=1 -race -v -run 'TestFEC.*(Path|LostPackets|Burst)' -timeout 30m ./
-      - name: 交叉编译检查（linux/arm64 + fec_simd）
-        run: GOOS=linux GOARCH=arm64 go build -tags fec_simd ./...
+      - name: 交叉编译检查（linux/arm64）
+        run: GOOS=linux GOARCH=arm64 go build ./...
       - name: 安装 qemu-user-static（arm64 测试）
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-user-static
-      - name: arm64 NEON 等价性测试（qemu）
+      - name: arm64 GF(2^8) 等价性测试（qemu）
         run: |
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -tags fec_simd -o /tmp/fec-arm64.test ./
-          qemu-aarch64-static /tmp/fec-arm64.test -test.run 'TestGF256TableMatchesLogExp|TestFECXORScaledMatchesLogExp|TestFECSIMDAvailableARM64' -test.v
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/fec-arm64.test ./
+          qemu-aarch64-static /tmp/fec-arm64.test -test.run 'TestGF256TableMatchesLogExp|TestFECXORScaledMatchesLogExp' -test.v

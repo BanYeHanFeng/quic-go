@@ -476,7 +476,6 @@ func init() {
 			gfMulTable[a][b] = gfExp[int(gfLog[a])+int(gfLog[b])]
 		}
 	}
-	initFECSIMDTables()
 }
 
 func gfMul(a, b byte) byte {
@@ -501,12 +500,17 @@ func fecXORScaled(dst, src []byte, coefficient byte) {
 		}
 		return
 	}
-	fecXORScaledImpl(dst, src, coefficient)
+	fecXORScaledTable(dst, src, coefficient)
 }
 
-// fecXORScaledTable is the portable implementation: every byte is multiplied
-// through the per-coefficient 256 byte row of gfMulTable. It is also the fallback
-// of the optional SIMD build (see fec_xor_simd_amd64.go).
+// fecXORScaledTable is the only multiply-accumulate implementation: every byte is
+// multiplied through the per-coefficient 256 byte row of gfMulTable.
+//
+// A PSHUFB (amd64) / VTBL (arm64) nibble split table SIMD variant used to live
+// behind an opt-in `fec_simd` build tag. It was deleted, not just disabled: that
+// exact technique - two 4-bit lookup tables fed to a vector byte shuffle - is what
+// StreamScale US 8,683,296 claims (asserted against GF-Complete/Jerasure, and the
+// basis of a 2023 jury verdict against Cloudera). Do not reintroduce it.
 func fecXORScaledTable(dst, src []byte, coefficient byte) {
 	table := &gfMulTable[coefficient]
 	dst = dst[:len(src)]
