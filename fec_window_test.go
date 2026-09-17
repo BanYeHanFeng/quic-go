@@ -331,6 +331,50 @@ func TestFECProtectsTheIdleTail(t *testing.T) {
 	}
 }
 
+// TestFECTailFlushFollowsTargetRate pins the behaviour of a flow that goes idle after
+// every packet: the idle flush has to be paid for out of the row credit like any other
+// row, so the parity follows the configured rate instead of being limited only by the
+// overhead byte cap.
+func TestFECTailFlushFollowsTargetRate(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 30, MaxGroupSize: 128, MaxParityRows: 2, FlushDelay: 2 * time.Millisecond}
+	const (
+		packetCount = 600
+		packetSize  = 1000
+		// Far above the flush delay: every packet is an isolated tail.
+		packetGap = 100 * time.Millisecond
+	)
+	sender := newWindowTestSender(config, 0.05)
+	for i := 0; i < packetCount; i++ {
+		data := randomPacket(t, packetSize)
+		sender.state.encoder.addPacket(protocol.PacketNumber(1000+i), data, 1452, sender.now, true)
+		for {
+			frame := sender.state.encoder.pendingFrame(sender.now, 1452)
+			if frame == nil {
+				break
+			}
+			sender.state.frameSent(frame, protocol.Version1)
+		}
+		sender.now = sender.now.Add(packetGap)
+		for {
+			frame := sender.state.encoder.pendingFrame(sender.now, 1452)
+			if frame == nil {
+				break
+			}
+			sender.state.frameSent(frame, protocol.Version1)
+		}
+	}
+	stats := sender.state.stats()
+	if stats.ParityPacketsSent == 0 {
+		t.Fatal("no tail row was sent")
+	}
+	// 5% of 600 packets is 30 rows; the debt allows only a couple of rows more while
+	// it is repaid, so the byte cap must not be what limits this flow.
+	if stats.MeasuredOverhead > 0.08 {
+		t.Fatalf("intermittent flow measured overhead %v, expected the target rate, not the overhead cap: %+v",
+			stats.MeasuredOverhead, stats)
+	}
+}
+
 func TestFECReserveCoversRepairFrame(t *testing.T) {
 	config := FECConfig{MaxGroupSize: wire.MaxFECWindowSize, MaxOverheadPercent: 100, MaxParityRows: 2}
 	sender := newWindowTestSender(config, 1)

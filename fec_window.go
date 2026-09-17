@@ -76,6 +76,14 @@ const (
 	// fecWindowMaxFlushRows bounds the number of rows an idle sender emits for the tail
 	// of its window.
 	fecWindowMaxFlushRows = 2
+	// fecWindowTailCreditDebt is how many repair rows the tail flush of an idle window
+	// may borrow from the row credit the packets after it will earn. Every emitted row
+	// costs one credit and every protected packet earns rate credits, so the long-term
+	// repair ratio still converges to rate; the debt only lets the first tail rows be
+	// emitted before a slow flow has accumulated a full row. Without the debt, an
+	// intermittent flow would offer a flush after every packet and spend the byte cap
+	// (up to max overhead) on rows the target redundancy never budgeted.
+	fecWindowTailCreditDebt = 2.0
 	// fecWindowMinMembers is the smallest window the sender protects. A row over a
 	// single packet would just duplicate it.
 	fecWindowMinMembers = 2
@@ -862,6 +870,12 @@ func (e *fecWindowEncoder) buildRow(maxPacketSize protocol.ByteCount) *wire.FECW
 // non-empty window, the rows for the tail of the window are built here: the packets
 // sent last are covered by fewer rows than the ones in the middle, and a connection
 // that stops sending would otherwise leave them unprotected.
+//
+// The tail rows are paid for out of the same row credit as the rows addPacket emits,
+// and may run up to fecWindowTailCreditDebt rows ahead of it. A flow that goes idle
+// after every packet therefore repays the borrowed credit before another tail row is
+// emitted, and its long-term repair ratio follows the configured rate instead of being
+// capped only by the byte budget.
 func (e *fecWindowEncoder) pendingFrame(now monotime.Time, maxPacketSize protocol.ByteCount) wire.Frame {
 	if len(e.ready) > 0 {
 		frame := e.ready[0]
@@ -875,12 +889,19 @@ func (e *fecWindowEncoder) pendingFrame(now monotime.Time, maxPacketSize protoco
 		return nil
 	}
 	// The tail is offered to the byte budget once per packet: a flush the budget refused
-	// must not be retried on every iteration of the send loop.
+	// must not be retried on every iteration of the send loop. A tail row is paid for
+	// out of the row credit like any other row; it may run up to
+	// fecWindowTailCreditDebt rows ahead of the credit the packets after the idle gap
+	// will earn, but the borrowed credit has to be repaid before the next tail row.
 	e.tailFlushed = true
 	for i := 0; i < e.flushRows; i++ {
+		if e.rowCredit < 1-fecWindowTailCreditDebt {
+			break
+		}
 		if !e.emitRow(maxPacketSize) {
 			break
 		}
+		e.rowCredit--
 	}
 	if len(e.ready) > 0 {
 		frame := e.ready[0]
