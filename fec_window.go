@@ -7,6 +7,7 @@ import (
 
 	"github.com/sagernet/quic-go/internal/monotime"
 	"github.com/sagernet/quic-go/internal/protocol"
+	"github.com/sagernet/quic-go/internal/utils"
 	"github.com/sagernet/quic-go/internal/wire"
 )
 
@@ -152,6 +153,10 @@ const (
 	// fecWindowMissingTimeout is how long a packet the peer protects may stay missing
 	// before the decoder gives up on it and counts it as unrecoverable.
 	fecWindowMissingTimeout = time.Second
+	// fecWindowStallWarnInterval rate limits the log line that makes a stalled sender
+	// visible: packets expiring unrecovered while no repair row has arrived for a whole
+	// missing timeout mean the peer stopped protecting this direction.
+	fecWindowStallWarnInterval = 10 * time.Second
 	// fecWindowCacheSlack is the number of packets the decoder caches on top of two
 	// windows: rows can only reference packets that are still in the sender's window,
 	// but packets arrive out of order.
@@ -160,6 +165,12 @@ const (
 	// rows that are this many rows apart use the same base; they never share a member
 	// unless the redundancy is far above the configured cap.
 	fecWindowCauchyRows = 64
+	// fecWindowMaxCoverageRows is the largest number of rows a single packet may be
+	// covered by. updateRedundancyFor derives its rate cap from it: a packet is covered
+	// by about window*rate consecutive rows, and it can only be recovered while those
+	// rows have distinct row bases, of which there are fecWindowCauchyRows. Naming the
+	// condition explicitly keeps the rate limit from silently turning into a guess.
+	fecWindowMaxCoverageRows = fecWindowCauchyRows
 	// fecWindowFrameBaseBytes is the part of a window repair frame that doesn't depend
 	// on the window: frame type, row, first packet number, span, member count, parity
 	// length and the length parity.
@@ -196,6 +207,7 @@ type fecWindowState struct {
 	config  FECConfig
 	encoder *fecWindowEncoder
 	decoder *fecWindowDecoder
+	logger  utils.Logger
 
 	lossBits   atomic.Uint64 // math.Float64bits of the smoothed loss rate
 	windowSize atomic.Int64  // configured window size while FEC is active, 0 while idle
@@ -207,15 +219,27 @@ type fecWindowState struct {
 	skippedRows    atomic.Uint64
 	droppedFrames  atomic.Uint64
 
+	skippedRowsBudget      atomic.Uint64
+	skippedRowsUnbuildable atomic.Uint64
+
 	protectedRecv atomic.Uint64
 	recoveredRecv atomic.Uint64
 	failedRecv    atomic.Uint64
 	parityRecv    atomic.Uint64
+	missingGauge  atomic.Uint64
+	duplicateRows atomic.Uint64
 }
 
 func newFECWindowState(config FECConfig) *fecWindowState {
+	return newFECWindowStateWithLogger(config, nil)
+}
+
+// newFECWindowStateWithLogger is newFECWindowState plus the connection logger: the
+// decoder uses it to make a stalled peer visible (missing packets that expire while no
+// repair row arrives). A nil logger disables those logs.
+func newFECWindowStateWithLogger(config FECConfig, logger utils.Logger) *fecWindowState {
 	config = config.withDefaults()
-	state := &fecWindowState{config: config}
+	state := &fecWindowState{config: config, logger: logger}
 	state.encoder = newFECWindowEncoder(state, config)
 	state.decoder = newFECWindowDecoder(state, config)
 	// Install the baseline immediately, before the first packet: waiting for the first
@@ -248,11 +272,15 @@ func (s *fecWindowState) stats() FECStats {
 		ParityPacketsSent:        s.paritySent.Load(),
 		ParityBytesSent:          parityBytes,
 		SkippedRows:              s.skippedRows.Load(),
+		SkippedRowsBudget:        s.skippedRowsBudget.Load(),
+		SkippedRowsUnbuildable:   s.skippedRowsUnbuildable.Load(),
 		DroppedFrames:            s.droppedFrames.Load(),
 		ProtectedPacketsReceived: s.protectedRecv.Load(),
 		RecoveredPackets:         s.recoveredRecv.Load(),
 		FailedPackets:            s.failedRecv.Load(),
 		ParityPacketsReceived:    s.parityRecv.Load(),
+		MissingPackets:           s.missingGauge.Load(),
+		DuplicateRows:            s.duplicateRows.Load(),
 	}
 	if protectedBytes > 0 {
 		stats.MeasuredOverhead = float64(parityBytes) / float64(protectedBytes)
@@ -603,10 +631,10 @@ func (e *fecWindowEncoder) updateRedundancyFor(lossRate float64) {
 	// Two rows whose numbers are congruent modulo fecWindowCauchyRows use the same row
 	// base, and a repair row is only invertible against rows with a different base. A
 	// packet is covered by about window*rate consecutive rows, so keeping that product
-	// below fecWindowCauchyRows guarantees that two rows that share a member always
-	// have different bases.
-	if sameBase := float64(fecWindowCauchyRows) / float64(e.windowSize); maxRate > sameBase {
-		maxRate = sameBase
+	// at or below fecWindowMaxCoverageRows guarantees that two rows that share a member
+	// always have different bases.
+	if baseLimit := float64(fecWindowMaxCoverageRows) / float64(e.windowSize); maxRate > baseLimit {
+		maxRate = baseLimit
 	}
 	rate := math.Min(required, maxRate)
 	if rate < 0 {
@@ -711,16 +739,19 @@ func (e *fecWindowEncoder) emitRow(maxPacketSize protocol.ByteCount) bool {
 	// that is actually built.
 	if length := e.estimatedRowLength(); length > 0 && float64(length) > e.credit {
 		e.state.skippedRows.Add(1)
+		e.state.skippedRowsBudget.Add(1)
 		return false
 	}
 	frame := e.buildRow(maxPacketSize)
 	if frame == nil {
 		e.state.skippedRows.Add(1)
+		e.state.skippedRowsUnbuildable.Add(1)
 		return false
 	}
 	length := float64(frame.Length(protocol.Version1))
 	if length > e.credit {
 		e.state.skippedRows.Add(1)
+		e.state.skippedRowsBudget.Add(1)
 		return false
 	}
 	e.credit -= length
@@ -846,6 +877,7 @@ func (e *fecWindowEncoder) pendingFrame(now monotime.Time, maxPacketSize protoco
 // contributions of all members that are already known removed. What is left is a
 // linear combination of the missing packets.
 type fecWindowPendingRow struct {
+	row    uint64
 	pivot  protocol.PacketNumber
 	coeffs map[protocol.PacketNumber]byte
 	rhs    []byte
@@ -902,6 +934,11 @@ type fecWindowDecoder struct {
 	feedbackTime     monotime.Time
 	reportedReceived uint64
 	reportedLost     uint64
+
+	// lastParity is when the last repair row arrived, and lastStallWarn rate limits the
+	// "missing packets expired while no repair row arrives" log line.
+	lastParity    monotime.Time
+	lastStallWarn monotime.Time
 }
 
 func newFECWindowDecoder(state *fecWindowState, config FECConfig) *fecWindowDecoder {
@@ -928,6 +965,7 @@ func (d *fecWindowDecoder) reset() {
 	d.protectedOrder = nil
 	d.missing = nil
 	d.pending = nil
+	d.state.missingGauge.Store(0)
 }
 
 // recordPacket caches a received packet and lets the pending equations use it: a packet
@@ -968,7 +1006,16 @@ func (d *fecWindowDecoder) cachePacket(pn protocol.PacketNumber, data []byte) {
 			d.staleBefore = evicted
 		}
 	}
-	delete(d.missing, pn)
+	if _, ok := d.missing[pn]; ok {
+		delete(d.missing, pn)
+		d.syncMissingGauge()
+	}
+}
+
+// syncMissingGauge publishes the size of the missing set, which is only updated from
+// the connection's run loop, for FECStats readers on other goroutines.
+func (d *fecWindowDecoder) syncMissingGauge() {
+	d.state.missingGauge.Store(uint64(len(d.missing)))
 }
 
 // noteKnown removes a packet from the pending equations: its contribution to the parity
@@ -1012,12 +1059,37 @@ func (d *fecWindowDecoder) markProtected(pn protocol.PacketNumber) {
 }
 
 func (d *fecWindowDecoder) expireMissing(now monotime.Time) {
+	expired := 0
 	for pn, first := range d.missing {
 		if now.Sub(first) >= fecWindowMissingTimeout {
 			delete(d.missing, pn)
 			d.state.failedRecv.Add(1)
+			expired++
 		}
 	}
+	if expired == 0 {
+		return
+	}
+	d.syncMissingGauge()
+	// Packets expiring while no repair row has arrived for a whole missing timeout are
+	// the signature of a peer that went idle (or was never protecting this direction)
+	// after announcing the packets: exactly the windows that dominate the unrecoverable
+	// counters in the field. Log them instead of leaving the counters to speak for
+	// themselves. The log is rate limited, and a nil logger (tests, embedders that
+	// don't set one) disables it.
+	if d.state.logger == nil || now.Sub(d.lastStallWarn) < fecWindowStallWarnInterval {
+		return
+	}
+	if !d.lastParity.IsZero() && now.Sub(d.lastParity) < fecWindowMissingTimeout {
+		return
+	}
+	d.lastStallWarn = now
+	lastParity := "never"
+	if !d.lastParity.IsZero() {
+		lastParity = now.Sub(d.lastParity).String()
+	}
+	d.state.logger.Infof("FEC: %d protected packets expired unrecovered; last repair row %s ago (recovered=%d, failed=%d, still missing=%d)",
+		expired, lastParity, d.state.recoveredRecv.Load(), d.state.failedRecv.Load(), len(d.missing))
 }
 
 // handleRepair processes an incoming repair row. The packets of the row that are still
@@ -1026,6 +1098,7 @@ func (d *fecWindowDecoder) expireMissing(now monotime.Time) {
 // that the connection can process it like a packet that arrived on the wire.
 func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now monotime.Time) []fecRecoveredPacket {
 	d.state.parityRecv.Add(1)
+	d.lastParity = now
 	missing := make([]int, 0, len(frame.PacketNumbers))
 	trackMissing := func(pn protocol.PacketNumber) {
 		// The set only feeds the statistics; the equation is built from the cache
@@ -1041,6 +1114,7 @@ func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now mo
 			d.missing = make(map[protocol.PacketNumber]monotime.Time)
 		}
 		d.missing[pn] = now
+		d.syncMissingGauge()
 	}
 	for position, pn := range frame.PacketNumbers {
 		d.markProtected(pn)
@@ -1059,6 +1133,15 @@ func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now mo
 	}
 	if len(missing) == 0 {
 		return nil
+	}
+	for _, pending := range d.pending {
+		if pending.row == frame.Row {
+			// The same equation twice can't add rank, only work. Count it so that a
+			// misbehaving or replaying peer is visible instead of silently filling the
+			// pending set.
+			d.state.duplicateRows.Add(1)
+			return nil
+		}
 	}
 	row := d.buildRow(frame, missing)
 	if row == nil {
@@ -1080,6 +1163,7 @@ func (d *fecWindowDecoder) buildRow(frame *wire.FECWindowRepairFrame, missing []
 	rhs := make([]byte, frame.ParityLength)
 	copy(rhs, frame.Parity)
 	row := &fecWindowPendingRow{
+		row:    frame.Row,
 		coeffs: make(map[protocol.PacketNumber]byte, len(missing)),
 		rhs:    rhs,
 		lenRHS: frame.LengthParity,

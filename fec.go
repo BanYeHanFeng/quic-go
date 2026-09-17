@@ -161,6 +161,14 @@ type FECStats struct {
 	// budget the overhead cap granted didn't cover them. A value that keeps growing
 	// means the cap - not the measured loss rate - is limiting FEC on this connection.
 	SkippedRows uint64
+	// SkippedRowsBudget is the part of SkippedRows that the byte budget refused. A
+	// value that keeps growing means MaxOverheadPercent, not the loss estimate, is what
+	// limits FEC on this connection.
+	SkippedRowsBudget uint64
+	// SkippedRowsUnbuildable is the part of SkippedRows that were neither refused by the
+	// budget nor sent: the window couldn't be described, or the repair row would not
+	// fit into a datagram.
+	SkippedRowsUnbuildable uint64
 	// DroppedFrames is the number of repair frames that were discarded because the send
 	// queue stayed busy for too long. It should stay at zero; a growing value means the
 	// sender never gets a chance to send parity, so FEC is not protecting anything on
@@ -174,6 +182,14 @@ type FECStats struct {
 	RecoveredPackets         uint64
 	FailedPackets            uint64
 	ParityPacketsReceived    uint64
+	// MissingPackets is the number of packets the peer announced as protected that this
+	// endpoint has neither received nor reconstructed, and that haven't expired yet. It
+	// is a gauge: MissingPackets > 0 while ParityPacketsReceived stopped growing is the
+	// signature of a peer that went idle after announcing the packets it protects.
+	MissingPackets uint64
+	// DuplicateRows is the number of repair rows dropped because an equation with the
+	// same row number was already pending. Re-adding it can't add rank, only work.
+	DuplicateRows uint64
 }
 
 // EnableFEC enables packet level forward error correction for this connection.
@@ -190,7 +206,7 @@ func (c *Conn) EnableFEC(config FECConfig) error {
 	default:
 		return &FECError{Message: "FEC can only be enabled after the handshake completed"}
 	}
-	state := newFECWindowState(config)
+	state := newFECWindowStateWithLogger(config, c.logger)
 	c.fecState.Store(state)
 	c.scheduleSending()
 	return nil

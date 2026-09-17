@@ -2,11 +2,14 @@ package quic
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/sagernet/quic-go/internal/monotime"
 	"github.com/sagernet/quic-go/internal/protocol"
+	"github.com/sagernet/quic-go/internal/utils"
 	"github.com/sagernet/quic-go/internal/wire"
 )
 
@@ -611,5 +614,159 @@ func TestFECBaselineIsClampedByOverheadCap(t *testing.T) {
 	stats := state.stats()
 	if stats.MeasuredOverhead > 0.10+1e-9 {
 		t.Fatalf("measured overhead %v exceeds the 10%% cap: %+v", stats.MeasuredOverhead, stats)
+	}
+}
+
+// recordingLogger captures the lines the FEC decoder logs, for the tests that assert a
+// stalled peer is made visible.
+type recordingLogger struct {
+	lines []string
+}
+
+func (l *recordingLogger) SetLogLevel(utils.LogLevel)     {}
+func (l *recordingLogger) SetLogTimeFormat(string)        {}
+func (l *recordingLogger) WithPrefix(string) utils.Logger { return l }
+func (l *recordingLogger) Debug() bool                    { return true }
+func (l *recordingLogger) Errorf(string, ...any)          {}
+func (l *recordingLogger) Infof(format string, args ...any) {
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+func (l *recordingLogger) Debugf(string, ...any) {}
+
+// TestFECSkipReasons verifies that the two skip causes are counted separately: the byte
+// budget refusing a row, and a row that can't be built to fit a datagram.
+func TestFECSkipReasons(t *testing.T) {
+	// A 1% cap can never pay for a 1200 byte parity row out of 1200 byte packets.
+	state := newFECWindowState(FECConfig{MaxOverheadPercent: 1, MaxGroupSize: 32})
+	state.encoder.setRate(1)
+	now := monotime.Now()
+	for i := 0; i < 50; i++ {
+		state.encoder.addPacket(protocol.PacketNumber(1+i), randomPacket(t, 1200), 1452, now, true)
+	}
+	stats := state.stats()
+	if stats.SkippedRowsBudget == 0 {
+		t.Fatalf("budget skips were not counted: %+v", stats)
+	}
+	if stats.SkippedRowsUnbuildable != 0 {
+		t.Fatalf("budget skips were miscounted as unbuildable: %+v", stats)
+	}
+
+	// A full-size packet plus the repair header doesn't fit into the same datagram.
+	state = newFECWindowState(FECConfig{MaxOverheadPercent: 100, MaxGroupSize: 32})
+	state.encoder.setRate(1)
+	state.encoder.credit = 1 << 20 // pre-pay the row so the budget check passes
+	state.encoder.addPacket(7, randomPacket(t, 1452), 1452, now, true)
+	stats = state.stats()
+	if stats.SkippedRowsUnbuildable == 0 {
+		t.Fatalf("unbuildable rows were not counted: %+v", stats)
+	}
+	if stats.SkippedRowsBudget != 0 {
+		t.Fatalf("unbuildable rows were miscounted as budget: %+v", stats)
+	}
+}
+
+// TestFECMissingGauge verifies that the missing-packets gauge follows the protected
+// packets the endpoint hasn't seen, and drops when they arrive or expire.
+func TestFECMissingGauge(t *testing.T) {
+	state := newFECWindowState(FECConfig{MaxGroupSize: 8, MaxOverheadPercent: 100, MaxParityRows: 1})
+	now := monotime.Now()
+	frame := &wire.FECWindowRepairFrame{
+		Row:               0,
+		FirstPacketNumber: 1,
+		Span:              2,
+		PacketNumbers:     []protocol.PacketNumber{1, 2},
+		ParityLength:      128,
+		Parity:            make([]byte, 128),
+	}
+	state.decoder.handleRepair(frame, now)
+	if got := state.stats().MissingPackets; got != 2 {
+		t.Fatalf("missing gauge = %d after a row over two unseen packets, want 2", got)
+	}
+	state.decoder.recordPacket(1, randomPacket(t, 64), protocol.KeyPhaseZero)
+	if got := state.stats().MissingPackets; got != 1 {
+		t.Fatalf("missing gauge = %d after packet 1 arrived, want 1", got)
+	}
+	state.decoder.expireMissing(now.Add(fecWindowMissingTimeout))
+	if got := state.stats().MissingPackets; got != 0 {
+		t.Fatalf("missing gauge = %d after the missing packet expired, want 0", got)
+	}
+}
+
+// TestFECStalledMissingIsLogged verifies that the decoder logs once when protected
+// packets expire while no repair row has arrived for a whole missing timeout.
+func TestFECStalledMissingIsLogged(t *testing.T) {
+	logger := &recordingLogger{}
+	state := newFECWindowStateWithLogger(FECConfig{MaxGroupSize: 8, MaxOverheadPercent: 100, MaxParityRows: 1}, logger)
+	now := monotime.Now()
+	state.decoder.handleRepair(&wire.FECWindowRepairFrame{
+		Row:               0,
+		FirstPacketNumber: 1,
+		Span:              2,
+		PacketNumbers:     []protocol.PacketNumber{1, 2},
+		ParityLength:      128,
+		Parity:            make([]byte, 128),
+	}, now)
+	state.decoder.expireMissing(now.Add(fecWindowMissingTimeout))
+	if len(logger.lines) != 1 {
+		t.Fatalf("expected one stall log line, got %v", logger.lines)
+	}
+	if !strings.Contains(logger.lines[0], "expired unrecovered") {
+		t.Fatalf("unexpected stall log line: %q", logger.lines[0])
+	}
+	// The log is rate limited: a second expiry inside the interval stays quiet.
+	state.decoder.handleRepair(&wire.FECWindowRepairFrame{
+		Row:               1,
+		FirstPacketNumber: 3,
+		Span:              2,
+		PacketNumbers:     []protocol.PacketNumber{3, 4},
+		ParityLength:      128,
+		Parity:            make([]byte, 128),
+	}, now.Add(100*time.Millisecond))
+	state.decoder.expireMissing(now.Add(2 * fecWindowMissingTimeout))
+	if len(logger.lines) != 1 {
+		t.Fatalf("the stall log was not rate limited: %v", logger.lines)
+	}
+}
+
+// TestFECDuplicateRowDropped verifies that a repair row whose equation is already
+// pending is counted and dropped instead of adding a duplicate equation.
+func TestFECDuplicateRowDropped(t *testing.T) {
+	state := newFECWindowState(FECConfig{MaxGroupSize: 8, MaxOverheadPercent: 100, MaxParityRows: 1})
+	now := monotime.Now()
+	frame := &wire.FECWindowRepairFrame{
+		Row:               3,
+		FirstPacketNumber: 1,
+		Span:              2,
+		PacketNumbers:     []protocol.PacketNumber{1, 2},
+		ParityLength:      128,
+		Parity:            make([]byte, 128),
+	}
+	state.decoder.handleRepair(frame, now)
+	if len(state.decoder.pending) != 1 {
+		t.Fatalf("expected one pending equation, got %d", len(state.decoder.pending))
+	}
+	state.decoder.handleRepair(frame, now.Add(time.Millisecond))
+	if got := state.stats().DuplicateRows; got != 1 {
+		t.Fatalf("duplicate rows = %d, want 1", got)
+	}
+	if len(state.decoder.pending) != 1 {
+		t.Fatalf("the duplicate equation was added: %d pending", len(state.decoder.pending))
+	}
+}
+
+// TestFECCoverageRowsStayWithinRowBases asserts the invariant updateRedundancyFor
+// relies on: a packet is covered by at most fecWindowMaxCoverageRows rows, so their row
+// bases can all be distinct.
+func TestFECCoverageRowsStayWithinRowBases(t *testing.T) {
+	for _, percent := range []int{1, 10, 20, 100} {
+		for _, window := range []int{2, 4, 16, 64, wire.MaxFECWindowSize} {
+			state := newFECWindowState(FECConfig{MaxOverheadPercent: percent, MaxGroupSize: window})
+			state.encoder.updateRedundancyFor(1) // a loss report of 100%
+			coverage := float64(state.encoder.windowSize) * state.encoder.rate
+			if coverage > float64(fecWindowMaxCoverageRows)+1e-9 {
+				t.Fatalf("%d%% cap, window %d: %v rows cover one packet, more than the %d row bases",
+					percent, window, coverage, fecWindowMaxCoverageRows)
+			}
+		}
 	}
 }
