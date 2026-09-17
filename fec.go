@@ -28,6 +28,14 @@ import (
 // the loss it observes (including packets that FEC had to repair) in FEC_FEEDBACK
 // frames, and the sender adapts the redundancy to the measured loss rate, capped by
 // FECConfig.MaxOverheadPercent. With no loss, no parity packets are sent at all.
+//
+// Acknowledging recovered packets needs one explicit justification: RFC 9265 says a
+// packet recovered by FEC must be treated as lost for congestion control, but it
+// excepts "a path that is known to be lossy", which is the path this fork is built
+// for. The exception only holds while the loss really is a property of the path and
+// not congestion caused by the redundancy itself, so FECStats reports the connection's
+// RTT inflation alongside the FEC counters: a rising RTT means the redundancy should
+// be reduced, not increased.
 
 const (
 	defaultFECMaxOverheadPercent = 20
@@ -190,6 +198,15 @@ type FECStats struct {
 	// DuplicateRows is the number of repair rows dropped because an equation with the
 	// same row number was already pending. Re-adding it can't add rank, only work.
 	DuplicateRows uint64
+
+	// SmoothedRTT, MinRTT and RTTInflation are the connection's RTT estimates at the
+	// time the statistics were read. While FEC is recovering packets, RTTInflation
+	// (smoothed RTT above the connection minimum) is the queueing delay the connection
+	// sees: if it grows, the loss is likely congestion and the right reaction is to
+	// reduce redundancy rather than add more. These are zero while FEC is disabled.
+	SmoothedRTT  time.Duration
+	MinRTT       time.Duration
+	RTTInflation time.Duration
 }
 
 // EnableFEC enables packet level forward error correction for this connection.
@@ -224,7 +241,16 @@ func (c *Conn) FECStats() FECStats {
 	if state == nil {
 		return FECStats{}
 	}
-	return state.stats()
+	stats := state.stats()
+	// RTTStats stores its estimates in atomics, so reading them from a statistics
+	// caller on another goroutine is safe.
+	stats.SmoothedRTT = c.rttStats.SmoothedRTT()
+	stats.MinRTT = c.rttStats.MinRTT()
+	stats.RTTInflation = stats.SmoothedRTT - stats.MinRTT
+	if stats.RTTInflation < 0 {
+		stats.RTTInflation = 0
+	}
+	return stats
 }
 
 // loadFEC returns the FEC state of the connection, or nil while FEC is disabled.
