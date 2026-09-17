@@ -694,10 +694,13 @@ func TestFECMissingGauge(t *testing.T) {
 	if got := state.stats().MissingPackets; got != 2 {
 		t.Fatalf("missing gauge = %d after a row over two unseen packets, want 2 (map=%v)", got, state.decoder.missing)
 	}
+	haveBefore, keyBefore := state.decoder.haveKeyPhase, state.decoder.keyPhase
+	cacheBefore, missingBefore := len(state.decoder.cache), len(state.decoder.missing)
 	state.decoder.recordPacket(1, randomPacket(t, 64), protocol.KeyPhaseZero)
 	if got := state.stats().MissingPackets; got != 1 {
-		t.Fatalf("missing gauge = %d after packet 1 arrived, want 1 (map=%v, len=%d, pending=%d)",
-			got, state.decoder.missing, len(state.decoder.missing), len(state.decoder.pending))
+		t.Fatalf("missing gauge = %d after packet 1 arrived, want 1 (before: have=%v key=%v cache=%d missing=%d; after: map=%v cache=%d have=%v key=%v stale=%d pending=%d)",
+			got, haveBefore, keyBefore, cacheBefore, missingBefore, state.decoder.missing,
+			len(state.decoder.cache), state.decoder.haveKeyPhase, state.decoder.keyPhase, state.decoder.staleBefore, len(state.decoder.pending))
 	}
 	state.decoder.expireMissing(now.Add(fecWindowMissingTimeout))
 	if got := state.stats().MissingPackets; got != 0 {
