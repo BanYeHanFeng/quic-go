@@ -164,3 +164,96 @@ func fecScaleSlice(data []byte, factor byte) {
 		data[i] = gfMul(factor, b)
 	}
 }
+
+// gfMulLogExp is the pre-table implementation of gfMul. It is only used as the
+// reference for the equivalence tests and as the "before" side of the FEC benchmark;
+// production code goes through gfMulTable.
+func gfMulLogExp(a, b byte) byte {
+	if a == 0 || b == 0 {
+		return 0
+	}
+	return gfExp[int(gfLog[a])+int(gfLog[b])]
+}
+
+func fecXORScaledLogExp(dst, src []byte, coefficient byte) {
+	if coefficient == 0 {
+		return
+	}
+	for i, b := range src {
+		dst[i] ^= gfMulLogExp(coefficient, b)
+	}
+}
+
+func TestGF256TableMatchesLogExp(t *testing.T) {
+	for a := 0; a < 256; a++ {
+		for b := 0; b < 256; b++ {
+			if got, want := gfMul(byte(a), byte(b)), gfMulLogExp(byte(a), byte(b)); got != want {
+				t.Fatalf("%d * %d = %d, want %d", a, b, got, want)
+			}
+		}
+	}
+}
+
+// TestFECXORScaledMatchesLogExp asserts that the table-driven hot path produces
+// byte-identical results to the log/exp implementation it replaced, for every
+// coefficient and a range of lengths. dst is deliberately longer than src: the
+// trailing bytes must stay untouched (zero-extension of the parity symbol).
+func TestFECXORScaledMatchesLogExp(t *testing.T) {
+	next := func(state *uint32) byte {
+		*state = *state*1664525 + 1013904223
+		return byte(*state >> 24)
+	}
+	for _, length := range []int{0, 1, 2, 3, 7, 16, 63, 64, 255, 256, 1200, 8192} {
+		state := uint32(42)
+		src := make([]byte, length)
+		for i := range src {
+			src[i] = next(&state)
+		}
+		for coefficient := 0; coefficient < 256; coefficient++ {
+			dstTable := make([]byte, length+13)
+			dstLogExp := make([]byte, length+13)
+			for i := range dstTable {
+				b := next(&state)
+				dstTable[i] = b
+				dstLogExp[i] = b
+			}
+			fecXORScaled(dstTable, src, byte(coefficient))
+			fecXORScaledLogExp(dstLogExp, src, byte(coefficient))
+			for i := range dstTable {
+				if dstTable[i] != dstLogExp[i] {
+					t.Fatalf("coefficient %d, length %d: byte %d = %d, want %d", coefficient, length, i, dstTable[i], dstLogExp[i])
+				}
+			}
+		}
+	}
+}
+
+// benchmarkFECRepairRow mirrors the cost of one repair row: 128 members of 1200
+// bytes each, all multiplied by the same row coefficient - the layout the C
+// benchmark in the FEC report measured.
+func benchmarkFECRepairRow(b *testing.B, xorScaled func(dst, src []byte, coefficient byte)) {
+	const members = 128
+	const memberLen = 1200
+	src := make([]byte, members*memberLen)
+	for i := range src {
+		src[i] = byte(i*7 + 13)
+	}
+	dst := make([]byte, memberLen)
+	b.SetBytes(members * memberLen)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		coefficient := byte(i%255 + 1)
+		for m := 0; m < members; m++ {
+			xorScaled(dst, src[m*memberLen:(m+1)*memberLen], coefficient)
+		}
+	}
+}
+
+func BenchmarkFECRepairRowTable(b *testing.B) {
+	benchmarkFECRepairRow(b, fecXORScaled)
+}
+
+func BenchmarkFECRepairRowLogExp(b *testing.B) {
+	benchmarkFECRepairRow(b, fecXORScaledLogExp)
+}

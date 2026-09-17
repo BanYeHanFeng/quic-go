@@ -39,6 +39,8 @@ jobs:
         run: go build ./...
       - name: FEC 单元测试
         run: go test -count=1 -v -run 'FEC|Fec|GF256' ./internal/wire/ ./
+      - name: FEC 编解码基准（256 字节表 vs 逐字节 log/exp）
+        run: go test -count=1 -run '^$' -bench 'BenchmarkFECRepairRow' -benchtime=2s -benchmem ./
       - name: FEC 集成测试（含竞态检测）
         run: go test -count=1 -race -v -run 'TestFEC.*(Path|LostPackets|Burst)' -timeout 30m ./
       - name: 全部测试

@@ -358,8 +358,9 @@ func (c *Conn) sendFECFrame(state *fecWindowState, frame wire.Frame, now monotim
 
 // GF(2^8) arithmetic, with the AES/Rijndael polynomial x^8 + x^4 + x^3 + x + 1.
 var (
-	gfExp [512]byte
-	gfLog [256]byte
+	gfExp      [512]byte
+	gfLog      [256]byte
+	gfMulTable [256][256]byte
 )
 
 func init() {
@@ -375,13 +376,20 @@ func init() {
 	for i := 255; i < len(gfExp); i++ {
 		gfExp[i] = gfExp[i-255]
 	}
+	// Multiplying by a fixed coefficient is the hot path of FEC encoding and
+	// decoding: every protected byte is multiplied by the coefficient of its row.
+	// A per-coefficient 256 byte lookup table turns that into a single branch-free
+	// array read, instead of looking up two logarithms and adding them for every
+	// byte in fecXORScaled. The table costs 64 KiB of per-process read-mostly data.
+	for a := 1; a < 256; a++ {
+		for b := 1; b < 256; b++ {
+			gfMulTable[a][b] = gfExp[int(gfLog[a])+int(gfLog[b])]
+		}
+	}
 }
 
 func gfMul(a, b byte) byte {
-	if a == 0 || b == 0 {
-		return 0
-	}
-	return gfExp[int(gfLog[a])+int(gfLog[b])]
+	return gfMulTable[a][b]
 }
 
 func gfInv(a byte) byte {
@@ -400,8 +408,9 @@ func fecXORScaled(dst, src []byte, coefficient byte) {
 		}
 		return
 	}
+	table := &gfMulTable[coefficient]
 	for i, b := range src {
-		dst[i] ^= gfMul(coefficient, b)
+		dst[i] ^= table[b]
 	}
 }
 
