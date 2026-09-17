@@ -332,7 +332,7 @@ func parseFECRecoveredFrame(b []byte, _ protocol.Version) (*FECRecoveredFrame, i
 		if length == 0 || protocol.ByteCount(length) > maxFECProtectedPacketLength {
 			return nil, 0, errors.New("recovered frame has an invalid packet length")
 		}
-		f.Packets = append(f.Packets, FECRecoveredPacket{PacketNumber: packetNumber, Length: protocol.ByteCount(length)})
+		f.Packets = append(f.Packets, FECRecoveredPacket{PacketNumber: protocol.PacketNumber(packetNumber), Length: protocol.ByteCount(length)})
 	}
 	return f, startLen - len(b), nil
 }
