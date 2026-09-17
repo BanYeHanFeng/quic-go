@@ -678,33 +678,42 @@ func TestFECSkipReasons(t *testing.T) {
 }
 
 // TestFECMissingGauge verifies that the missing-packets gauge follows the protected
-// packets the endpoint hasn't seen, and drops when they arrive or expire.
+// packets the endpoint hasn't seen, and drops as they arrive or expire. The repair row
+// comes from the real encoder, so its length parity is consistent: an artificial frame
+// with zero length parity would let the decoder "solve" a garbage packet as soon as
+// one of the unknowns arrives.
 func TestFECMissingGauge(t *testing.T) {
-	state := newFECWindowState(FECConfig{MaxGroupSize: 8, MaxOverheadPercent: 100, MaxParityRows: 1})
+	config := FECConfig{MaxGroupSize: 8, MaxOverheadPercent: 100, MaxParityRows: 1}
+	sender := newWindowTestSender(config, 1)
+	packets := make(map[protocol.PacketNumber][]byte)
+	var row *wire.FECWindowRepairFrame
+	for i := 0; i < 3; i++ {
+		pn := protocol.PacketNumber(1 + i)
+		packets[pn] = randomPacket(t, 300)
+		for _, r := range sender.send(t, pn, packets[pn]) {
+			if len(r.PacketNumbers) == 3 {
+				row = r
+			}
+		}
+	}
+	if row == nil {
+		t.Fatal("no repair row covering all three packets")
+	}
+	receiver := newFECWindowState(config)
 	now := monotime.Now()
-	frame := &wire.FECWindowRepairFrame{
-		Row:               0,
-		FirstPacketNumber: 1,
-		Span:              2,
-		PacketNumbers:     []protocol.PacketNumber{1, 2},
-		ParityLength:      128,
-		Parity:            make([]byte, 128),
+	receiver.decoder.handleRepair(row, now)
+	if got := receiver.stats().MissingPackets; got != 3 {
+		t.Fatalf("missing gauge = %d after a row over three unseen packets, want 3", got)
 	}
-	state.decoder.handleRepair(frame, now)
-	if got := state.stats().MissingPackets; got != 2 {
-		t.Fatalf("missing gauge = %d after a row over two unseen packets, want 2 (map=%v)", got, state.decoder.missing)
+	// With two unknowns left the equation still can't be solved, so the gauge only
+	// drops by the packet that actually arrived.
+	receiver.decoder.recordPacket(1, packets[1], protocol.KeyPhaseZero)
+	if got := receiver.stats().MissingPackets; got != 2 {
+		t.Fatalf("missing gauge = %d after packet 1 arrived, want 2 (map=%v)", got, receiver.decoder.missing)
 	}
-	haveBefore, keyBefore := state.decoder.haveKeyPhase, state.decoder.keyPhase
-	cacheBefore, missingBefore := len(state.decoder.cache), len(state.decoder.missing)
-	state.decoder.recordPacket(1, randomPacket(t, 64), protocol.KeyPhaseZero)
-	if got := state.stats().MissingPackets; got != 1 {
-		t.Fatalf("missing gauge = %d after packet 1 arrived, want 1 (before: have=%v key=%v cache=%d missing=%d; after: map=%v cache=%d have=%v key=%v stale=%d pending=%d)",
-			got, haveBefore, keyBefore, cacheBefore, missingBefore, state.decoder.missing,
-			len(state.decoder.cache), state.decoder.haveKeyPhase, state.decoder.keyPhase, state.decoder.staleBefore, len(state.decoder.pending))
-	}
-	state.decoder.expireMissing(now.Add(fecWindowMissingTimeout))
-	if got := state.stats().MissingPackets; got != 0 {
-		t.Fatalf("missing gauge = %d after the missing packet expired, want 0", got)
+	receiver.decoder.expireMissing(now.Add(fecWindowMissingTimeout))
+	if got := receiver.stats().MissingPackets; got != 0 {
+		t.Fatalf("missing gauge = %d after the missing packets expired, want 0", got)
 	}
 }
 
