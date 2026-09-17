@@ -279,7 +279,7 @@ func transfer(t *testing.T, client *Conn, server *Conn, payload []byte) []byte {
 
 // TestFECRecoversBurstsWithTheShippedDefaults drops bursts of consecutive packets on
 // the direction the connection sends on, which is the pattern a mobile path loses with,
-// and runs the configuration QUICX ships with - the default 20% overhead cap and the
+// and runs the configuration QUICX ships with - the default 30% overhead cap and the
 // default window - instead of the lower cap the other integration tests use.
 //
 // A reactive scheme can only start repairing after the peer reported the loss, and each

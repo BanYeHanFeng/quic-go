@@ -66,7 +66,7 @@ const (
 	//
 	//	window * cap / (1 + cap)
 	//
-	// packets: about 10.7 at the default 20% cap with a 64 packet window, about 21.3 at
+	// packets: about 14.8 at the default 30% cap with a 64 packet window, about 29.5 at
 	// 128. Mobile paths lose in bursts of that order, and a burst longer than the
 	// window can reconstruct is not partly repaired - the packets that fall out of the
 	// window before a row covers them are lost to a retransmission. The larger window
@@ -111,8 +111,8 @@ const (
 	// A row repairs one packet, so a burst costs one row per packet it lost, and a row
 	// is only emitted every 1/rate protected packets. The hold therefore has to last
 	// for the packets those rows are paid out of: a burst of ten packets needs about
-	// 55 protected packets at the 20% cap, and a path that carries 150 packets per
-	// second needs about 700ms for them. The hold runs from the sample that measured
+	// 34 protected packets at the 30% cap, and a path that carries 150 packets per
+	// second needs about 450ms for them. The hold runs from the sample that measured
 	// the peak, never from the last report, and it is capped by
 	// fecWindowLossPeakHoldMax: the redundancy of a burst may outlive the burst, but a
 	// clean path has to get its bytes back.

@@ -38,7 +38,7 @@ import (
 // be reduced, not increased.
 
 const (
-	defaultFECMaxOverheadPercent = 20
+	defaultFECMaxOverheadPercent = 30
 	defaultFECMaxParityRows      = 2
 	defaultFECFlushDelay         = 2 * time.Millisecond
 
@@ -79,7 +79,7 @@ const (
 
 // FECConfig configures packet level forward error correction for a connection.
 //
-// The zero value is a valid configuration: MaxOverheadPercent defaults to 20,
+// The zero value is a valid configuration: MaxOverheadPercent defaults to 30,
 // MaxGroupSize (the number of packets one window protects) to 128, MaxParityRows (the
 // number of repair rows an idle sender emits for the tail of its window) to 2, and
 // FlushDelay to 2ms.
@@ -88,7 +88,9 @@ type FECConfig struct {
 	// traffic. It bounds the bandwidth FEC is allowed to spend, no matter how high
 	// the measured loss rate is. The cap is enforced on the bytes actually sent: the
 	// sender grants every protected packet a byte budget of MaxOverheadPercent of its
-	// size and refuses a repair row the budget doesn't cover. Defaults to 20.
+	// size and refuses a repair row the budget doesn't cover. Defaults to 30: the
+	// 1.5x-loss safety factor then stays uncapped through about 20% measured loss,
+	// which is the knee the same-packet CI comparison measured for random loss.
 	MaxOverheadPercent int
 	// MaxGroupSize is the number of packets one window protects. Larger windows
 	// tolerate longer bursts, at the price of memory: the sender holds the bytes of

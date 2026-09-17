@@ -19,6 +19,16 @@ func randomPacket(t *testing.T, length int) []byte {
 	return data
 }
 
+func TestFECDefaultsUseTheHighLossKnee(t *testing.T) {
+	config := FECConfig{}.withDefaults()
+	if config.MaxOverheadPercent != 30 {
+		t.Fatalf("default max overhead is %d, expected 30", config.MaxOverheadPercent)
+	}
+	if config.MaxGroupSize != wire.MaxFECWindowSize {
+		t.Fatalf("default window is %d, expected %d", config.MaxGroupSize, wire.MaxFECWindowSize)
+	}
+}
+
 func TestFECLossTracker(t *testing.T) {
 	var tracker fecLossTracker
 	// the first packet initializes the tracker
