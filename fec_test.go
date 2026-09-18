@@ -75,6 +75,40 @@ func TestFECLossTracker(t *testing.T) {
 	if late.lost != 0 {
 		t.Fatalf("expected the presumed loss to be undone, got %d", late.lost)
 	}
+
+	// A loss revealed by a repair row (for example a protected packet missing at the
+	// tail of a traffic burst) is cumulative evidence even before the gap detector can
+	// see it, and the later gap scan must not count the same packet number again.
+	var evidenced fecLossTracker
+	evidenced.record(0)
+	evidenced.countLoss(10)
+	if evidenced.cumulativeLost != 1 {
+		t.Fatalf("repair-row evidence counted %d losses, want 1", evidenced.cumulativeLost)
+	}
+	for pn := protocol.PacketNumber(1); pn <= 20; pn++ {
+		evidenced.record(pn)
+	}
+	if evidenced.cumulativeLost != 1 {
+		t.Fatalf("the gap detector double-counted a repair-row loss: %d", evidenced.cumulativeLost)
+	}
+}
+
+// TestFECFeedbackUsesCumulativeLossEvidence verifies that the feedback frame reports the
+// deduplicated cumulative counter, not the reorder tracker's current count: a tail loss
+// has to reach the sender even when no newer packet number ever arrives to advance the
+// gap watermark.
+func TestFECFeedbackUsesCumulativeLossEvidence(t *testing.T) {
+	state := newFECWindowState(FECConfig{MaxGroupSize: 16, MaxOverheadPercent: 10})
+	now := monotime.Now()
+	state.decoder.tracker.record(1)
+	state.decoder.tracker.countLoss(2)
+	frame := state.decoder.pendingFeedback(now)
+	if frame == nil {
+		t.Fatal("no feedback frame was generated for the repair-row loss evidence")
+	}
+	if frame.LostPackets != 1 {
+		t.Fatalf("feedback reported %d lost packets, want 1", frame.LostPackets)
+	}
 }
 
 func TestFECDecaysWithoutFeedback(t *testing.T) {

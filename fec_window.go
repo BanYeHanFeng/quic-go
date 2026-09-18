@@ -47,10 +47,11 @@ import (
 //
 // Coefficients. A repair row combines the packets of its window with the coefficients
 // of a Cauchy matrix: coefficient(row, position) = 1 / (x[row] + y[position]), with the
-// row bases x and the position bases y taken from two disjoint halves of the nonzero
-// elements of GF(2^8). Every square submatrix of a Cauchy matrix is invertible, so any
-// `n` rows reconstruct any `n` members of the window - the code is MDS for every loss
-// pattern, not only for the patterns that keep the message symbols contiguous.
+// row bases x and the position bases y partitioning the 255 non-zero elements of
+// GF(2^8). Every square submatrix of a Cauchy matrix is invertible, so any `n` rows
+// reconstruct any `n` members of one window - the code is MDS for every loss pattern
+// over that window, not only for the patterns that keep the message symbols
+// contiguous. The repair burst may use all 127 row bases on one window.
 
 const (
 	// defaultFECWindowSize is the number of packets one window protects, unless the
@@ -58,20 +59,12 @@ const (
 	// follow it, so a large window trades memory for burst tolerance, not recovery
 	// latency.
 	//
-	// It is the largest window the wire format has, because the window size is what
-	// bounds the burst a reactive scheme can repair at all. The sender can only start
-	// repairing after the peer reported the loss, and every row it then spends costs
-	// 1/rate packets of the window's lifetime, so the longest burst a window can
-	// reconstruct is about
-	//
-	//	window * cap / (1 + cap)
-	//
-	// packets: about 14.8 at the default 30% cap with a 64 packet window, about 29.5 at
-	// 128. Mobile paths lose in bursts of that order, and a burst longer than the
-	// window can reconstruct is not partly repaired - the packets that fall out of the
-	// window before a row covers them are lost to a retransmission. The larger window
-	// also halves the repair frame header each protected packet pays for, because a row
-	// is as long as the longest packet of its window either way.
+	// It is the largest window the wire format has. The window bounds how long a lost
+	// packet stays repairable: a loss report can trigger a repair burst of up to 127
+	// extra rows out of the accumulated byte credit, but those rows still have to arrive
+	// before the lost packet leaves the window. The window also halves the repair frame
+	// header each protected packet pays for compared with a 64 packet window, because a
+	// row is as long as the longest packet of its window either way.
 	defaultFECWindowSize = 128
 	// fecWindowMaxFlushRows bounds the number of rows an idle sender emits for the tail
 	// of its window.
@@ -93,15 +86,35 @@ const (
 	// dropped instead of being held in memory.
 	fecWindowMaxReadyFrames = 8
 	// fecWindowMaxPendingRows bounds the equations the decoder keeps. A row whose
-	// unknowns never become solvable is useless, and the rows are superseded by the
-	// rows that follow them. It also bounds the work of one decoding pass, which is
-	// quadratic in the number of rows.
-	fecWindowMaxPendingRows = 16
+	// unknowns never become solvable is useless, and the newer rows are generally more
+	// useful than the oldest, but a burst can only be reconstructed if the decoder keeps
+	// at least one equation per missing packet until the system becomes solvable: with
+	// a 16 row cap a burst larger than 16 packets simply fell back to retransmission.
+	// The cap is therefore the number of independent row bases the code can use. The
+	// work of one decoding pass is quadratic in this bound, but it only runs on
+	// connections that are already seeing loss; the window itself is still 128 packets.
+	fecWindowMaxPendingRows = fecWindowCauchyRows
 	// fecWindowCreditLimit bounds the parity bytes the sender may spend out of the
 	// credit it accumulated while the path looked lossless. The long term overhead
 	// stays within the cap because the credit accrues at the cap; the limit only keeps
-	// a long clean period from paying for one large burst later.
-	fecWindowCreditLimit = 32 * 1024
+	// a long clean period from paying for one large burst later. It is large enough to
+	// cover a full window (128 packets) with extra rows after a burst, which is the
+	// minimum a loss-triggered repair burst needs to be able to spend.
+	fecWindowCreditLimit = 256 * 1024
+	// fecWindowRepairBurstNumerator and fecWindowRepairBurstDenominator turn a newly
+	// reported lost packet into repair rows. One row reconstructs one missing packet;
+	// sending two rows per lost packet pays for repair rows that are themselves lost on
+	// the path. The repair burst is usually sent into the same bursty path that produced
+	// the loss, so the parity is subject to the same loss pattern. The factor is bounded
+	// by the number of independent row bases and by the connection's byte credit, so it
+	// cannot overspend the configured cap.
+	fecWindowRepairBurstNumerator   = 2
+	fecWindowRepairBurstDenominator = 1
+	// fecWindowMaxRepairBurstFactor bounds the rows one feedback can schedule: two
+	// windows mean a full window of parity can be sent even after a large fraction of
+	// the first burst rows is lost. It has to stay small enough that a misbehaving
+	// peer can't make the sender emit an unbounded number of rows.
+	fecWindowMaxRepairBurstFactor = 2
 	// fecWindowRateMargin leaves a little room between the redundancy the overhead cap
 	// allows and the redundancy the sender aims for, so that a row is never refused
 	// because of rounding.
@@ -178,8 +191,12 @@ const (
 	fecWindowCacheSlack = 32
 	// fecWindowCauchyRows is the number of distinct row bases of the Cauchy matrix. Two
 	// rows that are this many rows apart use the same base; they never share a member
-	// unless the redundancy is far above the configured cap.
-	fecWindowCauchyRows = 64
+	// unless the redundancy is far above the configured cap. The row and position bases
+	// partition all 255 non-zero elements of GF(2^8), so this is the largest number of
+	// independent rows the wire-compatible coefficient scheme can use. A repair burst
+	// can spend up to this many rows on one window; the steady redundancy stays bounded
+	// by the much lower overhead cap.
+	fecWindowCauchyRows = 127
 	// fecWindowMaxCoverageRows is the largest number of rows a single packet may be
 	// covered by. updateRedundancyFor derives its rate cap from it: a packet is covered
 	// by about window*rate consecutive rows, and it can only be recovered while those
@@ -195,12 +212,14 @@ const (
 // fecWindowCoefficient returns the coefficient of the member at the given position of
 // the window for the repair row with the given number.
 //
-// The coefficients form a Cauchy matrix over GF(2^8): 1/(x + y), with the row base x
-// taken from alpha^0..alpha^63 and the position base y from alpha^64..alpha^191. The
-// two sets are disjoint, so no denominator is zero, and Cauchy's determinant formula
-// (all x distinct, all y distinct, no x equal to a y) says that every square submatrix
-// of the matrix is invertible. That is what makes the code MDS: any n rows recover any
-// n lost members of the window, whatever their positions.
+// The coefficients form a Cauchy matrix over GF(2^8): 1/(x + y). The row bases x use
+// alpha^0..alpha^126 and the position bases y use alpha^127..alpha^254; those two sets
+// partition the 255 non-zero elements, so no denominator is zero. Cauchy's determinant
+// formula (all x distinct, all y distinct, no x equal to a y) says that every square
+// submatrix of the matrix is invertible. That is what makes the code MDS for rows over
+// one window: any n rows recover any n lost members of that window, whatever their
+// positions, and the 127 distinct row bases are what a loss-triggered repair burst may
+// use.
 func fecWindowCoefficient(row uint64, position int) byte {
 	x := gfExp[int(row%fecWindowCauchyRows)]
 	y := gfExp[fecWindowCauchyRows+position]
@@ -236,6 +255,10 @@ type fecWindowState struct {
 
 	skippedRowsBudget      atomic.Uint64
 	skippedRowsUnbuildable atomic.Uint64
+
+	repairBursts           atomic.Uint64
+	repairBurstRowsSent    atomic.Uint64
+	repairBurstRowsSkipped atomic.Uint64
 
 	protectedRecv atomic.Uint64
 	recoveredRecv atomic.Uint64
@@ -293,6 +316,9 @@ func (s *fecWindowState) stats() FECStats {
 		SkippedRowsBudget:        s.skippedRowsBudget.Load(),
 		SkippedRowsUnbuildable:   s.skippedRowsUnbuildable.Load(),
 		DroppedFrames:            s.droppedFrames.Load(),
+		RepairBursts:              s.repairBursts.Load(),
+		RepairBurstRowsSent:       s.repairBurstRowsSent.Load(),
+		RepairBurstRowsSkipped:    s.repairBurstRowsSkipped.Load(),
 		ProtectedPacketsReceived: s.protectedRecv.Load(),
 		RecoveredPackets:         s.recoveredRecv.Load(),
 		FailedPackets:            s.failedRecv.Load(),
@@ -400,6 +426,13 @@ type fecWindowEncoder struct {
 	// byte budget. A flush the budget refused must not be retried on every send loop
 	// iteration; the next packet resets it.
 	tailFlushed bool
+	// burstRows are repair rows triggered by a loss report. They are sent immediately
+	// out of the byte credit the connection accumulated while the path looked cleaner,
+	// instead of waiting for future packets to earn row credit. A burst is what makes
+	// a flow that stops sending after a loss burst repairable at all: without it, the
+	// sender can only spend the idle tail flush rows, and a window that lost a larger
+	// number of packets is not repaired.
+	burstRows int
 
 	lastEvaluation monotime.Time
 	feedbackSeen   bool
@@ -481,7 +514,7 @@ func (e *fecWindowEncoder) reserve() protocol.ByteCount {
 	return fecWindowFrameBytes(e.maxSpan)
 }
 
-func (e *fecWindowEncoder) hasPending() bool { return len(e.ready) > 0 }
+func (e *fecWindowEncoder) hasPending() bool { return len(e.ready) > 0 || e.burstRows > 0 }
 
 func (e *fecWindowEncoder) flushDeadline() monotime.Time {
 	if e.tailFlushed || !e.protecting() || e.rowsSinceAdd > 0 || e.lastAdd.IsZero() || len(e.members) < fecWindowMinMembers {
@@ -571,17 +604,38 @@ func (e *fecWindowEncoder) holdDuration() time.Duration {
 // lost feedback packet degrades nothing but the freshness of the report.
 func (e *fecWindowEncoder) onFeedback(feedback *wire.FECFeedbackFrame, now monotime.Time) {
 	var deltaReceived, deltaLost uint64
-	if !e.feedbackSeen {
+	hadFeedback := e.feedbackSeen
+	if !hadFeedback {
 		deltaReceived = feedback.ReceivedPackets
 		deltaLost = feedback.LostPackets
 	} else if feedback.ReceivedPackets >= e.fbReceived && feedback.LostPackets >= e.fbLost {
 		deltaReceived = feedback.ReceivedPackets - e.fbReceived
 		deltaLost = feedback.LostPackets - e.fbLost
+	} else {
+		// The peer's counters moved backwards, which can happen when a packet
+		// arrives after the reorder window already presumed it lost. Don't count
+		// that report as a new loss, but still snap the baseline to the peer's view
+		// so the reports after it are measured against the right counters.
+		e.fbReceived = feedback.ReceivedPackets
+		e.fbLost = feedback.LostPackets
+		e.fbTime = now
+		e.lastEvaluation = now
+		e.evaluateLoss(now)
+		return
 	}
 	e.fbReceived = feedback.ReceivedPackets
 	e.fbLost = feedback.LostPackets
 	e.feedbackSeen = true
 	e.fbTime = now
+	// Schedule the repair burst from the raw delta before the estimator's sample is
+	// large enough to move the steady redundancy. A burst has to be repaired while its
+	// packets are still inside the window; waiting for 16 packets or 500ms of samples
+	// can be exactly the difference between a full window and an idle one. The first
+	// report of a connection only establishes the cumulative baseline, so it can't tell
+	// which of the counters are new losses.
+	if hadFeedback && deltaLost > 0 {
+		e.scheduleRepairBurst(deltaLost)
+	}
 	e.accumulateLossSample(deltaReceived, deltaLost, now)
 	e.lastEvaluation = now
 	e.evaluateLoss(now)
@@ -676,6 +730,68 @@ func (e *fecWindowEncoder) setRate(rate float64) {
 	} else {
 		e.state.windowSize.Store(0)
 	}
+}
+
+// scheduleRepairBurst turns a newly reported batch of lost packets into repair rows
+// for the current window. The rows are not charged against e.rowCredit: the long-term
+// overhead cap still bounds them because emitBurstRow pays for them from e.credit, the
+// same byte budget normal rows use. A burst therefore can't break the configured
+// MaxOverheadPercent, but it can spend the credit a cleaner path accumulated instead
+// of leaving it unused while a window of packets expires.
+func (e *fecWindowEncoder) scheduleRepairBurst(lost uint64) {
+	if lost == 0 || e.windowSize < fecWindowMinMembers {
+		return
+	}
+	// Only a window's worth of packets can be missing at once. Cap the raw report
+	// before converting, so a peer with a corrupted counter can't request a huge
+	// burst. The row-base and credit limits below bound the actual burst.
+	maxMissing := uint64(e.windowSize)
+	if lost > maxMissing {
+		lost = maxMissing
+	}
+	rows := (lost*fecWindowRepairBurstNumerator + fecWindowRepairBurstDenominator - 1) / fecWindowRepairBurstDenominator
+	maxRows := uint64(e.windowSize * fecWindowMaxRepairBurstFactor)
+	if maxRows > fecWindowCauchyRows {
+		maxRows = fecWindowCauchyRows
+	}
+	if rows > maxRows {
+		rows = maxRows
+	}
+	available := maxRows - uint64(e.burstRows)
+	if available == 0 {
+		return
+	}
+	if rows > available {
+		rows = available
+	}
+	e.burstRows += int(rows)
+	e.state.repairBursts.Add(1)
+}
+
+// emitBurstRow builds one scheduled repair row and pays for it from the byte credit.
+// It returns nil when the window is too small or the credit is exhausted; the caller
+// then drops the rest of the burst, because retrying the same stale window on every
+// send loop iteration would produce no new information.
+func (e *fecWindowEncoder) emitBurstRow(maxPacketSize protocol.ByteCount) *wire.FECWindowRepairFrame {
+	if len(e.members) < fecWindowMinMembers {
+		return nil
+	}
+	if length := e.estimatedRowLength(); length > 0 && float64(length) > e.credit {
+		return nil
+	}
+	frame := e.buildRow(maxPacketSize)
+	if frame == nil {
+		return nil
+	}
+	length := float64(frame.Length(protocol.Version1))
+	if length > e.credit {
+		return nil
+	}
+	e.credit -= length
+	e.rowSeq++
+	e.rowsSinceAdd++
+	e.state.repairBurstRowsSent.Add(1)
+	return frame
 }
 
 // addPacket adds a packet that was just sent to the window, and emits the repair rows
@@ -880,6 +996,19 @@ func (e *fecWindowEncoder) pendingFrame(now monotime.Time, maxPacketSize protoco
 	if len(e.ready) > 0 {
 		frame := e.ready[0]
 		e.ready = e.ready[1:]
+		return frame
+	}
+	if e.burstRows > 0 {
+		frame := e.emitBurstRow(maxPacketSize)
+		if frame == nil {
+			// Drop the rest of the burst instead of retrying it: its window has left
+			// or the byte credit is exhausted. New packets reset the window and can
+			// accumulate new credit for the next report.
+			e.state.repairBurstRowsSkipped.Add(uint64(e.burstRows))
+			e.burstRows = 0
+			return nil
+		}
+		e.burstRows--
 		return frame
 	}
 	if !e.protecting() || len(e.members) < fecWindowMinMembers {
@@ -1156,6 +1285,12 @@ func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now mo
 			d.missing = make(map[protocol.PacketNumber]monotime.Time)
 		}
 		d.missing[pn] = now
+		// Feed the loss to the cumulative feedback counter immediately: a repair row
+		// that names the missing packet is already direct evidence of loss. The gap
+		// tracker can't see a burst at the tail of a traffic burst until a later packet
+		// number arrives, which may never happen. countLoss deduplicates the two
+		// detectors, so the later gap scan doesn't report the same loss again.
+		d.tracker.countLoss(pn)
 		d.syncMissingGauge()
 	}
 	for position, pn := range frame.PacketNumbers {
@@ -1406,15 +1541,15 @@ func (d *fecWindowDecoder) pendingFeedback(now monotime.Time) *wire.FECFeedbackF
 	// asked for feedback on every send loop iteration, and the set can hold hundreds of
 	// packet numbers.
 	d.expireMissing(now)
-	if d.tracker.received == d.reportedReceived && d.tracker.lost == d.reportedLost {
+	if d.tracker.received == d.reportedReceived && d.tracker.cumulativeLost == d.reportedLost {
 		return nil
 	}
 	d.feedbackTime = now
 	d.reportedReceived = d.tracker.received
-	d.reportedLost = d.tracker.lost
+	d.reportedLost = d.tracker.cumulativeLost
 	return &wire.FECFeedbackFrame{
 		ReceivedPackets:  d.tracker.received,
-		LostPackets:      d.tracker.lost,
+		LostPackets:      d.tracker.cumulativeLost,
 		RecoveredPackets: d.state.recoveredRecv.Load(),
 		FailedPackets:    d.state.failedRecv.Load(),
 		ParityPackets:    d.state.parityRecv.Load(),

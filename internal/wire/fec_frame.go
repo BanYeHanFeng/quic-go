@@ -62,9 +62,9 @@ func (t FrameType) IsFECFrameType() bool {
 // longest protected packet) and combined with the coefficients of the row. The
 // coefficients form a Cauchy matrix over GF(2^8): the coefficient of the member at
 // position p of the row with number r is 1 / (x[r] + y[p]), with the row bases x and
-// the position bases y taken from two disjoint sets. Every square submatrix of a
-// Cauchy matrix is invertible, so any n rows reconstruct any n missing members of the
-// window, whatever their positions.
+// the position bases y partitioning the 255 non-zero elements of the field. Every
+// square submatrix of a Cauchy matrix is invertible, so any n rows reconstruct any n
+// missing members of one window, whatever their positions.
 //
 // The member list is a bitmap instead of a packet number list: the packets of a window
 // are nearly consecutive packet numbers - the packet numbers spent on parity packets
@@ -213,9 +213,12 @@ func (f *FECWindowRepairFrame) Length(_ protocol.Version) protocol.ByteCount {
 type FECFeedbackFrame struct {
 	// ReceivedPackets is the number of 1-RTT packets received by the peer.
 	ReceivedPackets uint64
-	// LostPackets is the number of packet numbers the peer never received (gaps in
-	// the packet number sequence). This is the loss rate of the path, independent of
-	// whether the packets were protected by FEC.
+	// LostPackets is the receiver's cumulative loss evidence: packet numbers that were
+	// presumed lost from gaps in the packet number sequence, or that a repair row revealed
+	// as missing protected packets. The two detections are deduplicated, so this is still
+	// a count of distinct lost packet numbers, independent of whether they were protected
+	// by FEC. A monotonic value also survives one lost feedback packet without resetting
+	// the sender's view to an older baseline.
 	LostPackets uint64
 	// RecoveredPackets is the number of packets that were reconstructed from parity.
 	RecoveredPackets uint64

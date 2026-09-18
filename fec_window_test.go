@@ -96,6 +96,273 @@ func windowTestTransfer(t *testing.T, config FECConfig, rate float64, count int,
 	return packets, recovered, receiver
 }
 
+// TestFECRepairBurstRecoversIdleTail pins the case the field logs exposed: the sender
+// has already enqueued the last packets of a burst, the loss report arrives, and there
+// is no further application data to pay for the repair rows. The old idle tail flush
+// sent at most two rows, so a burst of three or more packets was not repairable at all;
+// the repair burst has to spend the byte credit the connection accumulated earlier and
+// keep emitting rows until the window is repaired or the budget is exhausted.
+func TestFECRepairBurstRecoversIdleTail(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 30, MaxGroupSize: 16, MaxParityRows: 1}
+	sender := newFECWindowState(config)
+	receiver := newFECWindowState(config)
+	now := monotime.Now()
+	// Keep the window engaged but spend no row credit during the send: the whole
+	// repair has to come from the loss-triggered burst.
+	sender.encoder.setRate(0.001)
+
+	const (
+		packetCount = 16
+		lostCount   = 3
+	)
+	packets := make(map[protocol.PacketNumber][]byte, packetCount)
+	for i := 0; i < packetCount; i++ {
+		pn := protocol.PacketNumber(1000 + i)
+		data := randomPacket(t, 1200)
+		packets[pn] = data
+		sender.encoder.addPacket(pn, data, 1452, now, true)
+	}
+	// The first packets make it to the receiver; the tail is lost on the wire.
+	for i := 0; i < packetCount-lostCount; i++ {
+		pn := protocol.PacketNumber(1000 + i)
+		receiver.decoder.recordPacket(pn, packets[pn], protocol.KeyPhaseZero)
+	}
+	// The first report only establishes the cumulative baseline.
+	sender.encoder.onFeedback(&wire.FECFeedbackFrame{
+		ReceivedPackets: packetCount - lostCount,
+		LostPackets:     0,
+	}, now)
+	// The second report tells the sender about the tail loss and must schedule a burst.
+	sender.encoder.onFeedback(&wire.FECFeedbackFrame{
+		ReceivedPackets: packetCount - lostCount,
+		LostPackets:     lostCount,
+	}, now)
+
+	var recovered []fecRecoveredPacket
+	for {
+		frame := sender.pendingFrame(now, 1452)
+		if frame == nil {
+			break
+		}
+		row, ok := frame.(*wire.FECWindowRepairFrame)
+		if !ok {
+			t.Fatalf("unexpected FEC frame type %T", frame)
+		}
+		sender.frameSent(row, protocol.Version1)
+		recovered = append(recovered, receiver.decoder.handleRepair(row, now)...)
+	}
+	requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{
+		1000 + packetCount - lostCount,
+		1000 + packetCount - lostCount + 1,
+		1000 + packetCount - lostCount + 2,
+	})
+	if stats := sender.stats(); stats.RepairBursts != 1 || stats.RepairBurstRowsSent == 0 {
+		t.Fatalf("the repair burst wasn't reported: %+v", stats)
+	}
+}
+
+// TestFECRepairBurstRecoversTailFromFeedback exercises the full no-wire chain that a tail
+// loss needs: the sender goes idle with a few packets missing, the receiver learns they
+// are missing from the repair rows that were sent for the idle tail, feeds that evidence
+// back even though no newer packet number arrives, and the sender answers with a repair
+// burst while its window is still frozen in place.
+func TestFECRepairBurstRecoversTailFromFeedback(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 30, MaxGroupSize: 16, MaxParityRows: 2, FlushDelay: 2 * time.Millisecond}
+	sender := newFECWindowState(config)
+	receiver := newFECWindowState(config)
+	now := monotime.Now()
+	sender.encoder.setRate(0.001)
+	// Establish the cumulative baseline before any loss, like the first feedback of a
+	// real connection does. With no baseline configured this would disengage FEC, so
+	// turn the fixed test rate back on after it.
+	sender.encoder.onFeedback(&wire.FECFeedbackFrame{}, now)
+	sender.encoder.setRate(0.001)
+
+	const (
+		packetCount = 40
+		lostCount   = 4
+	)
+	packets := make(map[protocol.PacketNumber][]byte, packetCount)
+	for i := 0; i < packetCount; i++ {
+		pn := protocol.PacketNumber(1000 + i)
+		data := randomPacket(t, 1200)
+		packets[pn] = data
+		sender.encoder.addPacket(pn, data, 1452, now, true)
+	}
+	// The receiver misses the tail; no newer packet number will ever arrive to advance
+	// the gap tracker, which is exactly the case the old feedback counter missed.
+	for i := 0; i < packetCount-lostCount; i++ {
+		pn := protocol.PacketNumber(1000 + i)
+		receiver.decoder.recordPacket(pn, packets[pn], protocol.KeyPhaseZero)
+	}
+
+	// The idle tail flush sends what it can. Those rows are what tells the receiver that
+	// the tail packets are protected and missing.
+	var tailRows []*wire.FECWindowRepairFrame
+	flushNow := now.Add(10 * time.Millisecond)
+	for {
+		frame := sender.encoder.pendingFrame(flushNow, 1452)
+		if frame == nil {
+			break
+		}
+		row, ok := frame.(*wire.FECWindowRepairFrame)
+		if !ok {
+			t.Fatalf("unexpected FEC frame type %T", frame)
+		}
+		tailRows = append(tailRows, row)
+	}
+	if len(tailRows) == 0 {
+		t.Fatal("the idle tail was not flushed")
+	}
+	for _, row := range tailRows {
+		receiver.decoder.handleRepair(row, flushNow)
+	}
+
+	// The receiver reports the protected tail gaps even though its received-packet
+	// counter did not move.
+	feedback := receiver.decoder.pendingFeedback(now.Add(100 * time.Millisecond))
+	if feedback == nil {
+		t.Fatal("the receiver did not report the tail loss evidence")
+	}
+	if feedback.LostPackets < lostCount {
+		t.Fatalf("feedback reported %d lost packets, want at least %d", feedback.LostPackets, lostCount)
+	}
+
+	// The sender schedules and sends a repair burst for the current, frozen window.
+	sender.encoder.onFeedback(feedback, now.Add(100*time.Millisecond))
+	var recovered []fecRecoveredPacket
+	burstNow := now.Add(110 * time.Millisecond)
+	for {
+		frame := sender.pendingFrame(burstNow, 1452)
+		if frame == nil {
+			break
+		}
+		row, ok := frame.(*wire.FECWindowRepairFrame)
+		if !ok {
+			t.Fatalf("unexpected FEC frame type %T", frame)
+		}
+		recovered = append(recovered, receiver.decoder.handleRepair(row, burstNow)...)
+	}
+	want := make([]protocol.PacketNumber, 0, lostCount)
+	for i := packetCount - lostCount; i < packetCount; i++ {
+		want = append(want, protocol.PacketNumber(1000+i))
+	}
+	requireFECWindowRecovered(t, packets, recovered, want)
+}
+
+// TestFECRepairBurstsRecoverPeriodicLoss simulates the field pattern the production logs
+// exposed: a low average loss made of periodic bursts larger than the steady window
+// capacity. The data path has no additional row loss here, so it isolates the two
+// structural pieces of the fix: the 127 independent row bases (instead of 64), the
+// decoder keeping enough equations for a whole window (instead of 16), and the
+// loss-triggered repair burst that spends the accumulated byte credit after a report.
+// The old implementation recovered almost none of these bursts.
+func TestFECRepairBurstsRecoverPeriodicLoss(t *testing.T) {
+	config := FECConfig{
+		MaxOverheadPercent:        30,
+		MaxGroupSize:              128,
+		MaxParityRows:             2,
+		BaselineRedundancyPercent: 5,
+	}
+	sender := newFECWindowState(config)
+	receiver := newFECWindowState(config)
+	now := monotime.Now()
+	const (
+		packetCount = 40000
+		period      = 2000
+		burst       = 60
+	)
+	lost := 0
+	for i := 0; i < packetCount; i++ {
+		pn := protocol.PacketNumber(1000 + i)
+		data := randomPacket(t, 1200)
+		if i%period < burst {
+			lost++
+		} else {
+			receiver.decoder.recordPacket(pn, data, protocol.KeyPhaseZero)
+		}
+		sender.encoder.addPacket(pn, data, 1452, now, true)
+		for {
+			frame := sender.pendingFrame(now, 1452)
+			if frame == nil {
+				break
+			}
+			receiver.handleFrame(frame, now)
+		}
+		// Feed the peer's cumulative report back without a network delay: this models
+		// the low-RTT case the window is designed for and isolates the decoder and
+		// repair-burst changes from queueing effects.
+		if feedback := receiver.decoder.pendingFeedback(now); feedback != nil {
+			sender.encoder.onFeedback(feedback, now)
+		}
+		now = now.Add(time.Millisecond)
+	}
+	// Drain the last burst and let the decoder expire anything it still cannot solve.
+	for {
+		frame := sender.pendingFrame(now, 1452)
+		if frame == nil {
+			break
+		}
+		receiver.handleFrame(frame, now)
+	}
+	if feedback := receiver.decoder.pendingFeedback(now); feedback != nil {
+		sender.encoder.onFeedback(feedback, now)
+	}
+	for range 20 {
+		now = now.Add(time.Second)
+		if feedback := receiver.decoder.pendingFeedback(now); feedback != nil {
+			sender.encoder.onFeedback(feedback, now)
+		}
+	}
+	stats := receiver.stats()
+	t.Logf("periodic bursts: lost=%d recovered=%d failed=%d pending=%d",
+		lost, stats.RecoveredPackets, stats.FailedPackets, len(receiver.decoder.pending))
+	if stats.RecoveredPackets < uint64(lost/2) {
+		t.Fatalf("periodic bursts were not repaired: lost=%d recovered=%d failed=%d",
+			lost, stats.RecoveredPackets, stats.FailedPackets)
+	}
+}
+
+// TestFECRepairBurstStaysWithinCap verifies the new burst path is paid for from the same
+// byte credit as normal parity: the cumulative parity/protected byte ratio may not be
+// pushed over the configured cap by a repair burst. A burst larger than the credit is
+// partially sent and the rest is counted as skipped.
+func TestFECRepairBurstStaysWithinCap(t *testing.T) {
+	config := FECConfig{MaxOverheadPercent: 10, MaxGroupSize: 32}
+	state := newFECWindowState(config)
+	now := monotime.Now()
+	state.encoder.setRate(0.001)
+	for i := 0; i < 32; i++ {
+		state.encoder.addPacket(protocol.PacketNumber(1000+i), randomPacket(t, 1200), 1452, now, true)
+	}
+	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 32, LostPackets: 0}, now)
+	state.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 32, LostPackets: 16}, now)
+
+	var rows int
+	for {
+		frame := state.pendingFrame(now, 1452)
+		if frame == nil {
+			break
+		}
+		row, ok := frame.(*wire.FECWindowRepairFrame)
+		if !ok {
+			t.Fatalf("unexpected FEC frame type %T", frame)
+		}
+		rows++
+		state.frameSent(row, protocol.Version1)
+	}
+	if rows == 0 {
+		t.Fatal("no repair burst row fitted into the byte budget")
+	}
+	stats := state.stats()
+	if stats.MeasuredOverhead > 0.10+1e-9 {
+		t.Fatalf("repair burst exceeded the 10%% cap: %+v", stats)
+	}
+	if stats.RepairBurstRowsSkipped == 0 {
+		t.Fatalf("the burst was larger than the credit but no row was reported skipped: %+v", stats)
+	}
+}
+
 func TestFECRecoversSingleLoss(t *testing.T) {
 	for _, packetCount := range []int{8, 40, 200} {
 		config := FECConfig{MaxGroupSize: 32, MaxOverheadPercent: 100, MaxParityRows: 2}
@@ -145,6 +412,25 @@ func TestFECDoesNotReportRecoveredPacketsByDefault(t *testing.T) {
 	}
 	if frame, ok := receiver.pendingFrame(monotime.Now(), 1452).(*wire.FECRecoveredFrame); ok {
 		t.Fatalf("unexpected recovered frame: %+v", frame)
+	}
+}
+
+// TestFECRecoversLargeBursts is the decoder-side counterpart of the repair burst: a
+// burst of up to the row-base count has one independent row per lost packet, but the
+// decoder only reconstructs it if it keeps those equations. The old 16-row pending cap
+// silently limited every burst to 16 packets no matter how much parity was sent.
+func TestFECRecoversLargeBursts(t *testing.T) {
+	for _, burst := range []int{8, 16, 17, 32, 64} {
+		config := FECConfig{MaxGroupSize: 128, MaxOverheadPercent: 100, MaxParityRows: 2}
+		lost := make(map[protocol.PacketNumber]bool, burst)
+		want := make([]protocol.PacketNumber, 0, burst)
+		for i := 0; i < burst; i++ {
+			pn := protocol.PacketNumber(1010 + i)
+			lost[pn] = true
+			want = append(want, pn)
+		}
+		packets, recovered, _ := windowTestTransfer(t, config, 0.5, 300, lost)
+		requireFECWindowRecovered(t, packets, recovered, want)
 	}
 }
 
@@ -439,6 +725,9 @@ func TestFECDropsRowsItCannotEvaluate(t *testing.T) {
 // for a window larger than the number of row bases: two rows that share a member must
 // never use the same base, otherwise they are not linearly independent.
 func TestFECRateKeepsRowBasesDistinct(t *testing.T) {
+	// The steady redundancy must not make a packet overlap more row bases than the
+	// coefficient scheme has. Repair bursts may use up to all of them, but they are
+	// bounded at schedule time, not by the steady rate.
 	for _, windowSize := range []int{16, 64, 128} {
 		config := FECConfig{MaxGroupSize: windowSize, MaxOverheadPercent: 100}
 		state := newFECWindowState(config)

@@ -192,6 +192,15 @@ type FECStats struct {
 	// sender never gets a chance to send parity, so FEC is not protecting anything on
 	// that connection.
 	DroppedFrames uint64
+	// RepairBursts is the number of feedback reports that scheduled extra repair rows
+	// for a loss burst. RepairBurstRowsSent is the number of rows those bursts sent;
+	// they are also included in ParityPacketsSent. RepairBurstRowsSkipped counts rows a
+	// burst could not send because the byte credit was exhausted or the window was gone.
+	// A burst that is skipped before any row is sent means the packets of that burst
+	// have already left the window, and the loss has to fall back to retransmission.
+	RepairBursts           uint64
+	RepairBurstRowsSent    uint64
+	RepairBurstRowsSkipped uint64
 
 	// The remaining counters describe the direction we receive on: they are produced
 	// by the decoder and are independent of LossRate, which the peer measures on the
@@ -350,6 +359,12 @@ func (c *Conn) handleFECFrame(frame wire.Frame, rcvTime monotime.Time) error {
 		return nil
 	}
 	c.handleRecoveredFECPackets(state.handleFrame(frame, rcvTime), rcvTime)
+	// A feedback frame can have scheduled a repair burst on the encoder. Wake the send
+	// loop so the burst leaves immediately while the lost packets are still inside the
+	// window, even when this connection has no application data left to send.
+	if state.hasPending() {
+		c.scheduleSending()
+	}
 	return nil
 }
 
@@ -538,6 +553,19 @@ type fecLossTracker struct {
 	presumedLost map[protocol.PacketNumber]struct{}
 	received     uint64
 	lost         uint64
+	// cumulativeLost counts every packet number that was reported as lost, by either
+	// the reorder-gap detector above or the FEC decoder's repair rows below. It never
+	// decreases (unlike lost, which is undone when a packet arrives before the reorder
+	// timer expires), so it stays a valid cumulative counter even if a feedback packet
+	// is lost. The FEC decoder also feeds packets into it immediately when a repair row
+	// reveals a missing protected packet; without that, a burst at the tail of a traffic
+	// burst is invisible to the gap detector (no later packet number arrives to advance
+	// the watermark), the sender never learns it lost anything, and the window expires.
+	cumulativeLost uint64
+	// evidence records which packet numbers are already included in cumulativeLost, so
+	// the gap detector and the decoder can't count the same loss twice. It is pruned to
+	// a recent packet-number range; both detectors see a packet within that range.
+	evidence map[protocol.PacketNumber]struct{}
 }
 
 func (t *fecLossTracker) record(pn protocol.PacketNumber) {
@@ -548,10 +576,14 @@ func (t *fecLossTracker) record(pn protocol.PacketNumber) {
 		t.watermark = pn - 1
 		t.seen = map[protocol.PacketNumber]struct{}{pn: {}}
 		t.presumedLost = make(map[protocol.PacketNumber]struct{})
+		if t.evidence == nil {
+			t.evidence = make(map[protocol.PacketNumber]struct{})
+		}
 		return
 	}
 	if pn > t.largest {
 		t.largest = pn
+		t.pruneEvidence()
 	}
 	if pn <= t.watermark {
 		// A packet that arrived late: undo the "presumed lost" if we counted one.
@@ -580,6 +612,12 @@ func (t *fecLossTracker) record(pn protocol.PacketNumber) {
 			delete(t.seen, pn)
 			continue
 		}
+		if _, alreadyCounted := t.evidence[pn]; !alreadyCounted {
+			t.countLoss(pn)
+		}
+		// lost stays the gap tracker's current count (it is decremented if the packet
+		// arrives before the reorder window expires); cumulativeLost above is the
+		// monotonic counter the feedback frame reports.
 		t.lost++
 		t.presumedLost[pn] = struct{}{}
 	}
@@ -587,6 +625,36 @@ func (t *fecLossTracker) record(pn protocol.PacketNumber) {
 	for pn := range t.presumedLost {
 		if pn < t.watermark-4*fecReorderWindow {
 			delete(t.presumedLost, pn)
+		}
+	}
+}
+
+// countLoss records one packet number in the cumulative loss evidence. It is called by
+// both loss detectors and is idempotent for a packet number, so the gap scanner and the
+// decoder's repair rows can detect the same loss without inflating the feedback counter.
+func (t *fecLossTracker) countLoss(pn protocol.PacketNumber) {
+	if t.evidence == nil {
+		t.evidence = make(map[protocol.PacketNumber]struct{})
+	}
+	if _, ok := t.evidence[pn]; ok {
+		return
+	}
+	t.evidence[pn] = struct{}{}
+	t.cumulativeLost++
+}
+
+// pruneEvidence drops packet numbers that are so far behind the largest received packet
+// number that neither detector can add them again: the gap scanner only looks forward,
+// and the decoder drops repair rows over packets outside its cache. This keeps the
+// evidence map bounded on a long, lossy connection.
+func (t *fecLossTracker) pruneEvidence() {
+	if len(t.evidence) < fecMaxTrackerJump || t.largest <= fecMaxTrackerJump {
+		return
+	}
+	cutoff := t.largest - fecMaxTrackerJump
+	for pn := range t.evidence {
+		if pn < cutoff {
+			delete(t.evidence, pn)
 		}
 	}
 }
