@@ -213,9 +213,16 @@ func enableFEC(t *testing.T, conn *Conn, name string) {
 // configured share of the traffic FEC protected.
 func requireOverheadWithinCap(t *testing.T, name string, stats FECStats) {
 	t.Helper()
-	if stats.MeasuredOverhead > float64(fecTestOverheadCap)/100+1e-9 {
+	requireOverheadWithinCapPercent(t, name, stats, fecTestOverheadCap)
+}
+
+// requireOverheadWithinCapPercent checks the same bound for a test that configures a
+// different cap than fecTestOverheadCap (for example the shipped default of 30%).
+func requireOverheadWithinCapPercent(t *testing.T, name string, stats FECStats, capPercent int) {
+	t.Helper()
+	if stats.MeasuredOverhead > float64(capPercent)/100+1e-9 {
 		t.Fatalf("%s measured overhead %v exceeds the %d%% cap (%d parity bytes / %d protected bytes)",
-			name, stats.MeasuredOverhead, fecTestOverheadCap, stats.ParityBytesSent, stats.ProtectedBytesSent)
+			name, stats.MeasuredOverhead, capPercent, stats.ParityBytesSent, stats.ProtectedBytesSent)
 	}
 }
 
@@ -333,8 +340,8 @@ func TestFECRecoversBurstsWithTheShippedDefaults(t *testing.T) {
 		t.Fatalf("%d packets of the bursts were given up on (up to %d accepted): %+v",
 			stats.FailedPackets, maxFailed, stats)
 	}
-	requireOverheadWithinCap(t, "client", pair.clientConn.FECStats())
-	requireOverheadWithinCap(t, "server", stats)
+	requireOverheadWithinCapPercent(t, "client", pair.clientConn.FECStats(), defaultFECMaxOverheadPercent)
+	requireOverheadWithinCapPercent(t, "server", stats, defaultFECMaxOverheadPercent)
 }
 
 // TestFECCleanPathSendsNoParity verifies that FEC doesn't spend any bandwidth when
