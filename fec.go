@@ -37,10 +37,16 @@ import (
 // RTT inflation alongside the FEC counters: a rising RTT means the redundancy should
 // be reduced, not increased.
 
+// MaxFECMultiWindowCount is the largest number of independent sub-windows one
+// multi-window connection can negotiate. It mirrors the wire format bound so callers
+// do not have to import the internal wire package to clamp configuration.
+const MaxFECMultiWindowCount = wire.MaxFECMultiWindowCount
+
 const (
-	defaultFECMaxOverheadPercent = 30
-	defaultFECMaxParityRows      = 2
-	defaultFECFlushDelay         = 2 * time.Millisecond
+	defaultFECMaxOverheadPercent   = 30
+	defaultFECMaxParityRows        = 2
+	defaultFECRepairBurstRowsPerLoss = 2.0
+	defaultFECFlushDelay           = 2 * time.Millisecond
 
 	// fecMinLossRate is the loss rate above which FEC engages. Below this threshold
 	// the connection is treated as lossless, and no redundancy is sent at all.
@@ -117,6 +123,34 @@ type FECConfig struct {
 	// can turn it off for peers that do not understand the frame. Enabling it makes the
 	// connection react to the losses FEC repairs.
 	RecoveredPacketFeedback bool
+	// ExtendedFeedback is the phase 2 feedback protocol: the receiver reports the precise
+	// protected packet numbers that are still missing, and the sender schedules repair
+	// rows only for the losses that are still inside its window. This build always
+	// enables it in newFECWindowState (FEC_FEEDBACK_V2, 0x37); the field is kept for
+	// callers that inspect the effective configuration, but there is no downgrade to the
+	// cumulative FEC_FEEDBACK (0x33) send path.
+	ExtendedFeedback bool
+	// AdaptiveWindow adjusts the number of packets one window protects to the RTT and
+	// packet rate of the connection, between a lower bound and MaxGroupSize. It has no
+	// wire format impact: MaxGroupSize stays the protocol maximum, and the peer keeps
+	// its own working window. sing-box enables it by default; the library zero value
+	// stays false for callers that want the fixed window.
+	AdaptiveWindow bool
+	// MultiWindow splits the sliding window into MultiWindowCount independent
+	// sub-windows assigned by packet number modulo the count. It raises the effective
+	// window to count*MaxGroupSize, at the cost of additional state. It is negotiated
+	// with the 0x04 capability bit; sing-box enables it by default. The library zero
+	// value keeps the single-window scheme.
+	MultiWindow bool
+	// MultiWindowCount is the number of sub-windows used when MultiWindow is set.
+	// Defaults to 2 and is bounded by MaxFECMultiWindowCount.
+	MultiWindowCount int
+	// RepairBurstRowsPerLoss is the number of repair rows scheduled per lost packet
+	// after a feedback report. The default is 2: one row reconstructs one packet and
+	// the second covers a repair row lost on the same bursty path. It is an internal
+	// experiment parameter for the phase 2 field measurements; values around 1.5 and
+	// 2.5 are the ones the experiment matrix compares.
+	RepairBurstRowsPerLoss float64
 	// FlushDelay is how long the sender waits after the last packet before it emits
 	// the repair rows for the tail of the window. Defaults to 2ms.
 	FlushDelay time.Duration
@@ -150,6 +184,28 @@ func (c FECConfig) withDefaults() FECConfig {
 	if c.BaselineRedundancyPercent > 100 {
 		c.BaselineRedundancyPercent = 100
 	}
+	if c.RepairBurstRowsPerLoss <= 0 {
+		c.RepairBurstRowsPerLoss = defaultFECRepairBurstRowsPerLoss
+	}
+	if c.RepairBurstRowsPerLoss > 4 {
+		c.RepairBurstRowsPerLoss = 4
+	}
+	// Phase 2 is the only feedback protocol this build sends: FEC_FEEDBACK_V2 is always
+	// on, and a zero value config is not a request to use the cumulative v1 frame.
+	c.ExtendedFeedback = true
+	if !c.MultiWindow {
+		c.MultiWindowCount = 1
+	} else {
+		if c.MultiWindowCount <= 0 {
+			c.MultiWindowCount = 2
+		}
+		if c.MultiWindowCount > wire.MaxFECMultiWindowCount {
+			c.MultiWindowCount = wire.MaxFECMultiWindowCount
+		}
+		if c.MultiWindowCount < 2 {
+			c.MultiWindowCount = 2
+		}
+	}
 	return c
 }
 
@@ -157,8 +213,23 @@ func (c FECConfig) withDefaults() FECConfig {
 type FECStats struct {
 	Enabled bool
 	// WindowSize is the number of packets the current window protects. It is 0 while
-	// FEC is idle, i.e. while the path looks lossless.
+	// FEC is idle, i.e. while the path looks lossless. With AdaptiveWindow it is the
+	// current working window, which may be smaller than WindowMaxSize.
 	WindowSize int
+	// WindowMaxSize is the configured protocol maximum, i.e. the largest working
+	// window an adaptive encoder may use. It is also the fixed window size when
+	// AdaptiveWindow is off.
+	WindowMaxSize int
+	// AdaptiveWindow says whether WindowSize follows the measured RTT and packet rate.
+	AdaptiveWindow bool
+	// WindowCount is the number of independent sub-windows of the connection. It is 1
+	// for the single-window scheme, and 2..MaxFECMultiWindowCount when multi-window was
+	// negotiated.
+	WindowCount int
+	// EffectiveWindowSize is WindowSize times WindowCount: the number of distinct packet
+	// numbers the sliding-window members can cover across all sub-windows. It equals
+	// WindowSize for the single-window scheme.
+	EffectiveWindowSize int
 	LossRate   float64 // smoothed loss rate observed by the peer on the path we send on
 	// RedundancyRate is the parity/protected ratio the sender aims for at the current
 	// loss rate, before the overhead cap is applied. It is a configuration value
@@ -193,14 +264,44 @@ type FECStats struct {
 	// that connection.
 	DroppedFrames uint64
 	// RepairBursts is the number of feedback reports that scheduled extra repair rows
-	// for a loss burst. RepairBurstRowsSent is the number of rows those bursts sent;
-	// they are also included in ParityPacketsSent. RepairBurstRowsSkipped counts rows a
-	// burst could not send because the byte credit was exhausted or the window was gone.
-	// A burst that is skipped before any row is sent means the packets of that burst
-	// have already left the window, and the loss has to fall back to retransmission.
-	RepairBursts           uint64
-	RepairBurstRowsSent    uint64
-	RepairBurstRowsSkipped uint64
+	// for a loss burst. RepairBurstRowsScheduled is the number of rows those reports
+	// asked for, RepairBurstRowsSent is the number they sent (also included in
+	// ParityPacketsSent), and RepairBurstRowsSkipped counts rows a burst could not send
+	// because the byte credit was exhausted or the window was gone. A burst that is
+	// skipped before any row is sent means the packets of that burst have already left
+	// the window, and the loss has to fall back to retransmission. With extended
+	// feedback, RepairBurstRowsSkippedNoWindow separates the rows a report asked for
+	// for missing packets that were already outside the sender's window.
+	RepairBursts                  uint64
+	RepairBurstRowsScheduled      uint64
+	RepairBurstRowsSent           uint64
+	RepairBurstRowsSkipped        uint64
+	RepairBurstRowsSkippedNoWindow uint64
+
+	// RepairBurstRowsSkippedBudget is the part of RepairBurstRowsSkipped that the byte
+	// credit refused while the window was still available. It separates "the path is
+	// too lossy for the configured cap" from packets that simply left the window.
+	RepairBurstRowsSkippedBudget uint64
+	// MissingRangesReceived is the number of FEC_FEEDBACK_V2 ranges received, and
+	// MissingPacketsInWindow is the number of missing packet numbers those ranges named
+	// that were still inside the sender's window when the report was processed.
+	// MissingPacketsRepairable is the part of MissingPacketsInWindow the sender could
+	// still describe with a repair row; the rest was too old or too wide to protect.
+	MissingRangesReceived    uint64
+	MissingPacketsInWindow   uint64
+	MissingPacketsRepairable uint64
+
+	// The phase 2 field-observation metrics. They are deliberately additive and have no
+	// influence on the sending decision; they are what a P4 experiment has to collect
+	// before defaults can be changed from real-link data.
+	//
+	// FeedbackLatency is the delay between a missing packet entering the decoder's
+	// missing table and a feedback report that still named it. ProtectedPacketRate is
+	// the sender's EWMA packet rate in packets per second, and PeerLossPeak is the
+	// highest loss rate the peer reported while its hold window was active.
+	FeedbackLatency    time.Duration
+	ProtectedPacketRate float64
+	PeerLossPeak       float64
 
 	// The remaining counters describe the direction we receive on: they are produced
 	// by the decoder and are independent of LossRate, which the peer measures on the
@@ -318,6 +419,7 @@ func (c *Conn) fecRecordSentPacket(pn protocol.PacketNumber, data []byte, maxPac
 	if state == nil {
 		return
 	}
+	state.setRTT(c.rttStats.SmoothedRTT())
 	state.tick(now)
 	state.addPacket(pn, data, maxPacketSize, now, carriesData)
 }

@@ -70,7 +70,7 @@ func (t FrameType) isAllowedAtEncLevel(encLevel protocol.EncryptionLevel) bool {
 		switch t {
 		case FrameTypeCrypto, FrameTypeAck, FrameTypeAckECN, FrameTypeConnectionClose, FrameTypeNewToken, FrameTypePathResponse, FrameTypeRetireConnectionID,
 			// FEC frames are only used after the handshake, in the 1-RTT packet number space.
-			FrameTypeFECFeedback, FrameTypeFECWindowRepair, FrameTypeFECRecovered:
+			FrameTypeFECFeedback, FrameTypeFECWindowRepair, FrameTypeFECRecovered, FrameTypeFECFeedbackV2, FrameTypeFECWindowRepairMulti:
 			return false
 		default:
 			return true

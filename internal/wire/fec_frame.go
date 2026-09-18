@@ -24,11 +24,37 @@ const (
 	// FrameTypeFECRecovered reports packets that were reconstructed by FEC back to the
 	// sender. 0x35 is not reused: it was taken by the experimental streaming scheme.
 	FrameTypeFECRecovered FrameType = 0x36
+	// FrameTypeFECFeedbackV2 carries the counters of FEC_FEEDBACK plus the precise
+	// ranges of protected packets that are still missing at the receiver. A sender
+	// uses the ranges to schedule repair rows only for packets that are still inside
+	// its window, instead of estimating from the cumulative loss delta.
+	FrameTypeFECFeedbackV2 FrameType = 0x37
+	// FrameTypeFECWindowRepairMulti is the multi-window variant of
+	// FEC_WINDOW_REPAIR. It carries the same repair row plus the sub-window it
+	// belongs to, so a connection can run k independent Cauchy windows without
+	// changing the shape of one row.
+	FrameTypeFECWindowRepairMulti FrameType = 0x38
 )
 
 // maxFECRecoveredFramePackets bounds the packets one recovered frame may report. It
 // keeps a malformed peer from allocating an unbounded slice while parsing.
 const maxFECRecoveredFramePackets = 256
+
+// MaxFECFeedbackV2Ranges bounds the number of missing packet ranges one
+// FEC_FEEDBACK_V2 frame carries. A frame has to fit into an ACK-only short packet,
+// and the receiver truncates the list rather than building a frame that can't be
+// sent.
+const MaxFECFeedbackV2Ranges = 32
+
+// MaxFECFeedbackV2MissingPackets bounds the number of packet numbers one
+// FEC_FEEDBACK_V2 frame describes. The bound applies to the parsed frame as well, so
+// a malformed peer can not make the receiver allocate an unbounded range list.
+const MaxFECFeedbackV2MissingPackets = 128
+
+// MaxFECMultiWindowCount bounds the sub-windows one multi-window encoder uses. The
+// effective window and the per-connection memory both grow with the count, so it is
+// a protocol-level bound rather than a tunable that can grow without limit.
+const MaxFECMultiWindowCount = 4
 
 // MaxFECWindowSize is the maximum number of packets a sliding window repair row
 // protects. A sliding window row is superseded by the rows that follow it, so a large
@@ -44,9 +70,13 @@ const MaxFECWindowSpan = 512
 // can be described by a FEC repair frame.
 const maxFECProtectedPacketLength = 16383
 
+// maxFECPacketNumber is the largest packet number QUIC varints can encode. It keeps
+// FEC_FEEDBACK_V2 ranges from overflowing protocol.PacketNumber on malformed input.
+const maxFECPacketNumber = 1<<62 - 1
+
 // IsFECFrameType says if this is a packet level FEC frame.
 func (t FrameType) IsFECFrameType() bool {
-	return t == FrameTypeFECWindowRepair || t == FrameTypeFECFeedback || t == FrameTypeFECRecovered
+	return t == FrameTypeFECWindowRepair || t == FrameTypeFECFeedback || t == FrameTypeFECRecovered || t == FrameTypeFECFeedbackV2 || t == FrameTypeFECWindowRepairMulti
 }
 
 // A FECWindowRepairFrame carries one repair row of the sliding window
@@ -201,6 +231,59 @@ func (f *FECWindowRepairFrame) Length(_ protocol.Version) protocol.ByteCount {
 	return length
 }
 
+// A FECMultiWindowRepairFrame carries one repair row of one sub-window of the
+// multi-window scheme. Its body is identical to FECWindowRepairFrame; WindowID says
+// which sub-window the member packet numbers belong to. The packet number itself
+// encodes the assignment (packet number % window count), so the receiver can route a
+// row without a separate field on every protected packet.
+//
+// Wire format:
+//
+//	0x38 | window id | row | first packet number | span | bitmap | member count
+//	     | parity length | length parity (2 bytes) | parity
+type FECMultiWindowRepairFrame struct {
+	WindowID uint64
+	FECWindowRepairFrame
+}
+
+func parseFECMultiWindowRepairFrame(b []byte, v protocol.Version) (*FECMultiWindowRepairFrame, int, error) {
+	startLen := len(b)
+	windowID, l, err := quicvarint.Parse(b)
+	if err != nil {
+		return nil, 0, replaceUnexpectedEOF(err)
+	}
+	b = b[l:]
+	body, n, err := parseFECWindowRepairFrame(b, v)
+	if err != nil {
+		return nil, 0, err
+	}
+	f := &FECMultiWindowRepairFrame{WindowID: windowID}
+	f.FECWindowRepairFrame = *body
+	return f, startLen - len(b) + n, nil
+}
+
+func (f *FECMultiWindowRepairFrame) Append(b []byte, v protocol.Version) ([]byte, error) {
+	b = quicvarint.Append(b, uint64(FrameTypeFECWindowRepairMulti))
+	b = quicvarint.Append(b, f.WindowID)
+	body, err := f.FECWindowRepairFrame.Append(nil, v)
+	if err != nil {
+		return nil, err
+	}
+	// The embedded body frame prepends its own 0x34 frame type. Skip it: the multi
+	// frame already announced the frame type and the sub-window, and the body follows
+	// immediately after the window id.
+	if len(body) == 0 {
+		return b, nil
+	}
+	b = append(b, body[1:]...)
+	return b, nil
+}
+
+func (f *FECMultiWindowRepairFrame) Length(v protocol.Version) protocol.ByteCount {
+	bodyLength := f.FECWindowRepairFrame.Length(v) - protocol.ByteCount(quicvarint.Len(uint64(FrameTypeFECWindowRepair)))
+	return protocol.ByteCount(quicvarint.Len(uint64(FrameTypeFECWindowRepairMulti)) + quicvarint.Len(f.WindowID)) + bodyLength
+}
+
 // A FECFeedbackFrame reports the receiver's view of the FEC protected packet stream
 // back to the sender, so that the sender can adapt the amount of redundancy to the
 // loss rate actually observed on the path. All counters are cumulative; the sender
@@ -263,6 +346,152 @@ func (f *FECFeedbackFrame) Length(_ protocol.Version) protocol.ByteCount {
 			quicvarint.Len(f.FailedPackets) +
 			quicvarint.Len(f.ParityPackets),
 	)
+}
+
+// A FECFeedbackV2Range describes a span of packet numbers that are still missing at
+// the receiver. Count is the length of the span, not the number of gaps inside it:
+// a range produced by merging two gaps at most three packet numbers apart counts the
+// packet numbers between them as well. The sender only uses ranges to test whether
+// the packets are still in its window, so the span representation is sufficient.
+type FECFeedbackV2Range struct {
+	// FirstPacketNumber is the first packet number of the range.
+	FirstPacketNumber protocol.PacketNumber
+	// Count is the number of consecutive packet numbers the range describes.
+	Count uint64
+}
+
+// A FECFeedbackV2Frame extends FEC_FEEDBACK with the receiver's current missing
+// packet ranges. The cumulative counters keep the same semantics as FEC_FEEDBACK, so
+// a sender can share its loss estimator between the two frame types. The ranges are
+// only a snapshot: feedback packets can be lost, and the next snapshot re-sends the
+// ranges of the packets that are still missing.
+//
+// Wire format (all integers are QUIC varints):
+//
+//	0x37 | received | lost evidence | recovered | failed | parity received | count |
+//	(first packet number, count) * count
+//
+// Ranges are sorted by packet number and do not overlap. A receiver only reports
+// packet numbers that a repair row announced as protected; unannounced gaps in the
+// packet number sequence are carried by the cumulative lost evidence counter but are
+// not necessarily FEC repairable.
+type FECFeedbackV2Frame struct {
+	// ReceivedPackets, LostPackets, RecoveredPackets, FailedPackets and ParityPackets
+	// carry the same cumulative counters as FECFeedbackFrame. LostPackets is still the
+	// receiver's cumulative deduplicated loss evidence, not the number of packets that
+	// are currently missing.
+	ReceivedPackets  uint64
+	LostPackets      uint64
+	RecoveredPackets uint64
+	FailedPackets    uint64
+	ParityPackets    uint64
+	// MissingRanges is the current snapshot of protected packet numbers the receiver
+	// has neither seen nor reconstructed. It is empty when there is nothing missing, or
+	// when the receiver chose to suppress an unchanged snapshot.
+	MissingRanges []FECFeedbackV2Range
+}
+
+// MissingPackets returns the number of packet numbers the frame ranges describe.
+func (f *FECFeedbackV2Frame) MissingPackets() uint64 {
+	var count uint64
+	for _, r := range f.MissingRanges {
+		count += r.Count
+	}
+	return count
+}
+
+func parseFECFeedbackV2Frame(b []byte, _ protocol.Version) (*FECFeedbackV2Frame, int, error) {
+	startLen := len(b)
+	f := &FECFeedbackV2Frame{}
+	fields := []*uint64{&f.ReceivedPackets, &f.LostPackets, &f.RecoveredPackets, &f.FailedPackets, &f.ParityPackets}
+	for _, field := range fields {
+		value, l, err := quicvarint.Parse(b)
+		if err != nil {
+			return nil, 0, replaceUnexpectedEOF(err)
+		}
+		*field = value
+		b = b[l:]
+	}
+	rangeCount, l, err := quicvarint.Parse(b)
+	if err != nil {
+		return nil, 0, replaceUnexpectedEOF(err)
+	}
+	b = b[l:]
+	if rangeCount > MaxFECFeedbackV2Ranges {
+		return nil, 0, errors.New("FEC feedback v2 carries too many missing ranges")
+	}
+	if rangeCount > 0 {
+		f.MissingRanges = make([]FECFeedbackV2Range, 0, rangeCount)
+	}
+	var (
+		totalMissing uint64
+		previousEnd  uint64
+	)
+	for i := uint64(0); i < rangeCount; i++ {
+		first, l, err := quicvarint.Parse(b)
+		if err != nil {
+			return nil, 0, replaceUnexpectedEOF(err)
+		}
+		b = b[l:]
+		count, l, err := quicvarint.Parse(b)
+		if err != nil {
+			return nil, 0, replaceUnexpectedEOF(err)
+		}
+		b = b[l:]
+		if count == 0 {
+			return nil, 0, errors.New("FEC feedback v2 contains an empty missing range")
+		}
+		// Packet numbers are QUIC varints, i.e. non-negative integers below 2^62.
+		// Reject a range that would step over that bound before it is converted into
+		// a signed protocol.PacketNumber.
+		if first > maxFECPacketNumber || count-1 > maxFECPacketNumber-first {
+			return nil, 0, errors.New("FEC feedback v2 missing range overflows")
+		}
+		if i > 0 && first <= previousEnd {
+			return nil, 0, errors.New("FEC feedback v2 missing ranges are not increasing")
+		}
+		previousEnd = first + count - 1
+		totalMissing += count
+		if totalMissing > MaxFECFeedbackV2MissingPackets {
+			return nil, 0, errors.New("FEC feedback v2 reports too many missing packets")
+		}
+		f.MissingRanges = append(f.MissingRanges, FECFeedbackV2Range{
+			FirstPacketNumber: protocol.PacketNumber(first),
+			Count:             count,
+		})
+	}
+	return f, startLen - len(b), nil
+}
+
+func (f *FECFeedbackV2Frame) Append(b []byte, _ protocol.Version) ([]byte, error) {
+	b = quicvarint.Append(b, uint64(FrameTypeFECFeedbackV2))
+	b = quicvarint.Append(b, f.ReceivedPackets)
+	b = quicvarint.Append(b, f.LostPackets)
+	b = quicvarint.Append(b, f.RecoveredPackets)
+	b = quicvarint.Append(b, f.FailedPackets)
+	b = quicvarint.Append(b, f.ParityPackets)
+	b = quicvarint.Append(b, uint64(len(f.MissingRanges)))
+	for _, r := range f.MissingRanges {
+		b = quicvarint.Append(b, uint64(r.FirstPacketNumber))
+		b = quicvarint.Append(b, r.Count)
+	}
+	return b, nil
+}
+
+func (f *FECFeedbackV2Frame) Length(_ protocol.Version) protocol.ByteCount {
+	length := protocol.ByteCount(
+		quicvarint.Len(uint64(FrameTypeFECFeedbackV2)) +
+			quicvarint.Len(f.ReceivedPackets) +
+			quicvarint.Len(f.LostPackets) +
+			quicvarint.Len(f.RecoveredPackets) +
+			quicvarint.Len(f.FailedPackets) +
+			quicvarint.Len(f.ParityPackets) +
+			quicvarint.Len(uint64(len(f.MissingRanges))),
+	)
+	for _, r := range f.MissingRanges {
+		length += protocol.ByteCount(quicvarint.Len(uint64(r.FirstPacketNumber)) + quicvarint.Len(r.Count))
+	}
+	return length
 }
 
 // A FECRecoveredPacket is one packet the receiver reconstructed from a repair row.

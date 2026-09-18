@@ -72,6 +72,10 @@ func LogFrame(logger utils.Logger, frame Frame, sent bool) {
 		logger.Debugf("\t%s &wire.FECWindowRepairFrame{Row: %d, First: %d, Span: %d, Members: %d, Parity length: %d}", dir, f.Row, f.FirstPacketNumber, f.Span, len(f.PacketNumbers), len(f.Parity))
 	case *FECFeedbackFrame:
 		logger.Debugf("\t%s &wire.FECFeedbackFrame{Received: %d, Lost: %d, Recovered: %d, Failed: %d, Parity: %d}", dir, f.ReceivedPackets, f.LostPackets, f.RecoveredPackets, f.FailedPackets, f.ParityPackets)
+	case *FECFeedbackV2Frame:
+		logger.Debugf("\t%s &wire.FECFeedbackV2Frame{Received: %d, Lost: %d, Recovered: %d, Failed: %d, Parity: %d, MissingRanges: %d}", dir, f.ReceivedPackets, f.LostPackets, f.RecoveredPackets, f.FailedPackets, f.ParityPackets, len(f.MissingRanges))
+	case *FECMultiWindowRepairFrame:
+		logger.Debugf("\t%s &wire.FECMultiWindowRepairFrame{Window: %d, Row: %d, First: %d, Span: %d, Members: %d, Parity length: %d}", dir, f.WindowID, f.Row, f.FirstPacketNumber, f.Span, len(f.PacketNumbers), len(f.Parity))
 	default:
 		logger.Debugf("\t%s %#v", dir, frame)
 	}

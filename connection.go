@@ -1989,7 +1989,7 @@ func (c *Conn) handleFrame(
 		err = c.connIDGenerator.Retire(frame.SequenceNumber, destConnID, rcvTime.Add(3*c.rttStats.PTO(false)))
 	case *wire.HandshakeDoneFrame:
 		err = c.handleHandshakeDoneFrame(rcvTime)
-	case *wire.FECWindowRepairFrame, *wire.FECFeedbackFrame:
+	case *wire.FECWindowRepairFrame, *wire.FECMultiWindowRepairFrame, *wire.FECFeedbackFrame, *wire.FECFeedbackV2Frame:
 		err = c.handleFECFrame(frame, rcvTime)
 	case *wire.FECRecoveredFrame:
 		err = c.handleFECRecoveredFrame(frame, rcvTime)

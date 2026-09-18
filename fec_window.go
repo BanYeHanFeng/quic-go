@@ -101,15 +101,6 @@ const (
 	// cover a full window (128 packets) with extra rows after a burst, which is the
 	// minimum a loss-triggered repair burst needs to be able to spend.
 	fecWindowCreditLimit = 256 * 1024
-	// fecWindowRepairBurstNumerator and fecWindowRepairBurstDenominator turn a newly
-	// reported lost packet into repair rows. One row reconstructs one missing packet;
-	// sending two rows per lost packet pays for repair rows that are themselves lost on
-	// the path. The repair burst is usually sent into the same bursty path that produced
-	// the loss, so the parity is subject to the same loss pattern. The factor is bounded
-	// by the number of independent row bases and by the connection's byte credit, so it
-	// cannot overspend the configured cap.
-	fecWindowRepairBurstNumerator   = 2
-	fecWindowRepairBurstDenominator = 1
 	// fecWindowMaxRepairBurstFactor bounds the rows one feedback can schedule: two
 	// windows mean a full window of parity can be sent even after a large fraction of
 	// the first burst rows is lost. It has to stay small enough that a misbehaving
@@ -207,6 +198,31 @@ const (
 	// on the window: frame type, row, first packet number, span, member count, parity
 	// length and the length parity.
 	fecWindowFrameBaseBytes = 1 + 4 + 8 + 4 + 2 + 2 + 2
+	// fecWindowFeedbackMaxRanges and fecWindowFeedbackMaxMissing bound one
+	// FEC_FEEDBACK_V2 snapshot. They mirror the wire parser limits: the receiver
+	// truncates the missing list locally, and a malformed peer can not make it allocate
+	// or evaluate an unbounded list.
+	fecWindowFeedbackMaxRanges  = wire.MaxFECFeedbackV2Ranges
+	fecWindowFeedbackMaxMissing = wire.MaxFECFeedbackV2MissingPackets
+	// fecWindowFeedbackMergeGap is the largest packet number gap merged into one
+	// missing range. A single missing packet among a small reordering hole costs a
+	// separate range on the wire otherwise.
+	fecWindowFeedbackMergeGap = 3
+	// fecWindowAdaptiveScale turns the path's bandwidth-delay product (in packets)
+	// into the target working window. 1.5 leaves room for one feedback round trip
+	// worth of packets while keeping the window well below the 128 packet protocol
+	// maximum on fast paths.
+	fecWindowAdaptiveScale = 1.5
+	// fecWindowAdaptiveThreshold is the relative change from the current window a new
+	// target has to exceed before the window is adjusted.
+	fecWindowAdaptiveThreshold = 0.20
+	// fecWindowAdaptiveInterval is how long a new target has to persist before it is
+	// applied. It prevents packet timing noise from moving the window on every packet.
+	fecWindowAdaptiveInterval = time.Second
+	// fecWindowAdaptiveMinSize is the smallest working window an adaptive encoder uses
+	// when the configured maximum allows it. It keeps a fast path from shrinking the
+	// window below the point where a repair row still covers a useful burst.
+	fecWindowAdaptiveMinSize = 64
 )
 
 // fecWindowCoefficient returns the coefficient of the member at the given position of
@@ -256,9 +272,19 @@ type fecWindowState struct {
 	skippedRowsBudget      atomic.Uint64
 	skippedRowsUnbuildable atomic.Uint64
 
-	repairBursts           atomic.Uint64
-	repairBurstRowsSent    atomic.Uint64
-	repairBurstRowsSkipped atomic.Uint64
+	repairBursts                   atomic.Uint64
+	repairBurstRowsScheduled       atomic.Uint64
+	repairBurstRowsSent            atomic.Uint64
+	repairBurstRowsSkipped           atomic.Uint64
+	repairBurstRowsSkippedNoWindow   atomic.Uint64
+	repairBurstRowsSkippedBudget     atomic.Uint64
+	protectedPacketRateBits          atomic.Uint64
+	peerLossPeakBits                 atomic.Uint64
+	feedbackLatencyNanos             atomic.Int64
+
+	missingRangesReceived    atomic.Uint64
+	missingPacketsInWindow   atomic.Uint64
+	missingPacketsRepairable atomic.Uint64
 
 	protectedRecv atomic.Uint64
 	recoveredRecv atomic.Uint64
@@ -280,6 +306,10 @@ func newFECWindowState(config FECConfig) *fecWindowState {
 // repair row arrives). A nil logger disables those logs.
 func newFECWindowStateWithLogger(config FECConfig, logger utils.Logger) *fecWindowState {
 	config = config.withDefaults()
+	// Phase 2 is the only feedback protocol this build sends. The flag stays in the
+	// config for embedders and tests that inspect it, but a connection never falls back
+	// to the cumulative FEC_FEEDBACK frame in the send path.
+	config.ExtendedFeedback = true
 	state := &fecWindowState{config: config, logger: logger}
 	state.encoder = newFECWindowEncoder(state, config)
 	state.decoder = newFECWindowDecoder(state, config)
@@ -306,6 +336,10 @@ func (s *fecWindowState) stats() FECStats {
 	stats := FECStats{
 		Enabled:                  true,
 		WindowSize:               int(s.windowSize.Load()),
+		WindowMaxSize:            s.config.MaxGroupSize,
+		AdaptiveWindow:           s.config.AdaptiveWindow,
+		WindowCount:              s.encoder.effectiveWindowCount(),
+		EffectiveWindowSize:      int(s.windowSize.Load()) * s.encoder.effectiveWindowCount(),
 		LossRate:                 s.lossRate(),
 		RedundancyRate:           rate,
 		ProtectedPacketsSent:     s.protectedSent.Load(),
@@ -316,9 +350,18 @@ func (s *fecWindowState) stats() FECStats {
 		SkippedRowsBudget:        s.skippedRowsBudget.Load(),
 		SkippedRowsUnbuildable:   s.skippedRowsUnbuildable.Load(),
 		DroppedFrames:            s.droppedFrames.Load(),
-		RepairBursts:              s.repairBursts.Load(),
-		RepairBurstRowsSent:       s.repairBurstRowsSent.Load(),
-		RepairBurstRowsSkipped:    s.repairBurstRowsSkipped.Load(),
+		RepairBursts:                       s.repairBursts.Load(),
+		RepairBurstRowsScheduled:           s.repairBurstRowsScheduled.Load(),
+		RepairBurstRowsSent:                s.repairBurstRowsSent.Load(),
+		RepairBurstRowsSkipped:             s.repairBurstRowsSkipped.Load(),
+		RepairBurstRowsSkippedNoWindow:     s.repairBurstRowsSkippedNoWindow.Load(),
+		RepairBurstRowsSkippedBudget:       s.repairBurstRowsSkippedBudget.Load(),
+		MissingRangesReceived:              s.missingRangesReceived.Load(),
+		MissingPacketsInWindow:             s.missingPacketsInWindow.Load(),
+		MissingPacketsRepairable:           s.missingPacketsRepairable.Load(),
+		FeedbackLatency:                    time.Duration(s.feedbackLatencyNanos.Load()),
+		ProtectedPacketRate:                math.Float64frombits(s.protectedPacketRateBits.Load()),
+		PeerLossPeak:                       math.Float64frombits(s.peerLossPeakBits.Load()),
 		ProtectedPacketsReceived: s.protectedRecv.Load(),
 		RecoveredPackets:         s.recoveredRecv.Load(),
 		FailedPackets:            s.failedRecv.Load(),
@@ -340,6 +383,8 @@ func (s *fecWindowState) reserve() protocol.ByteCount { return s.encoder.reserve
 
 func (s *fecWindowState) tick(now monotime.Time) { s.encoder.tick(now) }
 
+func (s *fecWindowState) setRTT(rtt time.Duration) { s.encoder.setRTT(rtt) }
+
 func (s *fecWindowState) addPacket(pn protocol.PacketNumber, data []byte, maxPacketSize protocol.ByteCount, now monotime.Time, carriesData bool) {
 	s.encoder.addPacket(pn, data, maxPacketSize, now, carriesData)
 }
@@ -354,6 +399,10 @@ func (s *fecWindowState) handleFrame(frame wire.Frame, now monotime.Time) []fecR
 		return s.decoder.handleRepair(f, now)
 	case *wire.FECFeedbackFrame:
 		s.encoder.onFeedback(f, now)
+	case *wire.FECFeedbackV2Frame:
+		s.encoder.onFeedbackV2(f, now)
+	case *wire.FECMultiWindowRepairFrame:
+		return s.decoder.handleMultiRepair(f, now)
 	}
 	return nil
 }
@@ -367,7 +416,7 @@ func (s *fecWindowState) pendingFrame(now monotime.Time, maxPacketSize protocol.
 	if frame := s.encoder.pendingFrame(now, maxPacketSize); frame != nil {
 		return frame
 	}
-	if frame := s.decoder.pendingFeedback(now); frame != nil {
+	if frame := s.decoder.pendingFeedbackFrame(now, maxPacketSize); frame != nil {
 		return frame
 	}
 	return nil
@@ -376,7 +425,11 @@ func (s *fecWindowState) pendingFrame(now monotime.Time, maxPacketSize protocol.
 func (s *fecWindowState) hasPending() bool { return s.encoder.hasPending() }
 
 func (s *fecWindowState) frameSent(frame wire.Frame, v protocol.Version) {
-	if repair, ok := frame.(*wire.FECWindowRepairFrame); ok {
+	switch repair := frame.(type) {
+	case *wire.FECWindowRepairFrame:
+		s.paritySent.Add(1)
+		s.parityBytes.Add(uint64(repair.Length(v)))
+	case *wire.FECMultiWindowRepairFrame:
 		s.paritySent.Add(1)
 		s.parityBytes.Add(uint64(repair.Length(v)))
 	}
@@ -397,15 +450,41 @@ type fecWindowEncoder struct {
 	state  *fecWindowState
 	config FECConfig
 
-	windowSize  int
-	maxSpan     uint64
-	flushRows   int
-	overheadCap float64
+	windowSize int
+	// maxWindowSize is the configured protocol maximum, and minWindowSize is the
+	// smallest working window an adaptive encoder may choose. Both bound windowSize;
+	// an encoder without AdaptiveWindow keeps it fixed at maxWindowSize.
+	maxWindowSize int
+	minWindowSize int
+	maxSpan       uint64
+	flushRows     int
+	overheadCap   float64
+
+	// repairBurstRowsPerLoss is the configured rows-per-loss factor. It is read by
+	// repairBurstRowsFor and defaults to 2.
+	repairBurstRowsPerLoss float64
+
+	// adaptiveWindow moves windowSize with the path's bandwidth-delay product. The
+	// target has to persist for fecWindowAdaptiveInterval before it is applied, so
+	// measurement noise does not move the window back and forth.
+	adaptiveWindow      bool
+	rtt                 time.Duration
+	adaptiveTarget      int
+	adaptiveTargetSince monotime.Time
+	lastWindowChange    monotime.Time
 
 	members []fecWindowMember
 
+	// windowCount is the number of independent sub-windows. Packet numbers are
+	// assigned by pn % windowCount, which both endpoints can compute without an extra
+	// field on protected packets. nextWindow balances the steady repair rows over the
+	// sub-windows; burstWindows queues the loss-triggered rows per sub-window.
+	windowCount    int
+	nextWindow     int
+	burstWindows   []int
+
 	rowSeq uint64
-	ready  []*wire.FECWindowRepairFrame
+	ready  []wire.Frame
 
 	// rowCredit is the number of rows that are due, in rows: it accrues at the target
 	// redundancy and is spent one row at a time. credit is the byte budget, in bytes:
@@ -426,13 +505,11 @@ type fecWindowEncoder struct {
 	// byte budget. A flush the budget refused must not be retried on every send loop
 	// iteration; the next packet resets it.
 	tailFlushed bool
-	// burstRows are repair rows triggered by a loss report. They are sent immediately
-	// out of the byte credit the connection accumulated while the path looked cleaner,
-	// instead of waiting for future packets to earn row credit. A burst is what makes
-	// a flow that stops sending after a loss burst repairable at all: without it, the
-	// sender can only spend the idle tail flush rows, and a window that lost a larger
-	// number of packets is not repaired.
-	burstRows int
+	// burstWindows are repair rows triggered by a loss report, each tagged with the
+	// sub-window it belongs to. They are sent immediately out of the byte credit the
+	// connection accumulated while the path looked cleaner, instead of waiting for
+	// future packets to earn row credit. A burst is what makes a flow that stops
+	// sending after a loss burst repairable at all.
 
 	lastEvaluation monotime.Time
 	feedbackSeen   bool
@@ -480,7 +557,27 @@ func newFECWindowEncoder(state *fecWindowState, config FECConfig) *fecWindowEnco
 	if windowSize < fecWindowMinMembers {
 		windowSize = fecWindowMinMembers
 	}
-	maxSpan := uint64(2*windowSize + 8)
+	minWindowSize := fecWindowAdaptiveMinSize
+	if minWindowSize > windowSize {
+		minWindowSize = windowSize
+	}
+	if minWindowSize < fecWindowMinMembers {
+		minWindowSize = fecWindowMinMembers
+	}
+	windowCount := 1
+	if config.MultiWindow {
+		windowCount = config.MultiWindowCount
+		if windowCount < 2 {
+			windowCount = 2
+		}
+		if windowCount > wire.MaxFECMultiWindowCount {
+			windowCount = wire.MaxFECMultiWindowCount
+		}
+	}
+	// A sub-window member sits every windowCount packet numbers, so a row can span
+	// windowCount times the fixed-window span. The bitmap bound would reject wider
+	// rows, and the oldest members are dropped from the sub-window in that case.
+	maxSpan := uint64(2*windowSize*windowCount + 8)
 	if maxSpan > wire.MaxFECWindowSpan {
 		maxSpan = wire.MaxFECWindowSpan
 	}
@@ -491,14 +588,23 @@ func newFECWindowEncoder(state *fecWindowState, config FECConfig) *fecWindowEnco
 	if flushRows < 1 {
 		flushRows = 1
 	}
+	repairBurstRowsPerLoss := config.RepairBurstRowsPerLoss
+	if repairBurstRowsPerLoss <= 0 {
+		repairBurstRowsPerLoss = defaultFECRepairBurstRowsPerLoss
+	}
 	return &fecWindowEncoder{
-		state:        state,
-		config:       config,
-		windowSize:   windowSize,
-		maxSpan:      maxSpan,
-		flushRows:    flushRows,
-		overheadCap:  float64(config.MaxOverheadPercent) / 100,
-		baselineRate: float64(config.BaselineRedundancyPercent) / 100,
+		state:          state,
+		config:         config,
+		windowSize:     windowSize,
+		maxWindowSize:  windowSize,
+		minWindowSize:  minWindowSize,
+		windowCount:    windowCount,
+		maxSpan:        maxSpan,
+		flushRows:      flushRows,
+		overheadCap:            float64(config.MaxOverheadPercent) / 100,
+		baselineRate:           float64(config.BaselineRedundancyPercent) / 100,
+		repairBurstRowsPerLoss: repairBurstRowsPerLoss,
+		adaptiveWindow:         config.AdaptiveWindow,
 	}
 }
 
@@ -514,7 +620,7 @@ func (e *fecWindowEncoder) reserve() protocol.ByteCount {
 	return fecWindowFrameBytes(e.maxSpan)
 }
 
-func (e *fecWindowEncoder) hasPending() bool { return len(e.ready) > 0 || e.burstRows > 0 }
+func (e *fecWindowEncoder) hasPending() bool { return len(e.ready) > 0 || len(e.burstWindows) > 0 }
 
 func (e *fecWindowEncoder) flushDeadline() monotime.Time {
 	if e.tailFlushed || !e.protecting() || e.rowsSinceAdd > 0 || e.lastAdd.IsZero() || len(e.members) < fecWindowMinMembers {
@@ -600,33 +706,47 @@ func (e *fecWindowEncoder) holdDuration() time.Duration {
 	return hold
 }
 
-// onFeedback processes a loss report of the peer. The counters are cumulative, so a
-// lost feedback packet degrades nothing but the freshness of the report.
-func (e *fecWindowEncoder) onFeedback(feedback *wire.FECFeedbackFrame, now monotime.Time) {
-	var deltaReceived, deltaLost uint64
-	hadFeedback := e.feedbackSeen
+// observeFeedback records the cumulative counters of one loss report and returns
+// their deltas. hadFeedback reports whether a previous report established a baseline;
+// accepted is false when the peer's counters moved backwards, in which case the
+// baseline was snapped and no sample should be accumulated. V1 and V2 feedback share
+// this bookkeeping so their loss estimators see the same counter semantics.
+func (e *fecWindowEncoder) observeFeedback(received, lost uint64, now monotime.Time) (deltaReceived, deltaLost uint64, hadFeedback, accepted bool) {
+	hadFeedback = e.feedbackSeen
 	if !hadFeedback {
-		deltaReceived = feedback.ReceivedPackets
-		deltaLost = feedback.LostPackets
-	} else if feedback.ReceivedPackets >= e.fbReceived && feedback.LostPackets >= e.fbLost {
-		deltaReceived = feedback.ReceivedPackets - e.fbReceived
-		deltaLost = feedback.LostPackets - e.fbLost
+		deltaReceived = received
+		deltaLost = lost
+	} else if received >= e.fbReceived && lost >= e.fbLost {
+		deltaReceived = received - e.fbReceived
+		deltaLost = lost - e.fbLost
 	} else {
 		// The peer's counters moved backwards, which can happen when a packet
 		// arrives after the reorder window already presumed it lost. Don't count
 		// that report as a new loss, but still snap the baseline to the peer's view
 		// so the reports after it are measured against the right counters.
-		e.fbReceived = feedback.ReceivedPackets
-		e.fbLost = feedback.LostPackets
+		e.fbReceived = received
+		e.fbLost = lost
+		e.feedbackSeen = true
 		e.fbTime = now
 		e.lastEvaluation = now
 		e.evaluateLoss(now)
-		return
+		return 0, 0, hadFeedback, false
 	}
-	e.fbReceived = feedback.ReceivedPackets
-	e.fbLost = feedback.LostPackets
+	e.fbReceived = received
+	e.fbLost = lost
 	e.feedbackSeen = true
 	e.fbTime = now
+	return deltaReceived, deltaLost, hadFeedback, true
+}
+
+// onFeedback processes a FEC_FEEDBACK (0x33) report of the peer. The counters are
+// cumulative, so a lost feedback packet degrades nothing but the freshness of the
+// report.
+func (e *fecWindowEncoder) onFeedback(feedback *wire.FECFeedbackFrame, now monotime.Time) {
+	deltaReceived, deltaLost, hadFeedback, accepted := e.observeFeedback(feedback.ReceivedPackets, feedback.LostPackets, now)
+	if !accepted {
+		return
+	}
 	// Schedule the repair burst from the raw delta before the estimator's sample is
 	// large enough to move the steady redundancy. A burst has to be repaired while its
 	// packets are still inside the window; waiting for 16 packets or 500ms of samples
@@ -639,6 +759,100 @@ func (e *fecWindowEncoder) onFeedback(feedback *wire.FECFeedbackFrame, now monot
 	e.accumulateLossSample(deltaReceived, deltaLost, now)
 	e.lastEvaluation = now
 	e.evaluateLoss(now)
+}
+
+// onFeedbackV2 processes a FEC_FEEDBACK_V2 (0x37) report. The cumulative counters
+// drive the same loss estimator as V1, but the repair burst is scheduled only from the
+// packet numbers that are still inside the current window. A missing packet that left
+// the window can not be repaired by a parity row any more, so scheduling rows for it
+// would only spend credit without recovering anything. The cumulative lost delta is
+// still accumulated, so a report whose ranges are all stale keeps driving the steady
+// redundancy instead of looking like a clean path.
+func (e *fecWindowEncoder) onFeedbackV2(feedback *wire.FECFeedbackV2Frame, now monotime.Time) {
+	deltaReceived, deltaLost, _, accepted := e.observeFeedback(feedback.ReceivedPackets, feedback.LostPackets, now)
+	if !accepted {
+		return
+	}
+	e.state.missingRangesReceived.Add(uint64(len(feedback.MissingRanges)))
+	totalMissing := feedback.MissingPackets()
+	inWindow, repairable, repairableByWindow := e.classifyMissingPacketsByWindow(feedback.MissingRanges)
+	e.state.missingPacketsInWindow.Add(inWindow)
+	e.state.missingPacketsRepairable.Add(repairable)
+	if stale := totalMissing - inWindow; stale > 0 {
+		e.state.repairBurstRowsSkippedNoWindow.Add(e.repairBurstRowsFor(stale))
+	}
+	for windowID, windowRepairable := range repairableByWindow {
+		if windowRepairable > 0 {
+			e.scheduleRepairBurstForWindow(windowRepairable, windowID)
+		}
+	}
+	e.accumulateLossSample(deltaReceived, deltaLost, now)
+	e.lastEvaluation = now
+	e.evaluateLoss(now)
+}
+
+// memberIndex returns the position of pn in the encoder's window, or -1 when the
+// packet already left it. A V2 report carries at most 128 packet numbers and the
+// window holds at most 128 members, so a linear scan is bounded and cheaper than
+// building a separate index for the rare case that extended feedback is active.
+func (e *fecWindowEncoder) memberIndex(pn protocol.PacketNumber) int {
+	return slices.IndexFunc(e.members, func(member fecWindowMember) bool { return member.packetNumber == pn })
+}
+
+// classifyMissingPackets counts the packet numbers of a V2 report that are still in
+// the encoder's window. repairable is the subset a repair row can still describe: the
+// window must hold at least two members for a row to be worth sending.
+func (e *fecWindowEncoder) classifyMissingPackets(ranges []wire.FECFeedbackV2Range) (inWindow, repairable uint64) {
+	inWindow, repairable, _ = e.classifyMissingPacketsByWindow(ranges)
+	return inWindow, repairable
+}
+
+// classifyMissingPacketsByWindow does the same count, but keeps the repairable packet
+// numbers grouped by sub-window so that a multi-window encoder schedules repair rows
+// for the sub-windows that actually lost packets. A single-window encoder has one
+// implicit sub-window and gets the whole count in index 0.
+func (e *fecWindowEncoder) classifyMissingPacketsByWindow(ranges []wire.FECFeedbackV2Range) (inWindow, repairable uint64, byWindow []uint64) {
+	byWindow = make([]uint64, e.effectiveWindowCount())
+	for _, r := range ranges {
+		if r.Count == 0 {
+			continue
+		}
+		last := uint64(r.FirstPacketNumber) + r.Count
+		for pn := uint64(r.FirstPacketNumber); pn < last; pn++ {
+			if e.memberIndex(protocol.PacketNumber(pn)) < 0 {
+				continue
+			}
+			inWindow++
+			if len(e.members) < fecWindowMinMembers {
+				continue
+			}
+			repairable++
+			byWindow[e.windowForPacket(protocol.PacketNumber(pn))]++
+		}
+	}
+	return inWindow, repairable, byWindow
+}
+
+// repairBurstRowsFor converts a number of missing packets into the number of repair
+// rows a V2 report would schedule for them. It is used to attribute rows that could
+// not be scheduled because their packets had already left the window.
+func (e *fecWindowEncoder) repairBurstRowsFor(lost uint64) uint64 {
+	if lost == 0 || e.windowSize < fecWindowMinMembers {
+		return 0
+	}
+	maxMissing := uint64(e.windowSize)
+	if lost > maxMissing {
+		lost = maxMissing
+	}
+	rows := uint64(math.Ceil(float64(lost) * e.repairBurstRowsPerLoss))
+	maxRows := uint64(e.windowSize * fecWindowMaxRepairBurstFactor)
+	if maxRows > fecWindowCauchyRows {
+		maxRows = fecWindowCauchyRows
+	}
+	if rows > maxRows {
+		rows = maxRows
+	}
+	return rows
 }
 
 // accumulateLossSample adds the packets of one report to the pending sample and accepts
@@ -674,6 +888,7 @@ func (e *fecWindowEncoder) accumulateLossSample(received, lost uint64, now monot
 	if e.peerLoss > e.lossPeak {
 		e.lossPeak = e.peerLoss
 		e.lossPeakTime = now
+		e.state.peerLossPeakBits.Store(math.Float64bits(e.lossPeak))
 	}
 }
 
@@ -732,54 +947,178 @@ func (e *fecWindowEncoder) setRate(rate float64) {
 	}
 }
 
-// scheduleRepairBurst turns a newly reported batch of lost packets into repair rows
-// for the current window. The rows are not charged against e.rowCredit: the long-term
-// overhead cap still bounds them because emitBurstRow pays for them from e.credit, the
-// same byte budget normal rows use. A burst therefore can't break the configured
-// MaxOverheadPercent, but it can spend the credit a cleaner path accumulated instead
-// of leaving it unused while a window of packets expires.
-func (e *fecWindowEncoder) scheduleRepairBurst(lost uint64) {
-	if lost == 0 || e.windowSize < fecWindowMinMembers {
+// setRTT supplies the connection's smoothed RTT to an adaptive encoder. A non-adaptive
+// encoder ignores it; the fixed window does not depend on the path measurement.
+func (e *fecWindowEncoder) setRTT(rtt time.Duration) {
+	if rtt < 0 {
+		rtt = 0
+	}
+	e.rtt = rtt
+}
+
+// updateAdaptiveWindow recomputes the working window from the bandwidth-delay product
+// of the path. RTT is supplied by the connection and averageInterval is the EWMA
+// packet interval the encoder already tracks, so the target is the number of packets
+// the sender puts on the path during one RTT, with fecWindowAdaptiveScale as margin.
+// A new target must stay within fecWindowAdaptiveThreshold (relative change) and be
+// held for fecWindowAdaptiveInterval before it is used; that hysteresis is what keeps
+// packet timing noise from resizing the window on every packet.
+func (e *fecWindowEncoder) updateAdaptiveWindow(now monotime.Time) {
+	if !e.adaptiveWindow || e.rtt <= 0 || e.averageInterval <= 0 {
 		return
 	}
-	// Only a window's worth of packets can be missing at once. Cap the raw report
-	// before converting, so a peer with a corrupted counter can't request a huge
-	// burst. The row-base and credit limits below bound the actual burst.
-	maxMissing := uint64(e.windowSize)
-	if lost > maxMissing {
-		lost = maxMissing
+	packetRate := float64(time.Second) / e.averageInterval
+	target := int(math.Round(float64(e.rtt) / float64(time.Second) * packetRate * fecWindowAdaptiveScale))
+	if target < e.minWindowSize {
+		target = e.minWindowSize
 	}
-	rows := (lost*fecWindowRepairBurstNumerator + fecWindowRepairBurstDenominator - 1) / fecWindowRepairBurstDenominator
-	maxRows := uint64(e.windowSize * fecWindowMaxRepairBurstFactor)
-	if maxRows > fecWindowCauchyRows {
-		maxRows = fecWindowCauchyRows
+	if target > e.maxWindowSize {
+		target = e.maxWindowSize
 	}
-	if rows > maxRows {
-		rows = maxRows
+	if target == e.windowSize {
+		e.adaptiveTarget = target
+		e.adaptiveTargetSince = now
+		return
 	}
-	available := maxRows - uint64(e.burstRows)
+	if target != e.adaptiveTarget {
+		e.adaptiveTarget = target
+		e.adaptiveTargetSince = now
+	}
+	current := float64(e.windowSize)
+	change := math.Abs(float64(target)-current) / current
+	if change < fecWindowAdaptiveThreshold {
+		return
+	}
+	if e.adaptiveTargetSince.IsZero() || now.Sub(e.adaptiveTargetSince) < fecWindowAdaptiveInterval {
+		return
+	}
+	e.windowSize = target
+	e.lastWindowChange = now
+	if e.protecting() {
+		e.state.windowSize.Store(int64(e.windowSize))
+	}
+}
+
+// scheduleRepairBurst turns a newly reported batch of lost packets into repair rows
+// for the current configuration. A single-window encoder uses one window; a
+// multi-window encoder distributes the rows round-robin, because a cumulative counter
+// report does not identify which sub-window lost the packets. FEC_FEEDBACK_V2 does
+// identify them and uses scheduleRepairBurstForWindow directly.
+func (e *fecWindowEncoder) scheduleRepairBurst(lost uint64) {
+	rows := e.repairBurstRowsFor(lost)
+	if rows == 0 {
+		return
+	}
+	available := e.availableBurstRows()
 	if available == 0 {
 		return
 	}
 	if rows > available {
 		rows = available
 	}
-	e.burstRows += int(rows)
+	for i := uint64(0); i < rows; i++ {
+		windowID := e.nextWindow
+		e.nextWindow = (e.nextWindow + 1) % e.windowCount
+		e.burstWindows = append(e.burstWindows, windowID)
+	}
 	e.state.repairBursts.Add(1)
+	e.state.repairBurstRowsScheduled.Add(rows)
 }
 
-// emitBurstRow builds one scheduled repair row and pays for it from the byte credit.
-// It returns nil when the window is too small or the credit is exhausted; the caller
-// then drops the rest of the burst, because retrying the same stale window on every
-// send loop iteration would produce no new information.
-func (e *fecWindowEncoder) emitBurstRow(maxPacketSize protocol.ByteCount) *wire.FECWindowRepairFrame {
-	if len(e.members) < fecWindowMinMembers {
+// scheduleRepairBurstForWindow turns missing packets of one sub-window into repair
+// rows for that sub-window.
+func (e *fecWindowEncoder) scheduleRepairBurstForWindow(lost uint64, windowID int) {
+	if windowID < 0 || windowID >= e.windowCount {
+		return
+	}
+	rows := e.repairBurstRowsFor(lost)
+	if rows == 0 {
+		return
+	}
+	available := e.availableBurstRows()
+	if available == 0 {
+		return
+	}
+	if rows > available {
+		rows = available
+	}
+	for i := uint64(0); i < rows; i++ {
+		e.burstWindows = append(e.burstWindows, windowID)
+	}
+	e.state.repairBursts.Add(1)
+	e.state.repairBurstRowsScheduled.Add(rows)
+}
+
+// availableBurstRows is the number of loss-triggered rows the burst bound still allows.
+// All sub-windows share the same bound, like they share the byte credit: one noisy
+// sub-window can not multiply the configured overhead.
+func (e *fecWindowEncoder) availableBurstRows() uint64 {
+	maxRows := uint64(e.windowSize * e.effectiveWindowCount() * fecWindowMaxRepairBurstFactor)
+	if maxRows > fecWindowCauchyRows {
+		maxRows = fecWindowCauchyRows
+	}
+	if uint64(len(e.burstWindows)) >= maxRows {
+		return 0
+	}
+	return maxRows - uint64(len(e.burstWindows))
+}
+
+// effectiveWindowCount keeps the burst bound arithmetic valid for an encoder built
+// without an explicit count (tests and internal callers that bypass withDefaults).
+func (e *fecWindowEncoder) effectiveWindowCount() int {
+	if e.windowCount < 1 {
+		return 1
+	}
+	return e.windowCount
+}
+
+// windowForPacket returns the sub-window a packet number belongs to. It is the only
+// assignment rule the scheme needs; both endpoints derive it from the packet number.
+func (e *fecWindowEncoder) windowForPacket(pn protocol.PacketNumber) int {
+	if e.windowCount <= 1 {
+		return 0
+	}
+	return int(uint64(pn) % uint64(e.windowCount))
+}
+
+// evictMaxMembers is the total number of members the encoder keeps across all
+// sub-windows. It is one sub-window's size times the sub-window count.
+func (e *fecWindowEncoder) evictMaxMembers() int {
+	return e.windowSize * e.effectiveWindowCount()
+}
+
+// membersForWindow returns the encoder's members that belong to one sub-window. A
+// single-window encoder has exactly one implicit sub-window containing every member.
+func (e *fecWindowEncoder) membersForWindow(windowID int) []fecWindowMember {
+	if e.windowCount <= 1 {
+		return e.members
+	}
+	if windowID < 0 || windowID >= e.windowCount {
 		return nil
 	}
-	if length := e.estimatedRowLength(); length > 0 && float64(length) > e.credit {
+	members := make([]fecWindowMember, 0, (len(e.members)+e.windowCount-1)/e.windowCount)
+	for _, member := range e.members {
+		if int(uint64(member.packetNumber)%uint64(e.windowCount)) == windowID {
+			members = append(members, member)
+		}
+	}
+	return members
+}
+
+// emitBurstRow builds one scheduled repair row for the given sub-window and pays for
+// it from the shared byte credit. It returns nil when the sub-window is too small or
+// the credit is exhausted; the caller then drops the rest of the burst, because
+// retrying the same stale window on every send loop iteration would produce no new
+// information.
+func (e *fecWindowEncoder) emitBurstRow(maxPacketSize protocol.ByteCount, windowID int) wire.Frame {
+	members := e.membersForWindow(windowID)
+	if len(members) < fecWindowMinMembers {
 		return nil
 	}
-	frame := e.buildRow(maxPacketSize)
+	if length := estimatedMembersLength(members, e.maxSpan); length > 0 && float64(length) > e.credit {
+		return nil
+	}
+	frame := e.buildRepairFrame(members, maxPacketSize, e.rowSeq, windowID)
 	if frame == nil {
 		return nil
 	}
@@ -810,23 +1149,10 @@ func (e *fecWindowEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxP
 		// as a data packet while paying for it out of the bytes of both.
 		return
 	}
-	// Every protected packet adds to the budget of the overhead cap, whether or not a
-	// row is sent for it: that is what makes the measured overhead comparable to the
-	// cap.
-	e.state.protectedSent.Add(1)
-	e.state.protectedBytes.Add(uint64(len(data)))
-	e.credit = math.Min(e.credit+e.overheadCap*float64(len(data)), fecWindowCreditLimit)
-	if !e.protecting() {
-		return
-	}
-	packet := make([]byte, len(data))
-	copy(packet, data)
-	e.members = append(e.members, fecWindowMember{packetNumber: pn, data: packet})
-	e.averageLength = fecWindowLengthEWMAAlpha*float64(len(data)) + (1-fecWindowLengthEWMAAlpha)*e.averageLength
-	e.evict(pn)
-	// Track how fast the window is being filled: holdDuration uses it to keep the
-	// redundancy of a burst for as long as the packets of the burst stay in the window.
-	// A traffic gap is not a packet interval, so it is bounded.
+	// Track how fast the window is being filled before the member is added: holdDuration
+	// uses it to keep the redundancy of a burst for as long as the packets of the burst
+	// stay in the window, and an adaptive window uses the packet rate to size itself. A
+	// traffic gap is not a packet interval, so it is bounded.
 	if !e.lastAdd.IsZero() {
 		interval := float64(now.Sub(e.lastAdd))
 		if interval > float64(fecWindowAddIntervalMax) {
@@ -838,8 +1164,26 @@ func (e *fecWindowEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxP
 			} else {
 				e.averageInterval = fecWindowLengthEWMAAlpha*interval + (1-fecWindowLengthEWMAAlpha)*e.averageInterval
 			}
+			if e.protecting() && e.averageInterval > 0 {
+				e.state.protectedPacketRateBits.Store(math.Float64bits(float64(time.Second) / e.averageInterval))
+			}
 		}
 	}
+	// Every protected packet adds to the budget of the overhead cap, whether or not a
+	// row is sent for it: that is what makes the measured overhead comparable to the
+	// cap.
+	e.state.protectedSent.Add(1)
+	e.state.protectedBytes.Add(uint64(len(data)))
+	e.credit = math.Min(e.credit+e.overheadCap*float64(len(data)), fecWindowCreditLimit)
+	if !e.protecting() {
+		return
+	}
+	e.updateAdaptiveWindow(now)
+	packet := make([]byte, len(data))
+	copy(packet, data)
+	e.members = append(e.members, fecWindowMember{packetNumber: pn, data: packet})
+	e.averageLength = fecWindowLengthEWMAAlpha*float64(len(data)) + (1-fecWindowLengthEWMAAlpha)*e.averageLength
+	e.evict(pn)
 	e.lastAdd = now
 	e.rowsSinceAdd = 0
 	e.tailFlushed = false
@@ -859,9 +1203,13 @@ func (e *fecWindowEncoder) addPacket(pn protocol.PacketNumber, data []byte, maxP
 // is what keeps the window useful when only some of the packets carry data: a sender
 // that spends most of its packet numbers on acknowledgements would otherwise fill the
 // window with packets the peer already has (or that the decoder no longer caches).
+//
+// A multi-window encoder keeps windowCount sub-window's worth of members; the packet
+// numbers interleave, so each sub-window still holds up to windowSize members.
 func (e *fecWindowEncoder) evict(newest protocol.PacketNumber) {
+	maxMembers := e.windowSize * e.effectiveWindowCount()
 	for len(e.members) > 0 {
-		if len(e.members) <= e.windowSize && uint64(newest-e.members[0].packetNumber) < e.maxSpan {
+		if len(e.members) <= maxMembers && uint64(newest-e.members[0].packetNumber) < e.maxSpan {
 			return
 		}
 		// Clear the slot before it is resliced away, so that the packet it points to can
@@ -874,16 +1222,34 @@ func (e *fecWindowEncoder) evict(newest protocol.PacketNumber) {
 // emitRow builds one repair row for the current window and queues it for sending. It
 // returns false when the row can't be built or can't be paid for out of the byte
 // budget, in which case the caller drops the row credit instead of saving it up.
+//
+// A multi-window encoder picks the next sub-window that still has enough members; the
+// shared credit means one sub-window can not spend budget the others need.
 func (e *fecWindowEncoder) emitRow(maxPacketSize protocol.ByteCount) bool {
 	// The parity pass is the expensive part of a row. Refuse a row the byte budget
 	// can't pay for before computing it; the exact check below still runs on the frame
-	// that is actually built.
+	// that is actually built. The estimate over the whole member list is an upper
+	// bound for any sub-window, so it may refuse a row slightly early, never late.
 	if length := e.estimatedRowLength(); length > 0 && float64(length) > e.credit {
 		e.state.skippedRows.Add(1)
 		e.state.skippedRowsBudget.Add(1)
 		return false
 	}
-	frame := e.buildRow(maxPacketSize)
+	var frame wire.Frame
+	if e.effectiveWindowCount() <= 1 {
+		if body := e.buildRow(maxPacketSize); body != nil {
+			frame = body
+		}
+	} else {
+		for i := 0; i < e.effectiveWindowCount(); i++ {
+			windowID := e.nextWindow
+			e.nextWindow = (windowID + 1) % e.effectiveWindowCount()
+			if candidate := e.buildRepairFrame(e.membersForWindow(windowID), maxPacketSize, e.rowSeq, windowID); candidate != nil {
+				frame = candidate
+				break
+			}
+		}
+	}
 	if frame == nil {
 		e.state.skippedRows.Add(1)
 		e.state.skippedRowsUnbuildable.Add(1)
@@ -909,20 +1275,26 @@ func (e *fecWindowEncoder) emitRow(maxPacketSize protocol.ByteCount) bool {
 	return true
 }
 
-// estimatedRowLength is a lower bound for the size of the next repair row: the header
-// that describes the current window plus its longest member. It is computed without any
-// GF arithmetic, so a row the byte budget can't pay for is refused before its parity is
-// computed.
+// estimatedRowLength is an upper bound for the size of the next repair row: it uses
+// every member of the encoder, so it covers whichever sub-window is picked next. It is
+// computed without any GF arithmetic, so a row the byte budget can't pay for is refused
+// before its parity is computed.
 func (e *fecWindowEncoder) estimatedRowLength() protocol.ByteCount {
-	if len(e.members) < fecWindowMinMembers {
+	return estimatedMembersLength(e.members, e.maxSpan)
+}
+
+// estimatedMembersLength estimates a repair frame over one member set. maxSpan is the
+// membership bitmap bound of the encoder.
+func estimatedMembersLength(members []fecWindowMember, maxSpan uint64) protocol.ByteCount {
+	if len(members) < fecWindowMinMembers {
 		return 0
 	}
-	span := uint64(e.members[len(e.members)-1].packetNumber-e.members[0].packetNumber) + 1
-	if span > e.maxSpan {
-		span = e.maxSpan
+	span := uint64(members[len(members)-1].packetNumber-members[0].packetNumber) + 1
+	if span > maxSpan {
+		span = maxSpan
 	}
 	var maxLength protocol.ByteCount
-	for _, member := range e.members {
+	for _, member := range members {
 		if length := protocol.ByteCount(len(member.data)); length > maxLength {
 			maxLength = length
 		}
@@ -930,14 +1302,28 @@ func (e *fecWindowEncoder) estimatedRowLength() protocol.ByteCount {
 	return maxLength + fecWindowFrameBytes(span)
 }
 
-// buildRow computes one parity row over the current window. It returns nil when the
-// window is too small, when its packet number span doesn't fit into the membership
-// bitmap, or when the row wouldn't fit into a datagram.
+// buildRow computes one single-window parity row over every member. It is kept for the
+// internal tests that pin the coefficient layout; production rows go through
+// buildRepairFrame so that a multi-window encoder can wrap the body with its window id.
 func (e *fecWindowEncoder) buildRow(maxPacketSize protocol.ByteCount) *wire.FECWindowRepairFrame {
-	if len(e.members) < fecWindowMinMembers {
+	frame := e.buildRepairFrame(e.members, maxPacketSize, e.rowSeq, 0)
+	if frame == nil {
 		return nil
 	}
-	members := e.members
+	body, ok := frame.(*wire.FECWindowRepairFrame)
+	if !ok {
+		return nil
+	}
+	return body
+}
+
+// buildRepairFrame computes one Cauchy repair row over the given member set. windowID
+// is negative for a plain FEC_WINDOW_REPAIR frame; a multi-window encoder wraps the
+// same body into FEC_WINDOW_REPAIR_MULTI. The caller owns e.rowSeq and the byte credit.
+func (e *fecWindowEncoder) buildRepairFrame(members []fecWindowMember, maxPacketSize protocol.ByteCount, row uint64, windowID int) wire.Frame {
+	if len(members) < fecWindowMinMembers {
+		return nil
+	}
 	first := members[0].packetNumber
 	last := members[len(members)-1].packetNumber
 	// The window covers consecutive packet numbers, with the packet numbers spent on
@@ -951,7 +1337,7 @@ func (e *fecWindowEncoder) buildRow(maxPacketSize protocol.ByteCount) *wire.FECW
 		first = members[0].packetNumber
 	}
 	frame := &wire.FECWindowRepairFrame{
-		Row:               e.rowSeq,
+		Row:               row,
 		FirstPacketNumber: first,
 		Span:              uint64(last-first) + 1,
 		PacketNumbers:     make([]protocol.PacketNumber, len(members)),
@@ -966,12 +1352,6 @@ func (e *fecWindowEncoder) buildRow(maxPacketSize protocol.ByteCount) *wire.FECW
 	}
 	frame.ParityLength = parityLength
 	frame.Parity = make([]byte, parityLength)
-	if frame.Length(protocol.Version1)+fecMaxPacketOverhead > maxPacketSize {
-		// The parity packet would be larger than a datagram. This happens when the
-		// window holds a packet that was sent before FEC engaged, when packets were
-		// still sized without a repair frame in mind.
-		return nil
-	}
 	for position, member := range members {
 		coefficient := fecWindowCoefficient(frame.Row, position)
 		fecXORScaled(frame.Parity, member.data, coefficient)
@@ -979,7 +1359,17 @@ func (e *fecWindowEncoder) buildRow(maxPacketSize protocol.ByteCount) *wire.FECW
 		frame.LengthParity[0] ^= gfMul(coefficient, byte(length>>8))
 		frame.LengthParity[1] ^= gfMul(coefficient, byte(length))
 	}
-	return frame
+	if e.effectiveWindowCount() <= 1 || windowID < 0 {
+		if frame.Length(protocol.Version1)+fecMaxPacketOverhead > maxPacketSize {
+			return nil
+		}
+		return frame
+	}
+	multi := &wire.FECMultiWindowRepairFrame{WindowID: uint64(windowID), FECWindowRepairFrame: *frame}
+	if multi.Length(protocol.Version1)+fecMaxPacketOverhead > maxPacketSize {
+		return nil
+	}
+	return multi
 }
 
 // pendingFrame returns the next repair row to send. When the sender went idle with a
@@ -998,17 +1388,26 @@ func (e *fecWindowEncoder) pendingFrame(now monotime.Time, maxPacketSize protoco
 		e.ready = e.ready[1:]
 		return frame
 	}
-	if e.burstRows > 0 {
-		frame := e.emitBurstRow(maxPacketSize)
+	if len(e.burstWindows) > 0 {
+		windowID := e.burstWindows[0]
+		frame := e.emitBurstRow(maxPacketSize, windowID)
 		if frame == nil {
 			// Drop the rest of the burst instead of retrying it: its window has left
 			// or the byte credit is exhausted. New packets reset the window and can
-			// accumulate new credit for the next report.
-			e.state.repairBurstRowsSkipped.Add(uint64(e.burstRows))
-			e.burstRows = 0
+			// accumulate new credit for the next report. The two causes are counted
+			// separately so that a P4 experiment can tell an over-tight byte cap from
+			// missing packets that expired before the report arrived.
+			skipped := uint64(len(e.burstWindows))
+			e.state.repairBurstRowsSkipped.Add(skipped)
+			if len(e.membersForWindow(windowID)) < fecWindowMinMembers {
+				e.state.repairBurstRowsSkippedNoWindow.Add(skipped)
+			} else {
+				e.state.repairBurstRowsSkippedBudget.Add(skipped)
+			}
+			e.burstWindows = nil
 			return nil
 		}
-		e.burstRows--
+		e.burstWindows = e.burstWindows[1:]
 		return frame
 	}
 	if !e.protecting() || len(e.members) < fecWindowMinMembers {
@@ -1044,8 +1443,9 @@ func (e *fecWindowEncoder) pendingFrame(now monotime.Time, maxPacketSize protoco
 // contributions of all members that are already known removed. What is left is a
 // linear combination of the missing packets.
 type fecWindowPendingRow struct {
-	row    uint64
-	pivot  protocol.PacketNumber
+	row      uint64
+	windowID uint64
+	pivot    protocol.PacketNumber
 	coeffs map[protocol.PacketNumber]byte
 	rhs    []byte
 	lenRHS [2]byte
@@ -1062,10 +1462,11 @@ func (r *fecWindowPendingRow) updatePivot() {
 }
 
 type fecWindowDecoder struct {
-	state      *fecWindowState
-	config     FECConfig
-	windowSize int
-	cacheSize  int
+	state       *fecWindowState
+	config      FECConfig
+	windowSize  int
+	windowCount int
+	cacheSize   int
 	// maxMissing bounds the packet numbers the decoder tracks as missing, which only
 	// feed the statistics.
 	maxMissing int
@@ -1101,6 +1502,10 @@ type fecWindowDecoder struct {
 	feedbackTime     monotime.Time
 	reportedReceived uint64
 	reportedLost     uint64
+	// reportedMissing is the last missing-range snapshot sent in a FEC_FEEDBACK_V2
+	// frame. An unchanged snapshot is replaced by an empty range list, so a stream of
+	// reports does not repeat the same ranges every 20ms.
+	reportedMissing []wire.FECFeedbackV2Range
 
 	// lastParity is when the last repair row arrived, and lastStallWarn rate limits the
 	// "missing packets expired while no repair row arrives" log line.
@@ -1120,12 +1525,27 @@ func newFECWindowDecoder(state *fecWindowState, config FECConfig) *fecWindowDeco
 	if windowSize < fecWindowMinMembers {
 		windowSize = fecWindowMinMembers
 	}
+	windowCount := 1
+	if config.MultiWindow {
+		windowCount = config.MultiWindowCount
+		if windowCount < 2 {
+			windowCount = 2
+		}
+		if windowCount > wire.MaxFECMultiWindowCount {
+			windowCount = wire.MaxFECMultiWindowCount
+		}
+	}
+	// A sub-window's members interleave in the packet number space, so the cache and
+	// the missing table have to cover the whole effective window, not just one 128
+	// packet slice.
+	cacheSize := (2*windowSize + fecWindowCacheSlack) * windowCount
 	return &fecWindowDecoder{
-		state:      state,
-		config:     config,
-		windowSize: windowSize,
-		cacheSize:  2*windowSize + fecWindowCacheSlack,
-		maxMissing: 4 * (2*windowSize + fecWindowCacheSlack),
+		state:       state,
+		config:      config,
+		windowSize:  windowSize,
+		windowCount: windowCount,
+		cacheSize:   cacheSize,
+		maxMissing:  4 * cacheSize,
 	}
 }
 
@@ -1136,6 +1556,7 @@ func (d *fecWindowDecoder) reset() {
 	d.protectedOrder = nil
 	d.missing = nil
 	d.pending = nil
+	d.reportedMissing = nil
 	d.state.missingGauge.Store(0)
 }
 
@@ -1263,13 +1684,33 @@ func (d *fecWindowDecoder) expireMissing(now monotime.Time) {
 		expired, lastParity, d.state.recoveredRecv.Load(), d.state.failedRecv.Load(), len(d.missing))
 }
 
-// handleRepair processes an incoming repair row. The packets of the row that are still
-// missing become the unknowns of a new equation; if the equation - together with the
-// ones before it - determines a packet, the packet is reconstructed and returned, so
-// that the connection can process it like a packet that arrived on the wire.
+// handleRepair processes an incoming single-window repair row.
 func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now monotime.Time) []fecRecoveredPacket {
 	d.state.parityRecv.Add(1)
 	d.lastParity = now
+	return d.handleRepairForWindow(frame, 0, now)
+}
+
+// handleMultiRepair processes an incoming FEC_WINDOW_REPAIR_MULTI row. The window id
+// has to be one of the negotiated sub-windows; a row for an unknown window is dropped
+// instead of being interpreted as a single-window row (which would silently use the
+// wrong coefficients).
+func (d *fecWindowDecoder) handleMultiRepair(frame *wire.FECMultiWindowRepairFrame, now monotime.Time) []fecRecoveredPacket {
+	if frame.WindowID >= uint64(d.windowCount) {
+		return nil
+	}
+	d.state.parityRecv.Add(1)
+	d.lastParity = now
+	return d.handleRepairForWindow(&frame.FECWindowRepairFrame, frame.WindowID, now)
+}
+
+// handleRepairForWindow builds the equation of a repair row. The packets of the row
+// that are still missing become the unknowns; if the equation - together with the ones
+// before it - determines a packet, the packet is reconstructed and returned, so that
+// the connection can process it like a packet that arrived on the wire. windowID is
+// only used to distinguish two equations that happen to share a row number in
+// different sub-windows.
+func (d *fecWindowDecoder) handleRepairForWindow(frame *wire.FECWindowRepairFrame, windowID uint64, now monotime.Time) []fecRecoveredPacket {
 	missing := make([]int, 0, len(frame.PacketNumbers))
 	trackMissing := func(pn protocol.PacketNumber) {
 		// The set only feeds the statistics; the equation is built from the cache
@@ -1312,7 +1753,7 @@ func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now mo
 		return nil
 	}
 	for _, pending := range d.pending {
-		if pending.row == frame.Row {
+		if pending.row == frame.Row && pending.windowID == windowID {
 			// The same equation twice can't add rank, only work. Count it so that a
 			// misbehaving or replaying peer is visible instead of silently filling the
 			// pending set.
@@ -1320,7 +1761,7 @@ func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now mo
 			return nil
 		}
 	}
-	row := d.buildRow(frame, missing)
+	row := d.buildRowForWindow(frame, missing, windowID)
 	if row == nil {
 		return nil
 	}
@@ -1329,10 +1770,15 @@ func (d *fecWindowDecoder) handleRepair(frame *wire.FECWindowRepairFrame, now mo
 	return d.pump()
 }
 
-// buildRow turns a repair row into an equation over the packets that are missing. The
-// contributions of the packets that are already known - and of their lengths - are
-// subtracted from the parity.
+// buildRow keeps the single-window call shape used by earlier tests.
 func (d *fecWindowDecoder) buildRow(frame *wire.FECWindowRepairFrame, missing []int) *fecWindowPendingRow {
+	return d.buildRowForWindow(frame, missing, 0)
+}
+
+// buildRowForWindow turns a repair row into an equation over the packets that are
+// missing. The contributions of the packets that are already known - and of their
+// lengths - are subtracted from the parity.
+func (d *fecWindowDecoder) buildRowForWindow(frame *wire.FECWindowRepairFrame, missing []int, windowID uint64) *fecWindowPendingRow {
 	isMissing := make(map[int]struct{}, len(missing))
 	for _, position := range missing {
 		isMissing[position] = struct{}{}
@@ -1340,10 +1786,11 @@ func (d *fecWindowDecoder) buildRow(frame *wire.FECWindowRepairFrame, missing []
 	rhs := make([]byte, frame.ParityLength)
 	copy(rhs, frame.Parity)
 	row := &fecWindowPendingRow{
-		row:    frame.Row,
-		coeffs: make(map[protocol.PacketNumber]byte, len(missing)),
-		rhs:    rhs,
-		lenRHS: frame.LengthParity,
+		row:      frame.Row,
+		windowID: windowID,
+		coeffs:   make(map[protocol.PacketNumber]byte, len(missing)),
+		rhs:      rhs,
+		lenRHS:   frame.LengthParity,
 	}
 	for position, pn := range frame.PacketNumbers {
 		coefficient := fecWindowCoefficient(frame.Row, position)
@@ -1527,26 +1974,34 @@ func (d *fecWindowDecoder) pendingRecoveredFrame(maxPacketSize protocol.ByteCoun
 	return nil
 }
 
-// pendingFeedback returns a feedback frame if a new loss report is due. The loss rate
-// of the path is measured locally (packet number gaps), so reports are sent even while
-// FEC is idle: they are what makes the sender engage FEC in the first place.
-func (d *fecWindowDecoder) pendingFeedback(now monotime.Time) *wire.FECFeedbackFrame {
+// feedbackDue says whether a new loss report is due. Expiring missing packets is rate
+// limited with the reports: the decoder is asked for feedback on every send loop
+// iteration, and the set can hold hundreds of packet numbers.
+func (d *fecWindowDecoder) feedbackDue(now monotime.Time) bool {
 	if !d.tracker.initialized {
-		return nil
+		return false
 	}
 	if !d.feedbackTime.IsZero() && now.Sub(d.feedbackTime) < fecFeedbackInterval {
-		return nil
+		return false
 	}
-	// Expiring the missing packets is rate limited with the reports: the decoder is
-	// asked for feedback on every send loop iteration, and the set can hold hundreds of
-	// packet numbers.
 	d.expireMissing(now)
-	if d.tracker.received == d.reportedReceived && d.tracker.cumulativeLost == d.reportedLost {
-		return nil
-	}
+	return d.tracker.received != d.reportedReceived || d.tracker.cumulativeLost != d.reportedLost
+}
+
+func (d *fecWindowDecoder) markFeedbackSent(now monotime.Time) {
 	d.feedbackTime = now
 	d.reportedReceived = d.tracker.received
 	d.reportedLost = d.tracker.cumulativeLost
+}
+
+// pendingFeedback returns a v1 feedback frame if a new loss report is due. The loss
+// rate of the path is measured locally (packet number gaps), so reports are sent even
+// while FEC is idle: they are what makes the sender engage FEC in the first place.
+func (d *fecWindowDecoder) pendingFeedback(now monotime.Time) *wire.FECFeedbackFrame {
+	if !d.feedbackDue(now) {
+		return nil
+	}
+	d.markFeedbackSent(now)
 	return &wire.FECFeedbackFrame{
 		ReceivedPackets:  d.tracker.received,
 		LostPackets:      d.tracker.cumulativeLost,
@@ -1554,4 +2009,159 @@ func (d *fecWindowDecoder) pendingFeedback(now monotime.Time) *wire.FECFeedbackF
 		FailedPackets:    d.state.failedRecv.Load(),
 		ParityPackets:    d.state.parityRecv.Load(),
 	}
+}
+
+// pendingFeedbackFrame returns the feedback frame for the negotiated capability: a
+// v2 frame with missing ranges when extended feedback is active, otherwise the v1
+// cumulative counter frame. It falls back to v1 if a v2 frame can not be made to fit
+// into the datagram after truncating its ranges; both endpoints can always parse v1.
+func (d *fecWindowDecoder) pendingFeedbackFrame(now monotime.Time, maxPacketSize protocol.ByteCount) wire.Frame {
+	if !d.config.ExtendedFeedback {
+		if frame := d.pendingFeedback(now); frame != nil {
+			return frame
+		}
+		return nil
+	}
+	if frame := d.pendingFeedbackV2(now, maxPacketSize); frame != nil {
+		return frame
+	}
+	// No fallback to the cumulative v1 frame: if the v2 snapshot cannot be represented
+	// in a datagram, this report is simply skipped and the next one retries.
+	return nil
+}
+
+// pendingFeedbackV2 returns a feedback frame with the current missing packet ranges.
+// The frame is truncated from the oldest packet numbers until it fits into an
+// ACK-only packet; the newest missing packets are the ones most likely to still be
+// inside the sender's window, so they survive the truncation.
+func (d *fecWindowDecoder) pendingFeedbackV2(now monotime.Time, maxPacketSize protocol.ByteCount) *wire.FECFeedbackV2Frame {
+	if !d.feedbackDue(now) {
+		return nil
+	}
+	ranges := d.missingRanges()
+	// Estimate how long the oldest missing packet has been waiting when this report
+	// leaves the decoder. The wire format carries no timestamp, so this is the
+	// receiver-side half of the feedback latency P4 asks to observe; adding the link
+	// delay to the sender gives the full value.
+	var feedbackLatency time.Duration
+	for _, r := range ranges {
+		for pn := uint64(r.FirstPacketNumber); pn < uint64(r.FirstPacketNumber)+r.Count; pn++ {
+			if first, ok := d.missing[protocol.PacketNumber(pn)]; ok {
+				if age := now.Sub(first); age > feedbackLatency {
+					feedbackLatency = age
+				}
+			}
+		}
+	}
+	if feedbackLatency > 0 {
+		d.state.feedbackLatencyNanos.Store(int64(feedbackLatency))
+	}
+	if slices.Equal(ranges, d.reportedMissing) {
+		// The same snapshot again carries no new information. Keep sending the
+		// cumulative counters so a lost feedback packet is still recovered, but drop
+		// the repeated ranges.
+		ranges = nil
+	}
+	frame := &wire.FECFeedbackV2Frame{
+		ReceivedPackets:  d.tracker.received,
+		LostPackets:      d.tracker.cumulativeLost,
+		RecoveredPackets: d.state.recoveredRecv.Load(),
+		FailedPackets:    d.state.failedRecv.Load(),
+		ParityPackets:    d.state.parityRecv.Load(),
+		MissingRanges:    append([]wire.FECFeedbackV2Range(nil), ranges...),
+	}
+	if maxPacketSize > 0 {
+		for frame.Length(protocol.Version1)+fecMaxPacketOverhead > maxPacketSize && len(frame.MissingRanges) > 0 {
+			first := &frame.MissingRanges[0]
+			first.FirstPacketNumber++
+			first.Count--
+			if first.Count == 0 {
+				frame.MissingRanges = frame.MissingRanges[1:]
+			}
+		}
+		if frame.Length(protocol.Version1)+fecMaxPacketOverhead > maxPacketSize {
+			// The cumulative counters alone don't fit: let the caller fall back to v1,
+			// whose counters may be encoded in fewer bytes, instead of dropping the
+			// report entirely.
+			return nil
+		}
+	}
+	d.markFeedbackSent(now)
+	if len(frame.MissingRanges) > 0 {
+		d.reportedMissing = append(d.reportedMissing[:0], frame.MissingRanges...)
+	} else {
+		d.reportedMissing = nil
+	}
+	return frame
+}
+
+// missingRanges builds the current missing-packet ranges for a FEC_FEEDBACK_V2
+// frame. Only packet numbers that a repair row announced as protected are reported:
+// the cumulative lost evidence counter already covers unprotected gaps in the packet
+// number sequence. Ranges that are at most fecWindowFeedbackMergeGap packet numbers
+// apart are merged to keep the frame small; the newest missing packets are kept when
+// the snapshot is capped, because old ones are the ones most likely to have left the
+// sender's window already.
+func (d *fecWindowDecoder) missingRanges() []wire.FECFeedbackV2Range {
+	if len(d.missing) == 0 {
+		return nil
+	}
+	packetNumbers := make([]protocol.PacketNumber, 0, len(d.missing))
+	for pn := range d.missing {
+		if d.protected != nil {
+			if _, ok := d.protected[pn]; !ok {
+				continue
+			}
+		}
+		packetNumbers = append(packetNumbers, pn)
+	}
+	if len(packetNumbers) == 0 {
+		return nil
+	}
+	slices.Sort(packetNumbers)
+	if len(packetNumbers) > fecWindowFeedbackMaxMissing {
+		packetNumbers = packetNumbers[len(packetNumbers)-fecWindowFeedbackMaxMissing:]
+	}
+	ranges := make([]wire.FECFeedbackV2Range, 0, len(packetNumbers))
+	for _, pn := range packetNumbers {
+		if len(ranges) == 0 {
+			ranges = append(ranges, wire.FECFeedbackV2Range{FirstPacketNumber: pn, Count: 1})
+			continue
+		}
+		last := &ranges[len(ranges)-1]
+		lastEnd := uint64(last.FirstPacketNumber) + last.Count - 1
+		if uint64(pn) <= lastEnd {
+			continue
+		}
+		if uint64(pn)-lastEnd-1 <= fecWindowFeedbackMergeGap {
+			last.Count = uint64(pn) - uint64(last.FirstPacketNumber) + 1
+			continue
+		}
+		ranges = append(ranges, wire.FECFeedbackV2Range{FirstPacketNumber: pn, Count: 1})
+	}
+	// The packet number cap above is a cap on missing numbers, while Count counts the
+	// span including merged gaps. Trim the oldest ranges until the frame is within the
+	// wire cap as well.
+	total := uint64(0)
+	for _, r := range ranges {
+		total += r.Count
+	}
+	for total > fecWindowFeedbackMaxMissing && len(ranges) > 0 {
+		drop := total - fecWindowFeedbackMaxMissing
+		if ranges[0].Count <= drop {
+			total -= ranges[0].Count
+			ranges = ranges[1:]
+			continue
+		}
+		ranges[0].FirstPacketNumber += protocol.PacketNumber(drop)
+		ranges[0].Count -= drop
+		total = fecWindowFeedbackMaxMissing
+	}
+	if len(ranges) > fecWindowFeedbackMaxRanges {
+		ranges = ranges[len(ranges)-fecWindowFeedbackMaxRanges:]
+	}
+	if len(ranges) == 0 {
+		return nil
+	}
+	return ranges
 }

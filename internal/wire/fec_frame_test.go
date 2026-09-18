@@ -37,7 +37,7 @@ func TestFECFeedbackFrameRoundTrip(t *testing.T) {
 
 func TestFECFrameTypesAccepted(t *testing.T) {
 	parser := NewFrameParser(false, false, false)
-	for _, frameType := range []FrameType{FrameTypeFECFeedback, FrameTypeFECWindowRepair, FrameTypeFECRecovered} {
+	for _, frameType := range []FrameType{FrameTypeFECFeedback, FrameTypeFECFeedbackV2, FrameTypeFECWindowRepair, FrameTypeFECWindowRepairMulti, FrameTypeFECRecovered} {
 		typ, _, err := parser.ParseType([]byte{byte(frameType)}, protocol.Encryption1RTT)
 		if err != nil {
 			t.Fatalf("frame type %#x rejected at 1-RTT: %v", frameType, err)
@@ -246,4 +246,192 @@ func TestFECRecoveredFrameRejectsInvalid(t *testing.T) {
 	if _, _, err := parseFECRecoveredFrame(data[1:], protocol.Version1); err == nil {
 		t.Fatal("a zero length recovered packet was accepted")
 	}
+}
+
+func TestFECFeedbackV2RoundTrip(t *testing.T) {
+frame := &FECFeedbackV2Frame{
+ReceivedPackets:  1234,
+LostPackets:      17,
+RecoveredPackets: 12,
+FailedPackets:    3,
+ParityPackets:    99,
+MissingRanges: []FECFeedbackV2Range{
+{FirstPacketNumber: 100, Count: 1},
+{FirstPacketNumber: 104, Count: 8},
+{FirstPacketNumber: 130, Count: 3},
+},
+}
+data, err := frame.Append(nil, protocol.Version1)
+if err != nil {
+t.Fatal(err)
+}
+if frame.Length(protocol.Version1) != protocol.ByteCount(len(data)) {
+t.Fatalf("length mismatch: %d vs %d", frame.Length(protocol.Version1), len(data))
+}
+parsed, n, err := parseFECFeedbackV2Frame(data[1:], protocol.Version1)
+if err != nil {
+t.Fatal(err)
+}
+if n != len(data)-1 {
+t.Fatalf("expected to consume %d bytes, consumed %d", len(data)-1, n)
+}
+if parsed.ReceivedPackets != frame.ReceivedPackets ||
+parsed.LostPackets != frame.LostPackets ||
+parsed.RecoveredPackets != frame.RecoveredPackets ||
+parsed.FailedPackets != frame.FailedPackets ||
+parsed.ParityPackets != frame.ParityPackets ||
+len(parsed.MissingRanges) != len(frame.MissingRanges) {
+t.Fatalf("unexpected frame: %+v", parsed)
+}
+for i := range frame.MissingRanges {
+if parsed.MissingRanges[i] != frame.MissingRanges[i] {
+t.Fatalf("unexpected range at index %d: %+v", i, parsed.MissingRanges[i])
+}
+}
+reencoded, err := parsed.Append(nil, protocol.Version1)
+if err != nil {
+t.Fatal(err)
+}
+if !bytes.Equal(reencoded, data) {
+t.Fatal("re-encoded frame differs")
+}
+}
+
+func TestFECFeedbackV2TruncatedAndMalformed(t *testing.T) {
+if _, _, err := parseFECFeedbackV2Frame(nil, protocol.Version1); err == nil {
+t.Fatal("expected an error for an empty frame")
+}
+valid := &FECFeedbackV2Frame{
+ReceivedPackets:  1,
+MissingRanges:    []FECFeedbackV2Range{{FirstPacketNumber: 7, Count: 3}, {FirstPacketNumber: 12, Count: 1}},
+}
+data, err := valid.Append(nil, protocol.Version1)
+if err != nil {
+t.Fatal(err)
+}
+for i := 1; i < len(data); i++ {
+if _, _, err := parseFECFeedbackV2Frame(data[1:i], protocol.Version1); err == nil {
+t.Fatalf("truncated frame at %d bytes accepted", i)
+}
+}
+invalid := []FECFeedbackV2Frame{
+{MissingRanges: []FECFeedbackV2Range{{FirstPacketNumber: 5, Count: 0}}},
+{MissingRanges: []FECFeedbackV2Range{{FirstPacketNumber: 5, Count: 1}, {FirstPacketNumber: 5, Count: 1}}},
+{MissingRanges: []FECFeedbackV2Range{{FirstPacketNumber: 5, Count: 2}, {FirstPacketNumber: 4, Count: 1}}},
+}
+for _, frame := range invalid {
+data, err := frame.Append(nil, protocol.Version1)
+if err != nil {
+t.Fatal(err)
+}
+if _, _, err := parseFECFeedbackV2Frame(data[1:], protocol.Version1); err == nil {
+t.Fatalf("invalid frame accepted: %+v", frame)
+}
+}
+// A range that would cross the maximum packet number is rejected before it can be
+// turned into a packet number.
+overflow := quicvarint.Append(nil, 0)
+overflow = quicvarint.Append(overflow, 0)
+overflow = quicvarint.Append(overflow, 0)
+overflow = quicvarint.Append(overflow, 0)
+overflow = quicvarint.Append(overflow, 0)
+overflow = quicvarint.Append(overflow, 1)
+overflow = quicvarint.Append(overflow, maxFECPacketNumber)
+overflow = quicvarint.Append(overflow, 2)
+if _, _, err := parseFECFeedbackV2Frame(overflow, protocol.Version1); err == nil {
+t.Fatal("overflowing missing range accepted")
+}
+}
+
+func TestFECFeedbackV2TooManyRanges(t *testing.T) {
+ranges := make([]FECFeedbackV2Range, MaxFECFeedbackV2Ranges+1)
+for i := range ranges {
+ranges[i] = FECFeedbackV2Range{FirstPacketNumber: protocol.PacketNumber(i * 10), Count: 1}
+}
+frame := &FECFeedbackV2Frame{MissingRanges: ranges}
+data, err := frame.Append(nil, protocol.Version1)
+if err != nil {
+t.Fatal(err)
+}
+if _, _, err := parseFECFeedbackV2Frame(data[1:], protocol.Version1); err == nil {
+t.Fatal("expected an error for too many missing ranges")
+}
+}
+
+func TestFECFeedbackV2FitsIntoAckOnlyPacket(t *testing.T) {
+frame := &FECFeedbackV2Frame{
+ReceivedPackets:  maxFECPacketNumber,
+LostPackets:      maxFECPacketNumber,
+RecoveredPackets: maxFECPacketNumber,
+FailedPackets:    maxFECPacketNumber,
+ParityPackets:    maxFECPacketNumber,
+}
+for i := 0; i < MaxFECFeedbackV2Ranges; i++ {
+frame.MissingRanges = append(frame.MissingRanges, FECFeedbackV2Range{
+FirstPacketNumber: protocol.PacketNumber(i * 17),
+Count:             MaxFECFeedbackV2MissingPackets / MaxFECFeedbackV2Ranges,
+})
+}
+if length := frame.Length(protocol.Version1); length > 512 {
+t.Fatalf("FEC_FEEDBACK_V2 with %d ranges is %d bytes, too large for an ACK-only packet", len(frame.MissingRanges), length)
+}
+}
+
+func TestFECMultiWindowRepairFrameRoundTrip(t *testing.T) {
+for _, memberCount := range []int{2, 8, 64} {
+frame := &FECMultiWindowRepairFrame{
+WindowID: 3,
+FECWindowRepairFrame: FECWindowRepairFrame{
+Row:               77,
+FirstPacketNumber: 9000,
+Span:              uint64(2*memberCount - 1),
+ParityLength:      1200,
+LengthParity:      [2]byte{0xab, 0xcd},
+Parity:            bytes.Repeat([]byte{0x3c}, 1200),
+},
+}
+for i := 0; i < memberCount; i++ {
+frame.PacketNumbers = append(frame.PacketNumbers, protocol.PacketNumber(9000+i*2))
+}
+data, err := frame.Append(nil, protocol.Version1)
+if err != nil {
+t.Fatal(err)
+}
+if frame.Length(protocol.Version1) != protocol.ByteCount(len(data)) {
+t.Fatalf("%d members: length mismatch: %d vs %d", memberCount, frame.Length(protocol.Version1), len(data))
+}
+if data[0] != byte(FrameTypeFECWindowRepairMulti) {
+t.Fatalf("unexpected frame type: %#x", data[0])
+}
+parsed, n, err := parseFECMultiWindowRepairFrame(data[1:], protocol.Version1)
+if err != nil {
+t.Fatalf("%d members: %v", memberCount, err)
+}
+if n != len(data)-1 {
+t.Fatalf("%d members: expected to consume %d bytes, consumed %d", memberCount, len(data)-1, n)
+}
+if parsed.WindowID != frame.WindowID || parsed.Row != frame.Row ||
+parsed.FirstPacketNumber != frame.FirstPacketNumber || parsed.Span != frame.Span ||
+parsed.ParityLength != frame.ParityLength || parsed.LengthParity != frame.LengthParity {
+t.Fatalf("unexpected parsed frame: %+v", parsed)
+}
+if len(parsed.PacketNumbers) != len(frame.PacketNumbers) {
+t.Fatalf("unexpected packet numbers: %v", parsed.PacketNumbers)
+}
+for i := range frame.PacketNumbers {
+if parsed.PacketNumbers[i] != frame.PacketNumbers[i] {
+t.Fatalf("unexpected packet number at index %d: %d", i, parsed.PacketNumbers[i])
+}
+}
+if !bytes.Equal(parsed.Parity, frame.Parity) {
+t.Fatal("parity mismatch")
+}
+reencoded, err := parsed.Append(nil, protocol.Version1)
+if err != nil {
+t.Fatal(err)
+}
+if !bytes.Equal(reencoded, data) {
+t.Fatalf("%d members: re-encoded frame differs", memberCount)
+}
+}
 }

@@ -1171,3 +1171,296 @@ func TestFECCoverageRowsStayWithinRowBases(t *testing.T) {
 		}
 	}
 }
+
+func TestFECMissingRangesMergeAndCap(t *testing.T) {
+state := newFECWindowState(FECConfig{MaxGroupSize: 128})
+decoder := state.decoder
+now := monotime.Now()
+decoder.missing = make(map[protocol.PacketNumber]monotime.Time)
+for _, pn := range []protocol.PacketNumber{100, 101, 102, 105, 109, 120} {
+decoder.markProtected(pn)
+decoder.missing[pn] = now
+}
+ranges := decoder.missingRanges()
+if len(ranges) != 2 {
+t.Fatalf("expected 2 merged ranges, got %+v", ranges)
+}
+if ranges[0] != (wire.FECFeedbackV2Range{FirstPacketNumber: 100, Count: 10}) {
+t.Fatalf("unexpected merged range: %+v", ranges[0])
+}
+if ranges[1] != (wire.FECFeedbackV2Range{FirstPacketNumber: 120, Count: 1}) {
+t.Fatalf("unexpected gap range: %+v", ranges[1])
+}
+
+// More than fecWindowFeedbackMaxMissing packet numbers and more than
+// fecWindowFeedbackMaxRanges ranges: only the newest packets/ranges survive.
+state = newFECWindowState(FECConfig{MaxGroupSize: 128})
+decoder = state.decoder
+decoder.missing = make(map[protocol.PacketNumber]monotime.Time)
+for i := 0; i < 256; i++ {
+pn := protocol.PacketNumber(1000 + i*5)
+decoder.markProtected(pn)
+decoder.missing[pn] = now
+}
+ranges = decoder.missingRanges()
+if len(ranges) > fecWindowFeedbackMaxRanges {
+t.Fatalf("missing ranges exceed the cap: %d", len(ranges))
+}
+total := uint64(0)
+for _, r := range ranges {
+total += r.Count
+}
+if total > fecWindowFeedbackMaxMissing {
+t.Fatalf("missing packet count exceeds the cap: %d", total)
+}
+if got := ranges[len(ranges)-1].FirstPacketNumber; got != 1000+255*5 {
+t.Fatalf("newest missing packet was not kept: last range starts at %d", got)
+}
+}
+
+func TestFECV2SchedulesBurstOnlyForPacketsStillInWindow(t *testing.T) {
+state := newFECWindowState(FECConfig{MaxOverheadPercent: 30, MaxGroupSize: 16})
+state.encoder.setRate(0.001)
+now := monotime.Now()
+for i := 0; i < 16; i++ {
+pn := protocol.PacketNumber(1000 + i)
+state.encoder.addPacket(pn, bytes.Repeat([]byte{0x5a}, 1200), 1452, now, true)
+}
+state.encoder.onFeedbackV2(&wire.FECFeedbackV2Frame{
+ReceivedPackets: 16,
+LostPackets:     2,
+MissingRanges: []wire.FECFeedbackV2Range{
+{FirstPacketNumber: 900, Count: 1}, // already outside the window
+{FirstPacketNumber: 1010, Count: 1},
+},
+}, now.Add(time.Millisecond))
+stats := state.stats()
+if stats.MissingRangesReceived != 2 || stats.MissingPacketsInWindow != 1 {
+t.Fatalf("unexpected missing range statistics: %+v", stats)
+}
+if stats.RepairBurstRowsScheduled != 2 {
+t.Fatalf("expected 2 scheduled burst rows for the in-window loss, got %d", stats.RepairBurstRowsScheduled)
+}
+if stats.RepairBurstRowsSkippedNoWindow != 2 {
+t.Fatalf("expected 2 rows attributed to the stale loss, got %d", stats.RepairBurstRowsSkippedNoWindow)
+}
+frame := state.encoder.pendingFrame(now.Add(2*time.Millisecond), 1452)
+if frame == nil {
+t.Fatal("no repair burst row was emitted")
+}
+row, ok := frame.(*wire.FECWindowRepairFrame)
+if !ok {
+t.Fatalf("unexpected frame type %T", frame)
+}
+found := false
+for _, pn := range row.PacketNumbers {
+if pn == 900 {
+t.Fatal("repair row protects a packet that already left the window")
+}
+if pn == 1010 {
+found = true
+}
+}
+if !found {
+t.Fatalf("repair row does not protect the in-window missing packet: %v", row.PacketNumbers)
+}
+}
+
+func TestFECV2CompatibleWithV1CounterEstimation(t *testing.T) {
+config := FECConfig{MaxOverheadPercent: 30, MaxGroupSize: 16}
+now := monotime.Now()
+v1 := newFECWindowState(config)
+v2 := newFECWindowState(config)
+v1.encoder.setRate(0.001)
+v2.encoder.setRate(0.001)
+// The first report of each encoder establishes the cumulative baseline. The v2
+// report names a packet that is not even protected, but its cumulative lost
+// counter has to drive the same estimator as v1.
+v1.encoder.onFeedback(&wire.FECFeedbackFrame{}, now)
+v2.encoder.onFeedbackV2(&wire.FECFeedbackV2Frame{}, now)
+v1.encoder.onFeedback(&wire.FECFeedbackFrame{ReceivedPackets: 64, LostPackets: 16}, now.Add(time.Second))
+v2.encoder.onFeedbackV2(&wire.FECFeedbackV2Frame{
+ReceivedPackets: 64,
+LostPackets:     16,
+MissingRanges:   []wire.FECFeedbackV2Range{{FirstPacketNumber: 900, Count: 1}},
+}, now.Add(time.Second))
+if v1.encoder.sampleReceived != v2.encoder.sampleReceived || v1.encoder.sampleLost != v2.encoder.sampleLost {
+t.Fatalf("v2 counters diverged: v1 sample %d/%d, v2 sample %d/%d",
+v1.encoder.sampleReceived, v1.encoder.sampleLost, v2.encoder.sampleReceived, v2.encoder.sampleLost)
+}
+if v1.encoder.peerLoss != v2.encoder.peerLoss {
+t.Fatalf("v2 loss estimate diverged: v1 %v, v2 %v", v1.encoder.peerLoss, v2.encoder.peerLoss)
+}
+}
+
+func TestFECAdaptiveWindowFollowsRTTAndRate(t *testing.T) {
+state := newFECWindowState(FECConfig{AdaptiveWindow: true, MaxGroupSize: 128})
+encoder := state.encoder
+encoder.setRate(0.001)
+encoder.setRTT(5 * time.Millisecond)
+now := monotime.Now()
+data := bytes.Repeat([]byte{0x5a}, 1200)
+// 1ms packet interval = 1000 pps; 5ms RTT means a bandwidth-delay product of 5
+// packets, so the target is clamped to the 64 packet lower bound.
+for i := 0; i < 1200; i++ {
+now = now.Add(time.Millisecond)
+encoder.addPacket(protocol.PacketNumber(1000+i), data, 1452, now, true)
+}
+if encoder.windowSize != 64 {
+t.Fatalf("fast/lossy path window is %d, want 64", encoder.windowSize)
+}
+if stats := state.stats(); stats.WindowSize != 64 || stats.WindowMaxSize != 128 || !stats.AdaptiveWindow {
+t.Fatalf("adaptive window statistics are wrong: %+v", stats)
+}
+
+// 100ms RTT at the same rate targets 150 packets, clamped back to the configured
+// maximum of 128.
+encoder.setRTT(100 * time.Millisecond)
+for i := 0; i < 1200; i++ {
+now = now.Add(time.Millisecond)
+encoder.addPacket(protocol.PacketNumber(5000+i), data, 1452, now, true)
+}
+if encoder.windowSize != 128 {
+t.Fatalf("high RTT path window is %d, want 128", encoder.windowSize)
+}
+}
+
+func TestFECAdaptiveWindowHysteresis(t *testing.T) {
+state := newFECWindowState(FECConfig{AdaptiveWindow: true, MaxGroupSize: 128})
+encoder := state.encoder
+encoder.averageInterval = float64(time.Millisecond)
+now := monotime.Now()
+// 73ms RTT at 1000 pps targets 110 packets: a 14% change from the initial 128
+// window, below the 20% threshold. Even after two seconds it must not move.
+encoder.setRTT(73 * time.Millisecond)
+encoder.updateAdaptiveWindow(now)
+encoder.updateAdaptiveWindow(now.Add(2 * time.Second))
+if encoder.windowSize != 128 {
+t.Fatalf("a change under the hysteresis threshold moved the window to %d", encoder.windowSize)
+}
+// A large target only wins after it has been stable for a whole second.
+encoder.setRTT(5 * time.Millisecond)
+encoder.updateAdaptiveWindow(now.Add(2 * time.Second))
+encoder.updateAdaptiveWindow(now.Add(2500 * time.Millisecond))
+if encoder.windowSize != 128 {
+t.Fatalf("a target younger than one second moved the window to %d", encoder.windowSize)
+}
+encoder.updateAdaptiveWindow(now.Add(3200 * time.Millisecond))
+if encoder.windowSize != 64 {
+t.Fatalf("a stable low-BDP target did not shrink the window: %d", encoder.windowSize)
+}
+}
+
+func TestFECMultiWindowAssignment(t *testing.T) {
+state := newFECWindowState(FECConfig{MultiWindow: true, MultiWindowCount: 4, MaxGroupSize: 16})
+encoder := state.encoder
+if encoder.effectiveWindowCount() != 4 {
+t.Fatalf("window count is %d, want 4", encoder.effectiveWindowCount())
+}
+if encoder.evictMaxMembers() != 64 {
+t.Fatalf("effective member capacity is %d, want 64", encoder.evictMaxMembers())
+}
+for pn := protocol.PacketNumber(0); pn < 16; pn++ {
+if got := encoder.windowForPacket(pn); got != int(pn)%4 {
+t.Fatalf("packet %d assigned to window %d, want %d", pn, got, int(pn)%4)
+}
+}
+now := monotime.Now()
+for i := 0; i < 32; i++ {
+pn := protocol.PacketNumber(1000 + i)
+encoder.members = append(encoder.members, fecWindowMember{packetNumber: pn, data: []byte{byte(i)}})
+}
+for windowID := 0; windowID < 4; windowID++ {
+members := encoder.membersForWindow(windowID)
+if len(members) != 8 {
+t.Fatalf("window %d has %d members, want 8", windowID, len(members))
+}
+for _, member := range members {
+if int(member.packetNumber)%4 != windowID {
+t.Fatalf("member %d leaked into window %d", member.packetNumber, windowID)
+}
+}
+}
+_ = now
+}
+
+func TestFECMultiWindowBudgetShared(t *testing.T) {
+state := newFECWindowState(FECConfig{MultiWindow: true, MultiWindowCount: 2, MaxGroupSize: 8, MaxOverheadPercent: 100})
+encoder := state.encoder
+// All sub-windows share one byte wallet and one burst bound: a noisy sub-window
+// must not be able to spend the other sub-window's budget.
+encoder.credit = 10000
+encoder.scheduleRepairBurstForWindow(8, 0)
+queued := len(encoder.burstWindows)
+if queued == 0 {
+t.Fatal("no burst rows were queued")
+}
+encoder.scheduleRepairBurstForWindow(8, 1)
+if len(encoder.burstWindows) != queued*2 {
+t.Fatalf("the second sub-window did not queue through the same burst bound: %d vs %d", len(encoder.burstWindows), queued*2)
+}
+// The burst bound is global: the second schedule can not push the total past it.
+encoder.scheduleRepairBurstForWindow(8, 0)
+encoder.scheduleRepairBurstForWindow(8, 1)
+maxBurstRows := uint64(encoder.windowSize * encoder.effectiveWindowCount() * fecWindowMaxRepairBurstFactor)
+if got := uint64(len(encoder.burstWindows)); got > maxBurstRows {
+t.Fatalf("burst queue exceeded the shared bound: %d > %d", got, maxBurstRows)
+}
+if stats := state.stats(); stats.WindowCount != 2 {
+t.Fatalf("window count not reported: %+v", stats)
+}
+}
+
+func TestFECMultiWindowRecoversLosses(t *testing.T) {
+config := FECConfig{MultiWindow: true, MultiWindowCount: 2, MaxGroupSize: 16, MaxOverheadPercent: 100, MaxParityRows: 2}
+sender := newFECWindowState(config)
+receiver := newFECWindowState(config)
+sender.encoder.setRate(1)
+now := monotime.Now()
+packets := make(map[protocol.PacketNumber][]byte)
+lost := map[protocol.PacketNumber]bool{1000: true, 1001: true}
+var recovered []fecRecoveredPacket
+rows := 0
+for i := 0; i < 40; i++ {
+pn := protocol.PacketNumber(1000 + i)
+data := randomPacket(t, 700)
+packets[pn] = data
+sender.encoder.addPacket(pn, data, 1452, now, true)
+if !lost[pn] {
+recovered = append(recovered, receiver.decoder.recordPacket(pn, data, protocol.KeyPhaseZero)...)
+}
+for {
+frame := sender.encoder.pendingFrame(now, 1452)
+if frame == nil {
+break
+}
+multi, ok := frame.(*wire.FECMultiWindowRepairFrame)
+if !ok {
+t.Fatalf("unexpected FEC frame type %T", frame)
+}
+rows++
+recovered = append(recovered, receiver.decoder.handleMultiRepair(multi, now)...)
+}
+}
+if rows == 0 {
+t.Fatal("no multi-window repair rows were emitted")
+}
+requireFECWindowRecovered(t, packets, recovered, []protocol.PacketNumber{1000, 1001})
+}
+
+func TestFECRepairBurstRowsPerLoss(t *testing.T) {
+state := newFECWindowState(FECConfig{RepairBurstRowsPerLoss: 1.5, MaxGroupSize: 16})
+if got := state.encoder.repairBurstRowsPerLoss; got != 1.5 {
+t.Fatalf("configured rows-per-loss factor is %v, want 1.5", got)
+}
+if got := state.encoder.repairBurstRowsFor(1); got != 2 {
+t.Fatalf("1 lost packet at 1.5 rows/loss scheduled %d rows, want 2", got)
+}
+if got := state.encoder.repairBurstRowsFor(2); got != 3 {
+t.Fatalf("2 lost packets at 1.5 rows/loss scheduled %d rows, want 3", got)
+}
+state = newFECWindowState(FECConfig{RepairBurstRowsPerLoss: 2.5, MaxGroupSize: 16})
+if got := state.encoder.repairBurstRowsFor(1); got != 3 {
+t.Fatalf("1 lost packet at 2.5 rows/loss scheduled %d rows, want 3", got)
+}
+}
