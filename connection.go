@@ -961,7 +961,7 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
 	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
 	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
 	c.mtuDiscoverer.Reset(initialPacketSize, c.maxMTU())
-	c.conn = newSendConn(tr.conn, c.conn.RemoteAddr(), udp.PacketInfo{}, utils.DefaultLogger) // TODO: find a better way
+	c.conn = newSendConn(tr.conn, c.conn.RemoteAddr(), udp.PacketInfo{}, utils.DefaultLogger, c.config.DisableGSO) // TODO: find a better way
 	if !c.config.DisablePathMTUDiscovery && c.conn.capabilities().DF {
 		c.mtuDiscoverer.Start(now)
 	}

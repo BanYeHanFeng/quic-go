@@ -109,6 +109,7 @@ func populateConfig(config *Config) *Config {
 		maxIncomingUniStreams = 0
 	}
 	return &Config{
+		DisableGSO:                       config.DisableGSO,
 		GetConfigForClient:               config.GetConfigForClient,
 		Versions:                         versions,
 		HandshakeIdleTimeout:             handshakeIdleTimeout,
