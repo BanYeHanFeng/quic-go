@@ -259,7 +259,7 @@ func (t *Transport) dial(ctx context.Context, addr net.Addr, host string, tlsCon
 		initialPacketNumber = 1
 	}
 	return t.doDial(ctx,
-		newSendConn(t.conn, addr, packetInfo{}, utils.DefaultLogger),
+		newSendConn(t.conn, addr, packetInfo{}, utils.DefaultLogger, conf.DisableGSO),
 		tlsConf,
 		conf,
 		initialPacketNumber,

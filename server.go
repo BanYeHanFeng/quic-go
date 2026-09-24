@@ -771,6 +771,7 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 			return nil
 		}
 		config = populateConfig(conf)
+		config.DisableGSO = config.DisableGSO || s.config.DisableGSO
 	}
 
 	var conn *wrappedConn
@@ -817,7 +818,7 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 	conn = s.newConn(
 		ctx,
 		cancel,
-		newSendConn(s.conn, p.remoteAddr, p.info, s.logger),
+		newSendConn(s.conn, p.remoteAddr, p.info, s.logger, config.DisableGSO),
 		s.tr,
 		origDestConnID,
 		retrySrcConnID,

@@ -100,6 +100,11 @@ type ConnectionIDGenerator interface {
 
 // Config contains all configuration data needed for a QUIC server or client.
 type Config struct {
+	// DisableGSO disables Generic Segmentation Offload for this connection's sends.
+	// It does not disable ECN, path MTU discovery, or batched receives. A false
+	// value still respects platform support and QUIC_GO_DISABLE_GSO. On a server,
+	// a true value also applies to configurations returned by GetConfigForClient.
+	DisableGSO bool
 	// GetConfigForClient is called for incoming connections.
 	// If the error is not nil, the connection attempt is refused.
 	GetConfigForClient func(info *ClientInfo) (*Config, error)

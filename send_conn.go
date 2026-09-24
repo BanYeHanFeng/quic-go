@@ -37,6 +37,7 @@ type sconn struct {
 
 	// If GSO enabled, and we receive a GSO error for this remote address, GSO is disabled.
 	gotGSOError bool
+	disableGSO  bool
 	// Used to catch the error sometimes returned by the first sendmsg call on Linux,
 	// see https://github.com/golang/go/issues/63322.
 	wroteFirstPacket bool
@@ -44,7 +45,7 @@ type sconn struct {
 
 var _ sendConn = &sconn{}
 
-func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logger) *sconn {
+func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logger, disableGSO bool) *sconn {
 	localAddr := c.LocalAddr()
 	if info.addr.IsValid() {
 		if udpAddr, ok := localAddr.(*net.UDPAddr); ok {
@@ -59,9 +60,10 @@ func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logge
 	l := len(oob)
 	oob = append(oob, make([]byte, 64)...)[:l]
 	sc := &sconn{
-		rawConn:   c,
-		localAddr: localAddr,
-		logger:    logger,
+		rawConn:    c,
+		disableGSO: disableGSO,
+		localAddr:  localAddr,
+		logger:     logger,
 	}
 	sc.remoteAddrInfo.Store(&remoteAddrInfo{
 		addr: remote,
@@ -109,7 +111,7 @@ func (c *sconn) WriteTo(b []byte, addr net.Addr, info packetInfo) error {
 func (c *sconn) capabilities() connCapabilities {
 	capabilities := c.rawConn.capabilities()
 	if capabilities.GSO {
-		capabilities.GSO = !c.gotGSOError
+		capabilities.GSO = !c.disableGSO && !c.gotGSOError
 	}
 	return capabilities
 }

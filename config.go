@@ -125,6 +125,7 @@ func populateConfig(config *Config) *Config {
 	}
 
 	return &Config{
+		DisableGSO:                       config.DisableGSO,
 		GetConfigForClient:               config.GetConfigForClient,
 		Versions:                         versions,
 		HandshakeIdleTimeout:             handshakeIdleTimeout,
