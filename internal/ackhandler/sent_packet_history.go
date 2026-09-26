@@ -137,6 +137,21 @@ func (h *sentPacketHistory) NumOutstanding() int {
 	return h.numOutstanding
 }
 
+// OutstandingPackets returns the packet numbers of the packets which are still
+// waiting to be acknowledged or declared lost, in ascending order.
+func (h *sentPacketHistory) OutstandingPackets() []protocol.PacketNumber {
+	if h.numOutstanding == 0 {
+		return nil
+	}
+	packets := make([]protocol.PacketNumber, 0, h.numOutstanding)
+	for i, p := range h.packets {
+		if p != nil && p.Outstanding() {
+			packets = append(packets, h.firstPacketNumber+protocol.PacketNumber(i))
+		}
+	}
+	return packets
+}
+
 // Remove removes a packet from the sent packet history.
 // It must not be used for skipped packet numbers.
 func (h *sentPacketHistory) Remove(pn protocol.PacketNumber) error {
