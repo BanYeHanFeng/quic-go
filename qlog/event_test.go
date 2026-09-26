@@ -41,6 +41,28 @@ func TestPacketLostEncodesAckEliciting(t *testing.T) {
 	}
 }
 
+// TestSpuriousLossEncodesTrigger covers the attribution of a spurious loss. A
+// spurious loss recorded without the detector that produced it only says that
+// detection was wrong, so the field must not silently disappear.
+func TestSpuriousLossEncodesTrigger(t *testing.T) {
+	encoded := encodeEvent(t, SpuriousLoss{
+		PacketNumber:     9,
+		PacketReordering: 4,
+		TimeReordering:   12 * time.Millisecond,
+		Trigger:          PacketLossReorderingThreshold,
+	})
+	if !strings.Contains(encoded, `"trigger":"reordering_threshold"`) {
+		t.Errorf("spurious_loss %s does not report its trigger", encoded)
+	}
+
+	// A loss recorded before this field existed has no trigger, and the event
+	// has to stay valid (and unchanged) in that case.
+	encoded = encodeEvent(t, SpuriousLoss{PacketNumber: 9})
+	if strings.Contains(encoded, `"trigger"`) {
+		t.Errorf("spurious_loss %s reports a trigger it does not have", encoded)
+	}
+}
+
 // TestLossTimerUpdatedEncodesOutstandingPackets covers the packet numbers of a
 // PTO expiry: they are what makes a loss which was never declared visible, so
 // the array has to be encoded exactly when it is known.
