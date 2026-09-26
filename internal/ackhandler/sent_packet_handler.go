@@ -916,37 +916,18 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 		}
 
 		var packetLost bool
+		var packetLossTrigger qlog.PacketLossReason
 		if !p.SendTime.After(lostSendTime) {
 			packetLost = true
-			if !p.isPathProbePacket && p.IsAckEliciting() {
-				if h.logger.Debug() {
-					h.logger.Debugf("\tlost packet %d (time threshold)", pn)
-				}
-				if h.qlogger != nil {
-					h.qlogger.RecordEvent(qlog.PacketLost{
-						Header: qlog.PacketHeader{
-							PacketType:   qlog.EncryptionLevelToPacketType(p.EncryptionLevel),
-							PacketNumber: pn,
-						},
-						Trigger: qlog.PacketLossTimeThreshold,
-					})
-				}
+			packetLossTrigger = qlog.PacketLossTimeThreshold
+			if !p.isPathProbePacket && p.IsAckEliciting() && h.logger.Debug() {
+				h.logger.Debugf("\tlost packet %d (time threshold)", pn)
 			}
 		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
 			packetLost = true
-			if !p.isPathProbePacket && p.IsAckEliciting() {
-				if h.logger.Debug() {
-					h.logger.Debugf("\tlost packet %d (reordering threshold)", pn)
-				}
-				if h.qlogger != nil {
-					h.qlogger.RecordEvent(qlog.PacketLost{
-						Header: qlog.PacketHeader{
-							PacketType:   qlog.EncryptionLevelToPacketType(p.EncryptionLevel),
-							PacketNumber: pn,
-						},
-						Trigger: qlog.PacketLossReorderingThreshold,
-					})
-				}
+			packetLossTrigger = qlog.PacketLossReorderingThreshold
+			if !p.isPathProbePacket && p.IsAckEliciting() && h.logger.Debug() {
+				h.logger.Debugf("\tlost packet %d (reordering threshold)", pn)
 			}
 		} else if pnSpace.lossTime.IsZero() {
 			// Note: This conditional is only entered once per call
@@ -957,6 +938,23 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 			pnSpace.lossTime = lossTime
 		}
 		if packetLost {
+			if !p.isPathProbePacket {
+				// Every lost packet is traced, including packets which were not
+				// ack-eliciting: an ACK-only packet is lost just like any other,
+				// but its loss causes no retransmission and no congestion event,
+				// so it is marked in the event to keep the two populations
+				// apart when the trace is analysed.
+				if h.qlogger != nil {
+					h.qlogger.RecordEvent(qlog.PacketLost{
+						Header: qlog.PacketHeader{
+							PacketType:   qlog.EncryptionLevelToPacketType(p.EncryptionLevel),
+							PacketNumber: pn,
+						},
+						Trigger:      packetLossTrigger,
+						AckEliciting: p.IsAckEliciting(),
+					})
+				}
+			}
 			if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
 				h.lostPackets.Add(pn, p.SendTime)
 			}
@@ -1048,10 +1046,16 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		h.logger.Debugf("Loss detection alarm for %s fired in PTO mode. PTO count: %d", encLevel, h.ptoCount)
 	}
 	if h.qlogger != nil {
+		// A packet which is lost while it is the last one outstanding is never
+		// declared lost: time threshold detection needs a larger packet number
+		// to be acknowledged first. The PTO probe is the sender's only reaction,
+		// so the packets which were outstanding here are recorded to make those
+		// otherwise invisible losses attributable.
 		h.qlogger.RecordEvent(qlog.LossTimerUpdated{
-			Type:      qlog.LossTimerUpdateTypeExpired,
-			TimerType: qlog.TimerTypePTO,
-			EncLevel:  encLevel,
+			Type:               qlog.LossTimerUpdateTypeExpired,
+			TimerType:          qlog.TimerTypePTO,
+			EncLevel:           encLevel,
+			OutstandingPackets: ps.history.OutstandingPackets(),
 		})
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: h.ptoCount})
 	}

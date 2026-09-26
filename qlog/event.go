@@ -502,6 +502,14 @@ func (e PTOCountUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 type PacketLost struct {
 	Header  PacketHeader
 	Trigger PacketLossReason
+	// AckEliciting is false for packets which carried no ack-eliciting frame
+	// (an ACK-only packet, for example). Such a packet is still declared lost
+	// and its packet number is spent, but the loss never triggers a
+	// retransmission or a congestion event. It is reported here because the
+	// packet is just as lost as any other, and leaving it out makes the
+	// sender's own loss report look smaller than the path loss an observer
+	// derives from the packet number sets of both endpoints.
+	AckEliciting bool
 }
 
 func (e PacketLost) Name() string { return "recovery:packet_lost" }
@@ -515,6 +523,8 @@ func (e PacketLost) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	}
 	h.WriteToken(jsontext.String("trigger"))
 	h.WriteToken(jsontext.String(string(e.Trigger)))
+	h.WriteToken(jsontext.String("ack_eliciting"))
+	h.WriteToken(jsontext.Bool(e.AckEliciting))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
@@ -742,6 +752,14 @@ type LossTimerUpdated struct {
 	TimerType TimerType
 	EncLevel  EncryptionLevel
 	Time      time.Time
+	// OutstandingPackets lists the packet numbers which were still awaiting an
+	// ACK or a loss declaration when a PTO expired. A packet which is lost
+	// while it is the last one outstanding is never declared lost: loss
+	// detection needs a larger packet number to be acknowledged, so a PTO
+	// probe is sent instead and the original packet stays outstanding. This
+	// list is what makes those losses visible in the sender's own trace, where
+	// they would otherwise only show up as a packet the peer never received.
+	OutstandingPackets []protocol.PacketNumber
 }
 
 func (e LossTimerUpdated) Name() string { return "recovery:loss_timer_updated" }
@@ -758,6 +776,14 @@ func (e LossTimerUpdated) Encode(enc *jsontext.Encoder, t time.Time) error {
 	if e.Type == LossTimerUpdateTypeSet {
 		h.WriteToken(jsontext.String("delta"))
 		h.WriteToken(jsontext.Float(milliseconds(e.Time.Sub(t))))
+	}
+	if len(e.OutstandingPackets) > 0 {
+		h.WriteToken(jsontext.String("outstanding_packets"))
+		h.WriteToken(jsontext.BeginArray)
+		for _, pn := range e.OutstandingPackets {
+			h.WriteToken(jsontext.Uint(uint64(pn)))
+		}
+		h.WriteToken(jsontext.EndArray)
 	}
 	h.WriteToken(jsontext.EndObject)
 	return h.err
