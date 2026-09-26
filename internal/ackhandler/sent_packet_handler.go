@@ -598,7 +598,8 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
 	var spuriousLosses []protocol.PacketNumber
-	for pn, sendTime := range h.lostPackets.All() {
+	for pn, lost := range h.lostPackets.All() {
+		sendTime := lost.SendTime
 		ackRange := ack.AckRanges[ackRangeIdx]
 		for pn > ackRange.Largest {
 			// this should never happen, since detectSpuriousLosses is only called for ACKs that increase the largest acked
@@ -623,6 +624,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 					PacketNumber:     pn,
 					PacketReordering: uint64(packetReordering),
 					TimeReordering:   timeReordering,
+					Trigger:          lost.Trigger,
 				})
 			}
 			spuriousLosses = append(spuriousLosses, pn)
@@ -956,7 +958,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				}
 			}
 			if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-				h.lostPackets.Add(pn, p.SendTime)
+				h.lostPackets.Add(pn, p.SendTime, packetLossTrigger)
 			}
 			pnSpace.history.DeclareLost(pn)
 			if !p.isPathProbePacket && p.IsAckEliciting() {

@@ -6,11 +6,16 @@ import (
 
 	"github.com/sagernet/quic-go/internal/monotime"
 	"github.com/sagernet/quic-go/internal/protocol"
+	"github.com/sagernet/quic-go/qlog"
 )
 
 type lostPacket struct {
 	PacketNumber protocol.PacketNumber
 	SendTime     monotime.Time
+	// Trigger is the loss detection which declared this packet lost. It is
+	// kept with the packet so a spurious loss can be attributed to the
+	// detector which produced it, not just counted.
+	Trigger qlog.PacketLossReason
 }
 
 type lostPacketTracker struct {
@@ -27,13 +32,14 @@ func newLostPacketTracker(maxLength int) *lostPacketTracker {
 	}
 }
 
-func (t *lostPacketTracker) Add(p protocol.PacketNumber, sendTime monotime.Time) {
+func (t *lostPacketTracker) Add(p protocol.PacketNumber, sendTime monotime.Time, trigger qlog.PacketLossReason) {
 	if len(t.lostPackets) == t.maxLength {
 		t.lostPackets = t.lostPackets[1:]
 	}
 	t.lostPackets = append(t.lostPackets, lostPacket{
 		PacketNumber: p,
 		SendTime:     sendTime,
+		Trigger:      trigger,
 	})
 }
 
@@ -46,10 +52,10 @@ func (t *lostPacketTracker) Delete(pn protocol.PacketNumber) {
 	})
 }
 
-func (t *lostPacketTracker) All() iter.Seq2[protocol.PacketNumber, monotime.Time] {
-	return func(yield func(protocol.PacketNumber, monotime.Time) bool) {
+func (t *lostPacketTracker) All() iter.Seq2[protocol.PacketNumber, lostPacket] {
+	return func(yield func(protocol.PacketNumber, lostPacket) bool) {
 		for _, p := range t.lostPackets {
-			if !yield(p.PacketNumber, p.SendTime) {
+			if !yield(p.PacketNumber, p) {
 				return
 			}
 		}

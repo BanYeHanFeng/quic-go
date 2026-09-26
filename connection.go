@@ -3186,8 +3186,22 @@ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
 	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
 }
 
+// qlogRecorderSetter is implemented by congestion controllers which can report
+// their internal state into the connection's qlog trace. Controllers installed
+// with SetCongestionControl are not built by the connection, so they have no
+// other way to reach the trace; a controller which does not implement it is
+// simply not traced.
+type qlogRecorderSetter interface {
+	SetQlogger(qlogwriter.Recorder)
+}
+
 // SetCongestionControl replace the current congestion control algorithm with a new one.
 func (c *Conn) SetCongestionControl(cc congestion.CongestionControl) {
+	if c.qlogger != nil {
+		if setter, ok := cc.(qlogRecorderSetter); ok {
+			setter.SetQlogger(c.qlogger)
+		}
+	}
 	c.sentPacketHandler.SetCongestionControl(cc)
 }
 

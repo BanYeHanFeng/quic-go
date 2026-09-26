@@ -534,6 +534,11 @@ type SpuriousLoss struct {
 	PacketNumber     protocol.PacketNumber
 	PacketReordering uint64
 	TimeReordering   time.Duration
+	// Trigger is the loss detection which wrongly declared this packet lost.
+	// Without it, a spurious loss only shows that the detector was wrong, not
+	// which of the two detectors (time threshold, reordering threshold) to
+	// tune.
+	Trigger PacketLossReason
 }
 
 func (e SpuriousLoss) Name() string { return "recovery:spurious_loss" }
@@ -549,6 +554,10 @@ func (e SpuriousLoss) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h.WriteToken(jsontext.Uint(e.PacketReordering))
 	h.WriteToken(jsontext.String("reordering_time"))
 	h.WriteToken(jsontext.Float(milliseconds(e.TimeReordering)))
+	if e.Trigger != "" {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String(string(e.Trigger)))
+	}
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }

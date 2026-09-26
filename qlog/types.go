@@ -262,6 +262,21 @@ const (
 	CongestionStateRecovery CongestionState = "recovery"
 	// CongestionStateApplicationLimited means that the congestion controller is application limited
 	CongestionStateApplicationLimited CongestionState = "application_limited"
+
+	// The states below are BBR states. quic-go's own controllers never report
+	// them, but a controller installed with Conn.SetCongestionControl can: BBR
+	// has no slow start / congestion avoidance phase, and its mode (not its
+	// cwnd) decides how the sending rate is computed, so a trace without them
+	// cannot explain why BBR cut or raised the window.
+	//
+	// CongestionStateStartup is BBR's startup phase (high gain, exponential).
+	CongestionStateStartup CongestionState = "startup"
+	// CongestionStateDrain is BBR's drain phase, entered after startup.
+	CongestionStateDrain CongestionState = "drain"
+	// CongestionStateProbeBw is BBR's steady state, probing for more bandwidth.
+	CongestionStateProbeBw CongestionState = "probe_bw"
+	// CongestionStateProbeRtt is BBR's periodic RTT probe at the minimum window.
+	CongestionStateProbeRtt CongestionState = "probe_rtt"
 )
 
 func (s CongestionState) String() string {
