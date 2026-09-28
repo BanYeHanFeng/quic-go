@@ -815,8 +815,14 @@ func (h *sentPacketHandler) setLossDetectionTimer(now monotime.Time) {
 	if !hasAlarm && !oldAlarm.Time.IsZero() {
 		h.logger.Debugf("Canceling loss detection timer.")
 		if h.qlogger != nil {
+			// The cancelled timer has to carry the identity of the alarm it
+			// cancels: without the timer type and the packet number space a
+			// cancellation is not attributable, and a PTO cancellation cannot
+			// be told from the cancellation of a loss-time timer.
 			h.qlogger.RecordEvent(qlog.LossTimerUpdated{
-				Type: qlog.LossTimerUpdateTypeCancelled,
+				Type:      qlog.LossTimerUpdateTypeCancelled,
+				TimerType: oldAlarm.TimerType,
+				EncLevel:  oldAlarm.EncryptionLevel,
 			})
 		}
 	}
@@ -1270,8 +1276,12 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 	if h.qlogger != nil {
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: 0})
 		if !oldAlarm.Time.IsZero() {
+			// Discarding a packet number space cancels the timer of that
+			// space: the alarm it replaces says which one it was.
 			h.qlogger.RecordEvent(qlog.LossTimerUpdated{
-				Type: qlog.LossTimerUpdateTypeCancelled,
+				Type:      qlog.LossTimerUpdateTypeCancelled,
+				TimerType: oldAlarm.TimerType,
+				EncLevel:  oldAlarm.EncryptionLevel,
 			})
 		}
 	}

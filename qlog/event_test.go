@@ -88,3 +88,31 @@ func TestLossTimerUpdatedEncodesOutstandingPackets(t *testing.T) {
 		t.Errorf("loss_timer_updated %s reports outstanding packets it does not have", encoded)
 	}
 }
+
+// TestLossTimerCancelledEncodesAttribution covers the cancellation of a timer.
+// A cancelled timer has no time and no outstanding packets, so its timer type
+// and packet number space are the only thing which says what was cancelled:
+// without them a PTO cancellation is indistinguishable from the cancellation of
+// a loss-time timer.
+func TestLossTimerCancelledEncodesAttribution(t *testing.T) {
+	encoded := encodeEvent(t, LossTimerUpdated{
+		Type:      LossTimerUpdateTypeCancelled,
+		TimerType: TimerTypePTO,
+		EncLevel:  protocol.EncryptionHandshake,
+	})
+	if !strings.Contains(encoded, `"event_type":"cancelled"`) {
+		t.Errorf("loss_timer_updated %s does not report the cancellation", encoded)
+	}
+	if !strings.Contains(encoded, `"timer_type":"pto"`) {
+		t.Errorf("loss_timer_updated %s does not report which timer was cancelled", encoded)
+	}
+	if !strings.Contains(encoded, `"packet_number_space":"handshake"`) {
+		t.Errorf("loss_timer_updated %s does not report the packet number space of the cancelled timer", encoded)
+	}
+	// The fields are omitted instead of encoded empty when the timer did not
+	// know them: an empty attribution is what made the field useless.
+	encoded = encodeEvent(t, LossTimerUpdated{Type: LossTimerUpdateTypeCancelled})
+	if strings.Contains(encoded, `"timer_type"`) || strings.Contains(encoded, `"packet_number_space"`) {
+		t.Errorf("loss_timer_updated %s invents an attribution it does not have", encoded)
+	}
+}

@@ -768,6 +768,11 @@ type LossTimerUpdated struct {
 	// probe is sent instead and the original packet stays outstanding. This
 	// list is what makes those losses visible in the sender's own trace, where
 	// they would otherwise only show up as a packet the peer never received.
+	//
+	// TimerType and EncLevel identify the timer which was set, expired or
+	// cancelled. A cancelled event has no time of its own, so these two fields
+	// are the only attribution it can carry; they are omitted when the timer
+	// which was recorded did not know them.
 	OutstandingPackets []protocol.PacketNumber
 }
 
@@ -778,10 +783,12 @@ func (e LossTimerUpdated) Encode(enc *jsontext.Encoder, t time.Time) error {
 	h.WriteToken(jsontext.BeginObject)
 	h.WriteToken(jsontext.String("event_type"))
 	h.WriteToken(jsontext.String(string(e.Type)))
-	h.WriteToken(jsontext.String("timer_type"))
-	h.WriteToken(jsontext.String(string(e.TimerType)))
-	h.WriteToken(jsontext.String("packet_number_space"))
-	h.WriteToken(jsontext.String(encLevelToPacketNumberSpace(e.EncLevel)))
+	if e.TimerType != "" {
+		h.WriteToken(jsontext.String("timer_type"))
+		h.WriteToken(jsontext.String(string(e.TimerType)))
+		h.WriteToken(jsontext.String("packet_number_space"))
+		h.WriteToken(jsontext.String(encLevelToPacketNumberSpace(e.EncLevel)))
+	}
 	if e.Type == LossTimerUpdateTypeSet {
 		h.WriteToken(jsontext.String("delta"))
 		h.WriteToken(jsontext.Float(milliseconds(e.Time.Sub(t))))
@@ -794,19 +801,6 @@ func (e LossTimerUpdated) Encode(enc *jsontext.Encoder, t time.Time) error {
 		}
 		h.WriteToken(jsontext.EndArray)
 	}
-	h.WriteToken(jsontext.EndObject)
-	return h.err
-}
-
-type eventLossTimerCanceled struct{}
-
-func (e eventLossTimerCanceled) Name() string { return "recovery:loss_timer_updated" }
-
-func (e eventLossTimerCanceled) Encode(enc *jsontext.Encoder, _ time.Time) error {
-	h := encoderHelper{enc: enc}
-	h.WriteToken(jsontext.BeginObject)
-	h.WriteToken(jsontext.String("event_type"))
-	h.WriteToken(jsontext.String("cancelled"))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
