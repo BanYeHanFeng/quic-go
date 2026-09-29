@@ -38,4 +38,10 @@ func isSendMsgSizeErr(err error) bool {
 	return errors.Is(err, unix.EMSGSIZE)
 }
 
-func isRecvMsgSizeErr(error) bool { return false }
+func isRecvMsgSizeErr(err error) bool {
+	// A connected UDP socket can report an ICMP fragmentation-needed error
+	// from a previous send on the receive path. In particular, this can be
+	// caused by a DPLPMTUD probe. Let probe loss drive MTU discovery instead
+	// of closing the transport (and every connection using it).
+	return errors.Is(err, unix.EMSGSIZE)
+}

@@ -555,7 +555,8 @@ func (t *Transport) listen(conn rawConn) {
 			continue
 		}
 		if err != nil {
-			// Windows returns an error when receiving a UDP datagram that doesn't fit into the provided buffer.
+			// Ignore oversized datagrams on Windows and asynchronous MTU errors
+			// from connected UDP sockets on Linux.
 			if isRecvMsgSizeErr(err) {
 				continue
 			}
