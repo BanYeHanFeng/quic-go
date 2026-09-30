@@ -63,6 +63,30 @@ func TestSpuriousLossEncodesTrigger(t *testing.T) {
 	}
 }
 
+// TestReorderingWindowUpdatedEncodesThreshold covers the event which makes an
+// adapted packet threshold visible. Without it, the only trace of the adaptation
+// is that losses stop being reported, which is indistinguishable from a path
+// that stopped losing packets.
+func TestReorderingWindowUpdatedEncodesThreshold(t *testing.T) {
+	encoded := encodeEvent(t, ReorderingWindowUpdated{
+		PacketThreshold:    9,
+		ObservedReordering: 8,
+	})
+	if !strings.Contains(encoded, `"packet_threshold":9`) {
+		t.Errorf("reordering_window_updated %s does not report the threshold", encoded)
+	}
+	if !strings.Contains(encoded, `"observed_reordering":8`) {
+		t.Errorf("reordering_window_updated %s does not report the observation", encoded)
+	}
+
+	// A decay has no observation to report, and readers have to be able to rely
+	// on the field being present.
+	encoded = encodeEvent(t, ReorderingWindowUpdated{PacketThreshold: 6})
+	if !strings.Contains(encoded, `"observed_reordering":0`) {
+		t.Errorf("reordering_window_updated %s does not report a zero observation", encoded)
+	}
+}
+
 // TestLossTimerUpdatedEncodesOutstandingPackets covers the packet numbers of a
 // PTO expiry: they are what makes a loss which was never declared visible, so
 // the array has to be encoded exactly when it is known.

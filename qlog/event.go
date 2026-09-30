@@ -562,6 +562,32 @@ func (e SpuriousLoss) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	return h.err
 }
 
+// ReorderingWindowUpdated reports the packet threshold loss detection uses.
+// This is not an RFC 9002 event: the fork raises the threshold above the RFC
+// value while the path proves that it reorders further than that, and without
+// the event a raised threshold is invisible in the trace (losses simply stop
+// being reported, without saying why).
+type ReorderingWindowUpdated struct {
+	// PacketThreshold is the packet threshold now in use.
+	PacketThreshold uint64
+	// ObservedReordering is the reordering distance which raised it. It is zero
+	// when the threshold only decayed.
+	ObservedReordering uint64
+}
+
+func (e ReorderingWindowUpdated) Name() string { return "recovery:reordering_window_updated" }
+
+func (e ReorderingWindowUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("packet_threshold"))
+	h.WriteToken(jsontext.Uint(e.PacketThreshold))
+	h.WriteToken(jsontext.String("observed_reordering"))
+	h.WriteToken(jsontext.Uint(e.ObservedReordering))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
 type KeyUpdated struct {
 	Trigger  KeyUpdateTrigger
 	KeyType  KeyType

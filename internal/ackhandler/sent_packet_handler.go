@@ -571,7 +571,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		// A packet which turned out to be only late is proof that this path
 		// reorders at least that far, and the packet threshold has to allow for
 		// it or the next packet reordered by the same path is declared lost too.
-		h.reorderingWindow.Observe(rcvTime, maxReordering)
+		if threshold, changed := h.reorderingWindow.Observe(rcvTime, maxReordering); changed && h.qlogger != nil {
+			h.qlogger.RecordEvent(qlog.ReorderingWindowUpdated{
+				PacketThreshold:    uint64(threshold),
+				ObservedReordering: uint64(maxReordering),
+			})
+		}
 		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
 	}
@@ -930,7 +935,12 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	// The packet threshold adapts to the reordering the path shows. It is read
 	// once per call so that a decay which happens while this pass runs cannot
 	// change the threshold halfway through it.
-	reorderingThreshold, _ := h.reorderingWindow.Threshold(now)
+	reorderingThreshold, reorderingThresholdDecayed := h.reorderingWindow.Threshold(now)
+	if reorderingThresholdDecayed && h.qlogger != nil {
+		h.qlogger.RecordEvent(qlog.ReorderingWindowUpdated{
+			PacketThreshold: uint64(reorderingThreshold),
+		})
+	}
 
 	priorInFlight := h.bytesInFlight
 	for pn, p := range pnSpace.history.Packets() {
