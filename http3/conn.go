@@ -176,7 +176,7 @@ func (c *rawConn) openControlStream(settings *settingsFrame) (*quic.SendStream, 
 }
 
 func (c *rawConn) TrackStream(str *quic.Stream) *stateTrackingStream {
-	hstr := newStateTrackingStream(str, c, func(b []byte) error { return c.sendDatagram(str.StreamID(), b) })
+	hstr := newStateTrackingStream(str, c, func(b []byte, bypass bool) error { return c.sendDatagram(str.StreamID(), b, bypass) })
 
 	c.streamMx.Lock()
 	c.streams[str.StreamID()] = hstr
@@ -338,7 +338,7 @@ func (c *rawConn) handleControlStream(str *quic.ReceiveStream) {
 	c.controlStrHandler(str, fp)
 }
 
-func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
+func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte, bypass bool) error {
 	// TODO: this creates a lot of garbage and an additional copy
 	data := make([]byte, 0, len(b)+8)
 	quarterStreamID := uint64(streamID / 4)
@@ -352,6 +352,9 @@ func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
 				PayloadLength: len(b),
 			},
 		})
+	}
+	if bypass {
+		return c.conn.SendDatagramWithoutCongestionControl(data)
 	}
 	return c.conn.SendDatagram(data)
 }

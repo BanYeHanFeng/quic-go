@@ -209,6 +209,9 @@ func (e *ecnTracker) HandleNewlyAcked(packets []packetWithPacketNumber, ect0, ec
 	// Count ECT0 and ECT1 marks that we used when sending the packets that are now being acknowledged.
 	var ackedECT0, ackedECT1 int64
 	for _, p := range packets {
+		if p.congestionControlBypassed {
+			continue
+		}
 		//nolint:exhaustive // We only ever send ECT(0) and ECT(1).
 		switch e.ecnMarking(p.PacketNumber) {
 		case protocol.ECT0:
@@ -307,7 +310,7 @@ func (e *ecnTracker) HandleNewlyAcked(packets []packetWithPacketNumber, ect0, ec
 	if e.state == ecnStateTesting || e.state == ecnStateUnknown {
 		var ackedTestingPacket bool
 		for _, p := range packets {
-			if e.isTestingPacket(p.PacketNumber) {
+			if !p.congestionControlBypassed && e.isTestingPacket(p.PacketNumber) {
 				ackedTestingPacket = true
 				break
 			}

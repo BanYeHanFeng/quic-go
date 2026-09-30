@@ -10,7 +10,7 @@ import (
 // SentPacketHandler handles ACKs received for outgoing packets
 type SentPacketHandler interface {
 	// SentPacket may modify the packet
-	SentPacket(t monotime.Time, pn, largestAcked protocol.PacketNumber, streamFrames []StreamFrame, frames []Frame, encLevel protocol.EncryptionLevel, ecn protocol.ECN, size protocol.ByteCount, isPathMTUProbePacket, isPathProbePacket bool)
+	SentPacket(t monotime.Time, pn, largestAcked protocol.PacketNumber, streamFrames []StreamFrame, frames []Frame, encLevel protocol.EncryptionLevel, ecn protocol.ECN, size protocol.ByteCount, isPathMTUProbePacket, isPathProbePacket, bypassCongestionControl bool)
 	// ReceivedAck processes an ACK frame.
 	// It does not store a copy of the frame.
 	ReceivedAck(f *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) (bool /* 1-RTT packet acked */, error)
@@ -21,6 +21,7 @@ type SentPacketHandler interface {
 
 	// The SendMode determines if and what kind of packets can be sent.
 	SendMode(now monotime.Time) SendMode
+	CanSendUncongestedDatagram() bool
 	// TimeUntilSend is the time when the next packet should be sent.
 	// It is used for pacing packets.
 	TimeUntilSend() monotime.Time
@@ -30,7 +31,7 @@ type SentPacketHandler interface {
 	SetLastDatagramPadding(protocol.ByteCount)
 
 	// only to be called once the handshake is complete
-	QueueProbePacket(protocol.PacketNumberSpace) bool /* was a packet queued */
+	QueueProbePacket(protocol.PacketNumberSpace, monotime.Time) bool /* was a packet queued */
 
 	ECNMode(isShortHeaderPacket bool) protocol.ECN // isShortHeaderPacket should only be true for non-coalesced 1-RTT packets
 	PeekPacketNumber(protocol.PacketNumberSpace) (protocol.PacketNumber, protocol.PacketNumberLen)

@@ -21,6 +21,7 @@ import (
 var errNothingToPack = errors.New("nothing to pack")
 
 type packer interface {
+	AppendUncongestedDatagramPacket(*udp.PacketBuffer, *datagramQueue, protocol.ByteCount, protocol.Version) (shortHeaderPacket, error)
 	PackCoalescedPacket(onlyAck bool, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (*coalescedPacket, error)
 	PackAckOnlyPacket(maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, *udp.PacketBuffer, error)
 	AppendPacket(_ *udp.PacketBuffer, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, error)
@@ -58,13 +59,14 @@ type longHeaderPacket struct {
 }
 
 type shortHeaderPacket struct {
-	PacketNumber         protocol.PacketNumber
-	Frames               []ackhandler.Frame
-	StreamFrames         []ackhandler.StreamFrame
-	Ack                  *wire.AckFrame
-	Length               protocol.ByteCount
-	IsPathMTUProbePacket bool
-	IsPathProbePacket    bool
+	PacketNumber            protocol.PacketNumber
+	Frames                  []ackhandler.Frame
+	StreamFrames            []ackhandler.StreamFrame
+	Ack                     *wire.AckFrame
+	Length                  protocol.ByteCount
+	IsPathMTUProbePacket    bool
+	IsPathProbePacket       bool
+	BypassCongestionControl bool
 
 	// used for logging
 	DestConnID      protocol.ConnectionID
@@ -567,6 +569,50 @@ func (p *packetPacker) appendPacket(
 	kp := sealer.KeyPhase()
 
 	return p.appendShortHeaderPacket(buf, connID, pn, pnLen, kp, pl, 0, maxPacketSize, sealer, false, v)
+}
+
+// AppendUncongestedDatagramPacket never takes frames from the normal packer.
+// In particular, an ACK or a reliable frame cannot hitch a ride on this packet.
+func (p *packetPacker) AppendUncongestedDatagramPacket(buf *udp.PacketBuffer, queue *datagramQueue, maxSize protocol.ByteCount, v protocol.Version) (shortHeaderPacket, error) {
+	sealer, err := p.cryptoSetup.Get1RTTSealer()
+	if err != nil {
+		return shortHeaderPacket{}, err
+	}
+	pn, pnLen := p.pnManager.PeekPacketNumber(protocol.PacketNumberSpaceAppData)
+	connID := p.getDestConnID()
+	maxPayload := maxSize - wire.ShortHeaderLen(connID, pnLen) - protocol.ByteCount(sealer.Overhead())
+	for f := queue.Peek(); f != nil; f = queue.Peek() {
+		size := f.Length(v)
+		queue.Pop()
+		if size > maxPayload || size > p.maxDatagramFrameSize {
+			// A bypass packet carries only this single DATAGRAM frame, so it can omit
+			// the length field when that is required to fit the current PMTU or peer limit.
+			f.DataLenPresent = false
+			size = f.Length(v)
+		}
+		// RFC 9221, Section 3: DATAGRAM frames MUST NOT exceed the peer's max_datagram_frame_size.
+		// PMTU may also have decreased since enqueueing.
+		if size > p.maxDatagramFrameSize || size > maxPayload {
+			if p.qlogger != nil {
+				p.qlogger.RecordEvent(qlog.DatagramDropped{
+					Direction: qlog.DirectionSending,
+					Raw:       qlog.RawInfo{Length: len(f.Data), PayloadLength: qlog.OmitLength},
+					Trigger:   "too_large",
+				})
+			}
+			continue
+		}
+		if size < 4-protocol.ByteCount(pnLen) {
+			// IP packets are larger than this. Do not silently add PADDING frames
+			// to an exempt packet when this API is accidentally used for a tiny payload.
+			continue
+		}
+		pl := payload{frames: []ackhandler.Frame{{Frame: f}}, numDatagramFrames: 1, length: size}
+		packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, sealer.KeyPhase(), pl, 0, maxSize, sealer, false, v)
+		packet.BypassCongestionControl = true
+		return packet, err
+	}
+	return shortHeaderPacket{}, errNothingToPack
 }
 
 func (p *packetPacker) maybeGetCryptoPacket(

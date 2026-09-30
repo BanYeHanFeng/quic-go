@@ -232,7 +232,8 @@ type Conn struct {
 	keepAlivePingSent bool
 	keepAliveInterval time.Duration
 
-	datagramQueue *datagramQueue
+	datagramQueue            *datagramQueue
+	uncongestedDatagramQueue *datagramQueue
 
 	connStateMutex sync.Mutex
 	connState      ConnectionState
@@ -585,6 +586,7 @@ func (c *Conn) preSetup(r *pathReceiver) {
 	c.receivedPacketHandler = *ackhandler.NewReceivedPacketHandler(c.logger)
 
 	c.datagramQueue = newDatagramQueue(c.scheduleSending, c.logger, c.qlogger)
+	c.uncongestedDatagramQueue = newDatagramQueue(c.scheduleSending, c.logger, c.qlogger)
 	c.connState.Version = c.version
 }
 
@@ -2440,6 +2442,9 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 	if c.datagramQueue != nil {
 		c.datagramQueue.CloseWithError(e)
 	}
+	if c.uncongestedDatagramQueue != nil {
+		c.uncongestedDatagramQueue.CloseWithError(e)
+	}
 
 	// In rare instances, the connection ID manager might switch to a new connection ID
 	// when sending the CONNECTION_CLOSE frame.
@@ -2622,6 +2627,13 @@ func (c *Conn) maxMTU() protocol.ByteCount {
 }
 
 func (c *Conn) triggerSending(now monotime.Time) error {
+	if err := c.triggerCongestionControlledSending(now); err != nil {
+		return err
+	}
+	return c.sendUncongestedDatagrams(now)
+}
+
+func (c *Conn) triggerCongestionControlledSending(now monotime.Time) error {
 	c.pacingDeadline = 0
 
 	sendMode := c.sentPacketHandler.SendMode(now)
@@ -2655,7 +2667,7 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 			c.scheduleSending()
 			return nil
 		}
-		return c.triggerSending(now)
+		return c.triggerCongestionControlledSending(now)
 	default:
 		return fmt.Errorf("BUG: invalid send mode %d", sendMode)
 	}
@@ -2830,6 +2842,76 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 	}
 }
 
+// Bound each turn so a continuously replenished DATAGRAM queue cannot starve
+// receiving, timers, or reliable control traffic. GSO batches contain only
+// exempt packets, all marked Not-ECT, with no artificial padding or delay.
+func (c *Conn) sendUncongestedDatagrams(now monotime.Time) error {
+	if !c.handshakeConfirmed || !c.sentPacketHandler.CanSendUncongestedDatagram() || c.uncongestedDatagramQueue.Peek() == nil {
+		return nil
+	}
+	if c.sendQueue.WouldBlock() {
+		// keep sending if the send queue frees up before the run loop checks it
+		c.pacingDeadline = deadlineSendImmediately
+		return nil
+	}
+	maxSize := c.maxPacketSize()
+	gso := c.conn.capabilities().GSO
+	ecn := c.sentPacketHandler.ECNMode(false)
+	var buf *udp.PacketBuffer
+	for sent := range maxDatagramSendQueueLen {
+		if buf == nil {
+			if gso {
+				buf = udp.GetLargePacketBuffer()
+			} else {
+				buf = udp.GetPacketBuffer()
+			}
+		}
+		p, err := c.packer.AppendUncongestedDatagramPacket(buf, c.uncongestedDatagramQueue, maxSize, c.version)
+		if err != nil {
+			if err != errNothingToPack {
+				buf.Release()
+				return err
+			}
+			if buf.Len() == 0 {
+				buf.Release()
+			} else {
+				var segmentSize uint16
+				if gso {
+					segmentSize = uint16(maxSize)
+				}
+				c.sendQueue.Send(buf, segmentSize, ecn)
+			}
+			return nil
+		}
+		c.logShortHeaderPacket(p, ecn, p.Length)
+		c.registerPackedShortHeaderPacket(p, ecn, now)
+		more := sent+1 < maxDatagramSendQueueLen && c.sentPacketHandler.CanSendUncongestedDatagram() && c.uncongestedDatagramQueue.Peek() != nil
+		if gso && more && p.Length == maxSize && buf.Len()+maxSize <= buf.Cap() {
+			continue
+		}
+		var segmentSize uint16
+		if gso {
+			segmentSize = uint16(maxSize)
+		}
+		c.sendQueue.Send(buf, segmentSize, ecn)
+		buf = nil
+		if c.sendQueue.WouldBlock() {
+			// keep sending if the send queue frees up before the run loop checks it
+			if c.sentPacketHandler.CanSendUncongestedDatagram() && c.uncongestedDatagramQueue.Peek() != nil {
+				c.pacingDeadline = deadlineSendImmediately
+			}
+			return nil
+		}
+		if !more {
+			break
+		}
+	}
+	if c.sentPacketHandler.CanSendUncongestedDatagram() && c.uncongestedDatagramQueue.Peek() != nil {
+		c.scheduleSending()
+	}
+	return nil
+}
+
 func (c *Conn) resetPacingDeadline() {
 	deadline := c.sentPacketHandler.TimeUntilSend()
 	if deadline.IsZero() {
@@ -2882,7 +2964,7 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time) 
 	// or until there are no more packets to queue.
 	var packet *coalescedPacket
 	for packet == nil {
-		if wasQueued := c.sentPacketHandler.QueueProbePacket(encLevel.PacketNumberSpace()); !wasQueued {
+		if wasQueued := c.sentPacketHandler.QueueProbePacket(encLevel.PacketNumberSpace(), now); !wasQueued {
 			break
 		}
 		var err error
@@ -2931,6 +3013,7 @@ func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol
 			p.Length,
 			p.IsPathMTUProbePacket,
 			true,
+			false,
 		)
 		return
 	}
@@ -2953,6 +3036,7 @@ func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol
 		p.Length,
 		p.IsPathMTUProbePacket,
 		false,
+		p.BypassCongestionControl,
 	)
 	c.connIDManager.SentPacket()
 }
@@ -2976,6 +3060,7 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			p.EncryptionLevel(),
 			ecn,
 			p.length,
+			false,
 			false,
 			false,
 		)
@@ -3005,6 +3090,7 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			p.Length,
 			p.IsPathMTUProbePacket,
 			false,
+			p.BypassCongestionControl,
 		)
 	}
 	c.connIDManager.SentPacket()
@@ -3235,6 +3321,19 @@ func (c *Conn) recordStreamPriorityUpdated(id protocol.StreamID, urgency int8, i
 // In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
 // If the payload is too large to be sent at the current time, a [DatagramTooLargeError] is returned.
 func (c *Conn) SendDatagram(p []byte) error {
+	return c.sendDatagram(p, c.datagramQueue)
+}
+
+// SendDatagramWithoutCongestionControl sends an IP-tunneling DATAGRAM without
+// congestion-window or pacing restrictions (RFC 9484, Section 10). The caller
+// must ensure the payload encapsulates IP traffic suitable for this exemption.
+// Packets are Not-ECT, remain ACK/loss tracked and are never retransmitted.
+// This opt-in API uses a bounded queue and waits for handshake confirmation.
+func (c *Conn) SendDatagramWithoutCongestionControl(p []byte) error {
+	return c.sendDatagram(p, c.uncongestedDatagramQueue)
+}
+
+func (c *Conn) sendDatagram(p []byte, queue *datagramQueue) error {
 	maxDatagramFrameSize := c.peerMaxDatagramFrameSize(c.peerParams.Load())
 	if maxDatagramFrameSize <= 0 {
 		return errors.New("datagram support disabled")
@@ -3253,7 +3352,7 @@ func (c *Conn) SendDatagram(p []byte) error {
 	}
 	f.Data = make([]byte, len(p))
 	copy(f.Data, p)
-	return c.datagramQueue.Add(f)
+	return queue.Add(f)
 }
 
 // ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.

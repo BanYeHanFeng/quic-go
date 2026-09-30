@@ -27,6 +27,7 @@ type datagramStream interface {
 	SetPriority(urgency int8, incremental bool)
 	TryWriteAll([]byte) error
 	SendDatagram(b []byte) error
+	SendDatagramWithoutCongestionControl(b []byte) error
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
 
 	QUICStream() *quic.Stream
@@ -430,6 +431,16 @@ func (s *Stream) SendDatagram(b []byte) error {
 	return maybeReplaceError(s.datagramStream.SendDatagram(b))
 }
 
+// SendDatagramWithoutCongestionControl is reserved for IP tunneling under RFC
+// 9484, Section 10. It does not change congestion control for this stream.
+func (s *Stream) SendDatagramWithoutCongestionControl(b []byte) error {
+	s.addQlogProducer()
+	defer s.removeQlogProducer()
+
+	// TODO: reject if datagrams are not negotiated (yet)
+	return maybeReplaceError(s.datagramStream.SendDatagramWithoutCongestionControl(b))
+}
+
 func (s *Stream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	// TODO: reject if datagrams are not negotiated (yet)
 	b, err := s.datagramStream.ReceiveDatagram(ctx)
@@ -564,6 +575,12 @@ func (s *RequestStream) SetDeadline(t time.Time) error {
 // as the server might drop datagrams which it can't associate with an existing request.
 func (s *RequestStream) SendDatagram(b []byte) error {
 	return s.str.SendDatagram(b)
+}
+
+// SendDatagramWithoutCongestionControl sends an IP-tunneling HTTP Datagram.
+// See [Stream.SendDatagramWithoutCongestionControl] for the usage restrictions.
+func (s *RequestStream) SendDatagramWithoutCongestionControl(b []byte) error {
+	return s.str.SendDatagramWithoutCongestionControl(b)
 }
 
 // ReceiveDatagram receives HTTP Datagrams (RFC 9297).
