@@ -78,6 +78,9 @@ type sentPacketHandler struct {
 	handshakePackets *packetNumberSpace
 	appDataPackets   *packetNumberSpace
 	lostPackets      lostPacketTracker // only for application-data packet number space
+	// reorderingWindow is the packet threshold loss detection uses. It adapts to
+	// the reordering the path shows, see reordering_window.go.
+	reorderingWindow reorderingWindow
 	// send time of the largest acknowledged packet, across all packet number spaces
 	largestAckedTime monotime.Time
 
@@ -174,6 +177,7 @@ func NewSentPacketHandler(
 		handshakePackets:               newPacketNumberSpace(0, false),
 		appDataPackets:                 newPacketNumberSpace(0, true),
 		lostPackets:                    *newLostPacketTracker(64),
+		reorderingWindow:               newReorderingWindow(),
 		rttStats:                       rttStats,
 		connStats:                      connStats,
 		congestion:                     congestionControl{SendAlgorithmWithDebugInfos: congestion},
@@ -560,10 +564,14 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 
 	// detect spurious losses for application data packets, if the ACK was not reordered
 	if encLevel == protocol.Encryption1RTT && largestAcked == pnSpace.largestAcked {
-		h.detectSpuriousLosses(
+		maxReordering := h.detectSpuriousLosses(
 			ack,
 			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
 		)
+		// A packet which turned out to be only late is proof that this path
+		// reorders at least that far, and the packet threshold has to allow for
+		// it or the next packet reordered by the same path is declared lost too.
+		h.reorderingWindow.Observe(rcvTime, maxReordering)
 		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
 	}
@@ -593,9 +601,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	return acked1RTTPacket, nil
 }
 
-func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) {
+// detectSpuriousLosses deletes the packets which this ACK proves were declared
+// lost although they were only late, and reports how far the path had reordered
+// the furthest of them behind the packets which were acknowledged first.
+func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) protocol.PacketNumber {
 	var maxPacketReordering protocol.PacketNumber
-	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
 	var spuriousLosses []protocol.PacketNumber
 	for pn, lost := range h.lostPackets.All() {
@@ -616,7 +626,6 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 			packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
 			timeReordering := ackTime.Sub(sendTime)
 			maxPacketReordering = max(maxPacketReordering, packetReordering)
-			maxTimeReordering = max(maxTimeReordering, timeReordering)
 
 			if h.qlogger != nil {
 				h.qlogger.RecordEvent(qlog.SpuriousLoss{
@@ -633,6 +642,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	for _, pn := range spuriousLosses {
 		h.lostPackets.Delete(pn)
 	}
+	return maxPacketReordering
 }
 
 // Packets are returned in ascending packet number order.
@@ -917,6 +927,11 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	// Packets sent before this time are deemed lost.
 	lostSendTime := now.Add(-lossDelay)
 
+	// The packet threshold adapts to the reordering the path shows. It is read
+	// once per call so that a decay which happens while this pass runs cannot
+	// change the threshold halfway through it.
+	reorderingThreshold, _ := h.reorderingWindow.Threshold(now)
+
 	priorInFlight := h.bytesInFlight
 	for pn, p := range pnSpace.history.Packets() {
 		if pn > pnSpace.largestAcked {
@@ -931,7 +946,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 			if !p.isPathProbePacket && p.IsAckEliciting() && h.logger.Debug() {
 				h.logger.Debugf("\tlost packet %d (time threshold)", pn)
 			}
-		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
+		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= reorderingThreshold {
 			packetLost = true
 			packetLossTrigger = qlog.PacketLossReorderingThreshold
 			if !p.isPathProbePacket && p.IsAckEliciting() && h.logger.Debug() {
