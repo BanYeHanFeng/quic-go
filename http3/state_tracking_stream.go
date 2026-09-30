@@ -21,7 +21,7 @@ const streamDatagramQueueLen = 32
 type stateTrackingStream struct {
 	*quic.Stream
 
-	sendDatagram func([]byte) error
+	sendDatagram func([]byte, bool) error
 	hasData      chan struct{}
 	queue        [][]byte // TODO: use a ring buffer
 
@@ -38,7 +38,7 @@ type streamClearer interface {
 	clearStream(quic.StreamID)
 }
 
-func newStateTrackingStream(s *quic.Stream, clearer streamClearer, sendDatagram func([]byte) error) *stateTrackingStream {
+func newStateTrackingStream(s *quic.Stream, clearer streamClearer, sendDatagram func([]byte, bool) error) *stateTrackingStream {
 	t := &stateTrackingStream{
 		Stream:       s,
 		clearer:      clearer,
@@ -113,7 +113,13 @@ func (s *stateTrackingStream) Read(b []byte) (int, error) {
 	return n, err
 }
 
-func (s *stateTrackingStream) SendDatagram(b []byte) error {
+func (s *stateTrackingStream) SendDatagram(b []byte) error { return s.sendDatagramWithPolicy(b, false) }
+
+func (s *stateTrackingStream) SendDatagramWithoutCongestionControl(b []byte) error {
+	return s.sendDatagramWithPolicy(b, true)
+}
+
+func (s *stateTrackingStream) sendDatagramWithPolicy(b []byte, bypass bool) error {
 	s.mx.Lock()
 	sendErr := s.sendErr
 	s.mx.Unlock()
@@ -121,7 +127,7 @@ func (s *stateTrackingStream) SendDatagram(b []byte) error {
 		return sendErr
 	}
 
-	return s.sendDatagram(b)
+	return s.sendDatagram(b, bypass)
 }
 
 func (s *stateTrackingStream) signalHasDatagram() {

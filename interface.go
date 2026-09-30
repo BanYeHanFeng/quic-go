@@ -98,8 +98,20 @@ type ConnectionIDGenerator interface {
 	ConnectionIDLen() int
 }
 
+// CongestionControlAlgorithm selects the native sender. The zero value preserves NewReno.
+type CongestionControlAlgorithm uint8
+
+const (
+	CongestionControlNewReno CongestionControlAlgorithm = iota
+	CongestionControlCubic
+)
+
 // Config contains all configuration data needed for a QUIC server or client.
 type Config struct {
+	// CongestionControl selects the native congestion controller. An explicitly
+	// installed controller via Conn.SetCongestionControl takes precedence.
+	CongestionControl CongestionControlAlgorithm
+
 	// DisableGSO disables Generic Segmentation Offload for this connection's sends.
 	// It does not disable ECN, path MTU discovery, or batched receives. A false
 	// value still respects platform support and QUIC_GO_DISABLE_GSO. On a server,

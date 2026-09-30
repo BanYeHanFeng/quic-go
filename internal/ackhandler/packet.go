@@ -25,8 +25,9 @@ type packet struct {
 
 	congestionPacketNumber protocol.PacketNumber
 
-	includedInBytesInFlight bool
-	isPathProbePacket       bool
+	congestionControlBypassed bool
+	includedInBytesInFlight   bool
+	isPathProbePacket         bool
 }
 
 func (p *packet) Outstanding() bool {
@@ -49,6 +50,7 @@ func getPacket() *packet {
 	p.SendTime = 0
 	p.congestionPacketNumber = 0
 	p.IsPathMTUProbePacket = false
+	p.congestionControlBypassed = false
 	p.includedInBytesInFlight = false
 	p.isPathProbePacket = false
 	return p

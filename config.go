@@ -23,6 +23,10 @@ func (c *Config) maxRetryTokenAge() time.Duration {
 }
 
 func validateConfig(config *Config) error {
+	if config != nil && config.CongestionControl > CongestionControlCubic {
+		return fmt.Errorf("invalid congestion control algorithm: %d", config.CongestionControl)
+	}
+
 	if config == nil {
 		return nil
 	}
@@ -125,6 +129,7 @@ func populateConfig(config *Config) *Config {
 	}
 
 	return &Config{
+		CongestionControl:                config.CongestionControl,
 		DisableGSO:                       config.DisableGSO,
 		GetConfigForClient:               config.GetConfigForClient,
 		Versions:                         versions,

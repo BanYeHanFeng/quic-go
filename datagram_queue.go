@@ -48,6 +48,12 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	h.sendMx.Lock()
 
 	for {
+		select {
+		case <-h.closed:
+			h.sendMx.Unlock()
+			return h.closeErr
+		default:
+		}
 		if h.sendQueue.Len() < maxDatagramSendQueueLen {
 			h.sendQueue.PushBack(f)
 			h.sendMx.Unlock()

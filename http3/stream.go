@@ -9,10 +9,11 @@ import (
 	"net/http/httptrace"
 	"time"
 
-	"github.com/quic-go/qpack"
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3/qlog"
 	"github.com/sagernet/quic-go/qlogwriter"
+
+	"github.com/quic-go/qpack"
 )
 
 type datagramStream interface {
@@ -25,6 +26,7 @@ type datagramStream interface {
 	SetReadDeadline(time.Time) error
 	SetWriteDeadline(time.Time) error
 	SendDatagram(b []byte) error
+	SendDatagramWithoutCongestionControl(b []byte) error
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
 
 	QUICStream() *quic.Stream
@@ -402,4 +404,16 @@ func (r *tracingReader) Read(b []byte) (int, error) {
 		r.readFirst = true
 	}
 	return n, err
+}
+
+// SendDatagramWithoutCongestionControl is reserved for IP tunneling under RFC
+// 9484, Section 10. It does not change congestion control for this stream.
+func (s *Stream) SendDatagramWithoutCongestionControl(b []byte) error {
+	return s.datagramStream.SendDatagramWithoutCongestionControl(b)
+}
+
+// SendDatagramWithoutCongestionControl sends an IP-tunneling HTTP Datagram.
+// See Stream.SendDatagramWithoutCongestionControl for the usage restrictions.
+func (s *RequestStream) SendDatagramWithoutCongestionControl(b []byte) error {
+	return s.str.SendDatagramWithoutCongestionControl(b)
 }

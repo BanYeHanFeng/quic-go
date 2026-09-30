@@ -18,6 +18,7 @@ import (
 var errNothingToPack = errors.New("nothing to pack")
 
 type packer interface {
+	AppendUncongestedDatagramPacket(*packetBuffer, *datagramQueue, protocol.ByteCount, protocol.Version) (shortHeaderPacket, error)
 	PackCoalescedPacket(onlyAck bool, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (*coalescedPacket, error)
 	PackAckOnlyPacket(maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, *packetBuffer, error)
 	AppendPacket(_ *packetBuffer, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, error)
@@ -51,13 +52,14 @@ type longHeaderPacket struct {
 }
 
 type shortHeaderPacket struct {
-	PacketNumber         protocol.PacketNumber
-	Frames               []ackhandler.Frame
-	StreamFrames         []ackhandler.StreamFrame
-	Ack                  *wire.AckFrame
-	Length               protocol.ByteCount
-	IsPathMTUProbePacket bool
-	IsPathProbePacket    bool
+	PacketNumber            protocol.PacketNumber
+	Frames                  []ackhandler.Frame
+	StreamFrames            []ackhandler.StreamFrame
+	Ack                     *wire.AckFrame
+	Length                  protocol.ByteCount
+	IsPathMTUProbePacket    bool
+	IsPathProbePacket       bool
+	BypassCongestionControl bool
 
 	// used for logging
 	DestConnID      protocol.ConnectionID
@@ -538,6 +540,35 @@ func (p *packetPacker) appendPacket(
 	kp := sealer.KeyPhase()
 
 	return p.appendShortHeaderPacket(buf, connID, pn, pnLen, kp, pl, 0, maxPacketSize, sealer, false, v)
+}
+
+// AppendUncongestedDatagramPacket never takes frames from the normal packer.
+// In particular, an ACK or a reliable frame cannot hitch a ride on this packet.
+func (p *packetPacker) AppendUncongestedDatagramPacket(buf *packetBuffer, queue *datagramQueue, maxSize protocol.ByteCount, v protocol.Version) (shortHeaderPacket, error) {
+	sealer, err := p.cryptoSetup.Get1RTTSealer()
+	if err != nil {
+		return shortHeaderPacket{}, err
+	}
+	pn, pnLen := p.pnManager.PeekPacketNumber(protocol.Encryption1RTT)
+	connID := p.getDestConnID()
+	maxPayload := maxSize - wire.ShortHeaderLen(connID, pnLen) - protocol.ByteCount(sealer.Overhead())
+	for f := queue.Peek(); f != nil; f = queue.Peek() {
+		size := f.Length(v)
+		queue.Pop()
+		if size > maxPayload {
+			continue
+		} // PMTU may have decreased since enqueueing.
+		if size < 4-protocol.ByteCount(pnLen) {
+			// IP packets are larger than this. Do not silently add PADDING frames
+			// to an exempt packet when this API is accidentally used for a tiny payload.
+			continue
+		}
+		pl := payload{frames: []ackhandler.Frame{{Frame: f}}, length: size}
+		packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, sealer.KeyPhase(), pl, 0, maxSize, sealer, false, v)
+		packet.BypassCongestionControl = true
+		return packet, err
+	}
+	return shortHeaderPacket{}, errNothingToPack
 }
 
 func (p *packetPacker) maybeGetCryptoPacket(

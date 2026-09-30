@@ -3,6 +3,7 @@ package ackhandler
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -125,6 +126,7 @@ type sentPacketHandler struct {
 
 	// shortPacketNumbers allows single-byte packet numbers, as Chrome uses.
 	shortPacketNumbers bool
+	useReno            bool
 	// maxDatagramSize converts the congestion window into a packet count, which
 	// is what the packet number length depends on when shortPacketNumbers is set.
 	maxDatagramSize protocol.ByteCount
@@ -153,6 +155,7 @@ func NewSentPacketHandler(
 	ignorePacketsBelow func(protocol.PacketNumber),
 	pers protocol.Perspective,
 	shortPacketNumbers bool,
+	useReno bool,
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 ) SentPacketHandler {
@@ -161,12 +164,13 @@ func NewSentPacketHandler(
 		rttStats,
 		connStats,
 		initialMaxDatagramSize,
-		true, // use Reno
+		useReno,
 		qlogger,
 	)
 
 	h := &sentPacketHandler{
 		shortPacketNumbers:             shortPacketNumbers,
+		useReno:                        useReno,
 		maxDatagramSize:                initialMaxDatagramSize,
 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
 		peerAddressValidated:           pers == protocol.PerspectiveClient || clientAddressValidated,
@@ -325,6 +329,7 @@ func (h *sentPacketHandler) SentPacket(
 	size protocol.ByteCount,
 	isPathMTUProbePacket bool,
 	isPathProbePacket bool,
+	bypassCongestionControl bool,
 ) {
 	h.bytesSent += size
 	h.connStats.BytesSent.Add(uint64(size))
@@ -348,6 +353,7 @@ func (h *sentPacketHandler) SentPacket(
 	p.StreamFrames = streamFrames
 	p.IsPathMTUProbePacket = isPathMTUProbePacket
 	p.isPathProbePacket = isPathProbePacket
+	p.congestionControlBypassed = bypassCongestionControl
 	isAckEliciting := p.IsAckEliciting()
 
 	if isPathProbePacket {
@@ -356,29 +362,36 @@ func (h *sentPacketHandler) SentPacket(
 		return
 	}
 	h.congestionMutex.RLock()
-	p.congestionPacketNumber = protocol.PacketNumber(h.nextCongestionPacketNumber.Add(1))
+	if !bypassCongestionControl {
+		p.congestionPacketNumber = protocol.PacketNumber(h.nextCongestionPacketNumber.Add(1))
+	}
 	cc := h.congestion
 	h.congestionMutex.RUnlock()
 	priorInFlight := h.bytesInFlight
 	if isAckEliciting {
 		pnSpace.lastAckElicitingPacketTime = t
-		h.bytesInFlight += size
-		p.includedInBytesInFlight = true
-		if h.numProbesToSend > 0 {
+		if !bypassCongestionControl {
+			h.bytesInFlight += size
+			p.includedInBytesInFlight = true
+		}
+		if !bypassCongestionControl && h.numProbesToSend > 0 {
 			h.numProbesToSend--
 		}
 	}
 
-	if cc.injected {
-		if !h.packerEmptyTime.IsZero() {
-			if cc.extended != nil && t.Sub(h.packerEmptyTime) >= appLimitedThreshold && cc.CanSend(priorInFlight) {
-				cc.extended.OnAppLimited(priorInFlight)
+	// Retain ACK/loss tracking for exempt packets without feeding the sender.
+	if !bypassCongestionControl {
+		if cc.injected {
+			if !h.packerEmptyTime.IsZero() {
+				if cc.extended != nil && t.Sub(h.packerEmptyTime) >= appLimitedThreshold && cc.CanSend(priorInFlight) {
+					cc.extended.OnAppLimited(priorInFlight)
+				}
+				h.packerEmptyTime = 0
 			}
-			h.packerEmptyTime = 0
+			cc.OnPacketSent(t, priorInFlight, p.congestionPacketNumber, size, isAckEliciting)
+		} else {
+			cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
 		}
-		cc.OnPacketSent(t, priorInFlight, p.congestionPacketNumber, size, isAckEliciting)
-	} else {
-		cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
 	}
 
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
@@ -502,7 +515,9 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 				}
 				h.largestAckedTime = p.SendTime
 			}
-			cc.MaybeExitSlowStart()
+			if !p.congestionControlBypassed {
+				cc.MaybeExitSlowStart()
+			}
 		}
 	}
 
@@ -511,7 +526,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
 		if congested {
 			if !cc.injected {
-				cc.OnCongestionEvent(largestAcked, 0, priorInFlight)
+				for _, packet := range slices.Backward(ackedPackets) {
+					if !packet.congestionControlBypassed {
+						cc.OnCongestionEvent(packet.PacketNumber, 0, priorInFlight)
+						break
+					}
+				}
 			} else {
 				for i := len(ackedPackets) - 1; i >= 0; i-- {
 					if cc.reports(ackedPackets[i].packet) {
@@ -966,11 +986,11 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
 				if !cc.injected {
-					if !p.IsPathMTUProbePacket {
+					if !p.IsPathMTUProbePacket && !p.congestionControlBypassed {
 						cc.OnCongestionEvent(pn, p.Length, priorInFlight)
 					}
 				} else if cc.reports(p) {
-					if !p.IsPathMTUProbePacket {
+					if !p.IsPathMTUProbePacket && !p.congestionControlBypassed {
 						cc.OnCongestionEvent(p.congestionPacketNumber, p.Length, priorInFlight)
 					}
 					h.lostPacketsInfo = append(h.lostPacketsInfo, congestionExt.LostPacketInfo{
@@ -1296,7 +1316,7 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 				h.rttStats,
 				h.connStats,
 				initialMaxDatagramSize,
-				true, // use Reno
+				h.useReno,
 				h.qlogger,
 			),
 		}
@@ -1316,7 +1336,7 @@ type congestionControl struct {
 }
 
 func (cc congestionControl) reports(p *packet) bool {
-	return cc.injected && p.congestionPacketNumber >= cc.firstPacketNumber
+	return cc.injected && !p.congestionControlBypassed && p.congestionPacketNumber >= cc.firstPacketNumber
 }
 
 func (h *sentPacketHandler) getCongestionControl() congestionControl {
@@ -1353,4 +1373,12 @@ func (h *sentPacketHandler) MaybeNotifyAppLimited() {
 	if h.packerEmptyTime.IsZero() {
 		h.packerEmptyTime = monotime.Now()
 	}
+}
+
+// CanSendUncongestedDatagram applies transport and resource limits, independently
+// of the congestion controller. Reserve packet-history capacity for control and
+// recovery traffic, including when a DATAGRAM-only peer stops acknowledging.
+func (h *sentPacketHandler) CanSendUncongestedDatagram() bool {
+	return h.handshakeConfirmed && !h.isAmplificationLimited() &&
+		h.numProbesToSend == 0 && h.appDataPackets.history.Len() < protocol.MaxOutstandingSentPackets-64
 }
