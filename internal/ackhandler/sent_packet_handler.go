@@ -918,16 +918,40 @@ func (h *sentPacketHandler) detectLostPathProbes(now monotime.Time) {
 	}
 }
 
+// packetLossDelay is how long a packet may stay unacknowledged before the time
+// threshold declares it lost.
+//
+// RFC 9002 computes it as 9/8 * max(smoothed_rtt, latest_rtt), but the RTT
+// samples it is derived from have the peer's ACK delay subtracted
+// (RTTStats.UpdateRTT), while the peer is allowed to hold an ACK for up to its
+// advertised max_ack_delay. Without adding that delay back, the sender declares
+// a packet lost while its ACK is still sitting at the peer: on a mobile QUICX
+// tunnel with a 26 ms max_ack_delay, a third of the time-threshold spurious
+// losses had a network RTT below the threshold and were caused by nothing but
+// the peer's ACK delay. PTO accounts for the delay the same way.
+//
+// The addition is bounded by the RTT itself, so a peer advertising a
+// pathological max_ack_delay cannot push loss detection arbitrarily far out,
+// and it applies to 1-RTT packets only: the ACK Delay field is only meaningful
+// there, and a receiver must not delay ACKs of Initial or Handshake packets.
+func (h *sentPacketHandler) packetLossDelay(encLevel protocol.EncryptionLevel) time.Duration {
+	maxRTT := max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT())
+	// Minimum time of granularity before packets are deemed lost.
+	lossDelay := max(time.Duration(timeThreshold*float64(maxRTT)), protocol.TimerGranularity)
+	if encLevel == protocol.Encryption1RTT {
+		if peerMaxAckDelay := h.rttStats.MaxAckDelay(); peerMaxAckDelay > 0 {
+			lossDelay += min(peerMaxAckDelay, maxRTT)
+		}
+	}
+	return lossDelay
+}
+
 func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel, cc congestionControl) {
 	h.lostPacketsInfo = h.lostPacketsInfo[:0]
 	pnSpace := h.getPacketNumberSpace(encLevel)
 	pnSpace.lossTime = 0
 
-	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
-	lossDelay := time.Duration(timeThreshold * maxRTT)
-
-	// Minimum time of granularity before packets are deemed lost.
-	lossDelay = max(lossDelay, protocol.TimerGranularity)
+	lossDelay := h.packetLossDelay(encLevel)
 
 	// Packets sent before this time are deemed lost.
 	lostSendTime := now.Add(-lossDelay)
