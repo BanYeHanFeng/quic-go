@@ -502,6 +502,14 @@ func (e PTOCountUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 type PacketLost struct {
 	Header  PacketHeader
 	Trigger PacketLossReason
+	// AckEliciting is false for packets which carried no ack-eliciting frame
+	// (an ACK-only packet, for example). Such a packet is still declared lost
+	// and its packet number is spent, but the loss never triggers a
+	// retransmission or a congestion event. It is reported here because the
+	// packet is just as lost as any other, and leaving it out makes the
+	// sender's own loss report look smaller than the path loss an observer
+	// derives from the packet number sets of both endpoints.
+	AckEliciting bool
 }
 
 func (e PacketLost) Name() string { return "recovery:packet_lost" }
@@ -515,6 +523,8 @@ func (e PacketLost) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	}
 	h.WriteToken(jsontext.String("trigger"))
 	h.WriteToken(jsontext.String(string(e.Trigger)))
+	h.WriteToken(jsontext.String("ack_eliciting"))
+	h.WriteToken(jsontext.Bool(e.AckEliciting))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
@@ -524,6 +534,11 @@ type SpuriousLoss struct {
 	PacketNumber     protocol.PacketNumber
 	PacketReordering uint64
 	TimeReordering   time.Duration
+	// Trigger is the loss detection which wrongly declared this packet lost.
+	// Without it, a spurious loss only shows that the detector was wrong, not
+	// which of the two detectors (time threshold, reordering threshold) to
+	// tune.
+	Trigger PacketLossReason
 }
 
 func (e SpuriousLoss) Name() string { return "recovery:spurious_loss" }
@@ -539,6 +554,36 @@ func (e SpuriousLoss) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h.WriteToken(jsontext.Uint(e.PacketReordering))
 	h.WriteToken(jsontext.String("reordering_time"))
 	h.WriteToken(jsontext.Float(milliseconds(e.TimeReordering)))
+	if e.Trigger != "" {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String(string(e.Trigger)))
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// ReorderingWindowUpdated reports the packet threshold loss detection uses.
+// This is not an RFC 9002 event: the fork raises the threshold above the RFC
+// value while the path proves that it reorders further than that, and without
+// the event a raised threshold is invisible in the trace (losses simply stop
+// being reported, without saying why).
+type ReorderingWindowUpdated struct {
+	// PacketThreshold is the packet threshold now in use.
+	PacketThreshold uint64
+	// ObservedReordering is the reordering distance which raised it. It is zero
+	// when the threshold only decayed.
+	ObservedReordering uint64
+}
+
+func (e ReorderingWindowUpdated) Name() string { return "recovery:reordering_window_updated" }
+
+func (e ReorderingWindowUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("packet_threshold"))
+	h.WriteToken(jsontext.Uint(e.PacketThreshold))
+	h.WriteToken(jsontext.String("observed_reordering"))
+	h.WriteToken(jsontext.Uint(e.ObservedReordering))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
@@ -742,6 +787,19 @@ type LossTimerUpdated struct {
 	TimerType TimerType
 	EncLevel  EncryptionLevel
 	Time      time.Time
+	// OutstandingPackets lists the packet numbers which were still awaiting an
+	// ACK or a loss declaration when a PTO expired. A packet which is lost
+	// while it is the last one outstanding is never declared lost: loss
+	// detection needs a larger packet number to be acknowledged, so a PTO
+	// probe is sent instead and the original packet stays outstanding. This
+	// list is what makes those losses visible in the sender's own trace, where
+	// they would otherwise only show up as a packet the peer never received.
+	//
+	// TimerType and EncLevel identify the timer which was set, expired or
+	// cancelled. A cancelled event has no time of its own, so these two fields
+	// are the only attribution it can carry; they are omitted when the timer
+	// which was recorded did not know them.
+	OutstandingPackets []protocol.PacketNumber
 }
 
 func (e LossTimerUpdated) Name() string { return "recovery:loss_timer_updated" }
@@ -751,27 +809,24 @@ func (e LossTimerUpdated) Encode(enc *jsontext.Encoder, t time.Time) error {
 	h.WriteToken(jsontext.BeginObject)
 	h.WriteToken(jsontext.String("event_type"))
 	h.WriteToken(jsontext.String(string(e.Type)))
-	h.WriteToken(jsontext.String("timer_type"))
-	h.WriteToken(jsontext.String(string(e.TimerType)))
-	h.WriteToken(jsontext.String("packet_number_space"))
-	h.WriteToken(jsontext.String(encLevelToPacketNumberSpace(e.EncLevel)))
+	if e.TimerType != "" {
+		h.WriteToken(jsontext.String("timer_type"))
+		h.WriteToken(jsontext.String(string(e.TimerType)))
+		h.WriteToken(jsontext.String("packet_number_space"))
+		h.WriteToken(jsontext.String(encLevelToPacketNumberSpace(e.EncLevel)))
+	}
 	if e.Type == LossTimerUpdateTypeSet {
 		h.WriteToken(jsontext.String("delta"))
 		h.WriteToken(jsontext.Float(milliseconds(e.Time.Sub(t))))
 	}
-	h.WriteToken(jsontext.EndObject)
-	return h.err
-}
-
-type eventLossTimerCanceled struct{}
-
-func (e eventLossTimerCanceled) Name() string { return "recovery:loss_timer_updated" }
-
-func (e eventLossTimerCanceled) Encode(enc *jsontext.Encoder, _ time.Time) error {
-	h := encoderHelper{enc: enc}
-	h.WriteToken(jsontext.BeginObject)
-	h.WriteToken(jsontext.String("event_type"))
-	h.WriteToken(jsontext.String("cancelled"))
+	if len(e.OutstandingPackets) > 0 {
+		h.WriteToken(jsontext.String("outstanding_packets"))
+		h.WriteToken(jsontext.BeginArray)
+		for _, pn := range e.OutstandingPackets {
+			h.WriteToken(jsontext.Uint(uint64(pn)))
+		}
+		h.WriteToken(jsontext.EndArray)
+	}
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
