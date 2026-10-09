@@ -79,6 +79,9 @@ type sentPacketHandler struct {
 	handshakePackets *packetNumberSpace
 	appDataPackets   *packetNumberSpace
 	lostPackets      lostPacketTracker // only for application-data packet number space
+	// reorderingWindow is the packet threshold loss detection uses. It adapts to
+	// the reordering the path shows, see reordering_window.go.
+	reorderingWindow reorderingWindow
 	// send time of the largest acknowledged packet, across all packet number spaces
 	largestAckedTime monotime.Time
 
@@ -178,6 +181,7 @@ func NewSentPacketHandler(
 		handshakePackets:               newPacketNumberSpace(0, false),
 		appDataPackets:                 newPacketNumberSpace(0, true),
 		lostPackets:                    *newLostPacketTracker(64),
+		reorderingWindow:               newReorderingWindow(),
 		rttStats:                       rttStats,
 		connStats:                      connStats,
 		congestion:                     congestionControl{SendAlgorithmWithDebugInfos: congestion},
@@ -580,10 +584,19 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 
 	// detect spurious losses for application data packets, if the ACK was not reordered
 	if encLevel == protocol.Encryption1RTT && largestAcked == pnSpace.largestAcked {
-		h.detectSpuriousLosses(
+		maxReordering := h.detectSpuriousLosses(
 			ack,
 			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
 		)
+		// A packet which turned out to be only late is proof that this path
+		// reorders at least that far, and the packet threshold has to allow for
+		// it or the next packet reordered by the same path is declared lost too.
+		if threshold, changed := h.reorderingWindow.Observe(rcvTime, maxReordering); changed && h.qlogger != nil {
+			h.qlogger.RecordEvent(qlog.ReorderingWindowUpdated{
+				PacketThreshold:    uint64(threshold),
+				ObservedReordering: uint64(maxReordering),
+			})
+		}
 		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
 	}
@@ -613,12 +626,15 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	return acked1RTTPacket, nil
 }
 
-func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) {
+// detectSpuriousLosses deletes the packets which this ACK proves were declared
+// lost although they were only late, and reports how far the path had reordered
+// the furthest of them behind the packets which were acknowledged first.
+func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) protocol.PacketNumber {
 	var maxPacketReordering protocol.PacketNumber
-	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
 	var spuriousLosses []protocol.PacketNumber
-	for pn, sendTime := range h.lostPackets.All() {
+	for pn, lost := range h.lostPackets.All() {
+		sendTime := lost.SendTime
 		ackRange := ack.AckRanges[ackRangeIdx]
 		for pn > ackRange.Largest {
 			// this should never happen, since detectSpuriousLosses is only called for ACKs that increase the largest acked
@@ -635,7 +651,6 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 			packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
 			timeReordering := ackTime.Sub(sendTime)
 			maxPacketReordering = max(maxPacketReordering, packetReordering)
-			maxTimeReordering = max(maxTimeReordering, timeReordering)
 
 			if h.qlogger != nil {
 				h.qlogger.RecordEvent(qlog.SpuriousLoss{
@@ -643,6 +658,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 					PacketNumber:     pn,
 					PacketReordering: uint64(packetReordering),
 					TimeReordering:   timeReordering,
+					Trigger:          lost.Trigger,
 				})
 			}
 			spuriousLosses = append(spuriousLosses, pn)
@@ -651,6 +667,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	for _, pn := range spuriousLosses {
 		h.lostPackets.Delete(pn)
 	}
+	return maxPacketReordering
 }
 
 // Packets are returned in ascending packet number order.
@@ -833,8 +850,14 @@ func (h *sentPacketHandler) setLossDetectionTimer(now monotime.Time) {
 	if !hasAlarm && !oldAlarm.Time.IsZero() {
 		h.logger.Debugf("Canceling loss detection timer.")
 		if h.qlogger != nil {
+			// The cancelled timer has to carry the identity of the alarm it
+			// cancels: without the timer type and the packet number space a
+			// cancellation is not attributable, and a PTO cancellation cannot
+			// be told from the cancellation of a loss-time timer.
 			h.qlogger.RecordEvent(qlog.LossTimerUpdated{
-				Type: qlog.LossTimerUpdateTypeCancelled,
+				Type:      qlog.LossTimerUpdateTypeCancelled,
+				TimerType: oldAlarm.TimerType,
+				EncLevel:  oldAlarm.EncryptionLevel,
 			})
 		}
 	}
@@ -915,19 +938,53 @@ func (h *sentPacketHandler) detectLostPathProbes(now monotime.Time) {
 	}
 }
 
+// packetLossDelay is how long a packet may stay unacknowledged before the time
+// threshold declares it lost.
+//
+// RFC 9002 computes it as 9/8 * max(smoothed_rtt, latest_rtt), but the RTT
+// samples it is derived from have the peer's ACK delay subtracted
+// (RTTStats.UpdateRTT), while the peer is allowed to hold an ACK for up to its
+// advertised max_ack_delay. Without adding that delay back, the sender declares
+// a packet lost while its ACK is still sitting at the peer: on a mobile QUICX
+// tunnel with a 26 ms max_ack_delay, a third of the time-threshold spurious
+// losses had a network RTT below the threshold and were caused by nothing but
+// the peer's ACK delay. PTO accounts for the delay the same way.
+//
+// The addition is bounded by the RTT itself, so a peer advertising a
+// pathological max_ack_delay cannot push loss detection arbitrarily far out,
+// and it applies to 1-RTT packets only: the ACK Delay field is only meaningful
+// there, and a receiver must not delay ACKs of Initial or Handshake packets.
+func (h *sentPacketHandler) packetLossDelay(encLevel protocol.EncryptionLevel) time.Duration {
+	maxRTT := max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT())
+	// Minimum time of granularity before packets are deemed lost.
+	lossDelay := max(time.Duration(timeThreshold*float64(maxRTT)), protocol.TimerGranularity)
+	if encLevel == protocol.Encryption1RTT {
+		if peerMaxAckDelay := h.rttStats.MaxAckDelay(); peerMaxAckDelay > 0 {
+			lossDelay += min(peerMaxAckDelay, maxRTT)
+		}
+	}
+	return lossDelay
+}
+
 func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel, cc congestionControl) {
 	h.lostPacketsInfo = h.lostPacketsInfo[:0]
 	pnSpace := h.getPacketNumberSpace(encLevel)
 	pnSpace.lossTime = 0
 
-	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
-	lossDelay := time.Duration(timeThreshold * maxRTT)
-
-	// Minimum time of granularity before packets are deemed lost.
-	lossDelay = max(lossDelay, protocol.TimerGranularity)
+	lossDelay := h.packetLossDelay(encLevel)
 
 	// Packets sent before this time are deemed lost.
 	lostSendTime := now.Add(-lossDelay)
+
+	// The packet threshold adapts to the reordering the path shows. It is read
+	// once per call so that a decay which happens while this pass runs cannot
+	// change the threshold halfway through it.
+	reorderingThreshold, reorderingThresholdDecayed := h.reorderingWindow.Threshold(now)
+	if reorderingThresholdDecayed && h.qlogger != nil {
+		h.qlogger.RecordEvent(qlog.ReorderingWindowUpdated{
+			PacketThreshold: uint64(reorderingThreshold),
+		})
+	}
 
 	priorInFlight := h.bytesInFlight
 	for pn, p := range pnSpace.history.Packets() {
@@ -936,37 +993,18 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 		}
 
 		var packetLost bool
+		var packetLossTrigger qlog.PacketLossReason
 		if !p.SendTime.After(lostSendTime) {
 			packetLost = true
-			if !p.isPathProbePacket && p.IsAckEliciting() {
-				if h.logger.Debug() {
-					h.logger.Debugf("\tlost packet %d (time threshold)", pn)
-				}
-				if h.qlogger != nil {
-					h.qlogger.RecordEvent(qlog.PacketLost{
-						Header: qlog.PacketHeader{
-							PacketType:   qlog.EncryptionLevelToPacketType(p.EncryptionLevel),
-							PacketNumber: pn,
-						},
-						Trigger: qlog.PacketLossTimeThreshold,
-					})
-				}
+			packetLossTrigger = qlog.PacketLossTimeThreshold
+			if !p.isPathProbePacket && p.IsAckEliciting() && h.logger.Debug() {
+				h.logger.Debugf("\tlost packet %d (time threshold)", pn)
 			}
-		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
+		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= reorderingThreshold {
 			packetLost = true
-			if !p.isPathProbePacket && p.IsAckEliciting() {
-				if h.logger.Debug() {
-					h.logger.Debugf("\tlost packet %d (reordering threshold)", pn)
-				}
-				if h.qlogger != nil {
-					h.qlogger.RecordEvent(qlog.PacketLost{
-						Header: qlog.PacketHeader{
-							PacketType:   qlog.EncryptionLevelToPacketType(p.EncryptionLevel),
-							PacketNumber: pn,
-						},
-						Trigger: qlog.PacketLossReorderingThreshold,
-					})
-				}
+			packetLossTrigger = qlog.PacketLossReorderingThreshold
+			if !p.isPathProbePacket && p.IsAckEliciting() && h.logger.Debug() {
+				h.logger.Debugf("\tlost packet %d (reordering threshold)", pn)
 			}
 		} else if pnSpace.lossTime.IsZero() {
 			// Note: This conditional is only entered once per call
@@ -977,8 +1015,25 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 			pnSpace.lossTime = lossTime
 		}
 		if packetLost {
+			if !p.isPathProbePacket {
+				// Every lost packet is traced, including packets which were not
+				// ack-eliciting: an ACK-only packet is lost just like any other,
+				// but its loss causes no retransmission and no congestion event,
+				// so it is marked in the event to keep the two populations
+				// apart when the trace is analysed.
+				if h.qlogger != nil {
+					h.qlogger.RecordEvent(qlog.PacketLost{
+						Header: qlog.PacketHeader{
+							PacketType:   qlog.EncryptionLevelToPacketType(p.EncryptionLevel),
+							PacketNumber: pn,
+						},
+						Trigger:      packetLossTrigger,
+						AckEliciting: p.IsAckEliciting(),
+					})
+				}
+			}
 			if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-				h.lostPackets.Add(pn, p.SendTime)
+				h.lostPackets.Add(pn, p.SendTime, packetLossTrigger)
 			}
 			pnSpace.history.DeclareLost(pn)
 			if !p.isPathProbePacket && p.IsAckEliciting() {
@@ -1068,10 +1123,16 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		h.logger.Debugf("Loss detection alarm for %s fired in PTO mode. PTO count: %d", encLevel, h.ptoCount)
 	}
 	if h.qlogger != nil {
+		// A packet which is lost while it is the last one outstanding is never
+		// declared lost: time threshold detection needs a larger packet number
+		// to be acknowledged first. The PTO probe is the sender's only reaction,
+		// so the packets which were outstanding here are recorded to make those
+		// otherwise invisible losses attributable.
 		h.qlogger.RecordEvent(qlog.LossTimerUpdated{
-			Type:      qlog.LossTimerUpdateTypeExpired,
-			TimerType: qlog.TimerTypePTO,
-			EncLevel:  encLevel,
+			Type:               qlog.LossTimerUpdateTypeExpired,
+			TimerType:          qlog.TimerTypePTO,
+			EncLevel:           encLevel,
+			OutstandingPackets: ps.history.OutstandingPackets(),
 		})
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: h.ptoCount})
 	}
@@ -1284,8 +1345,12 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 	if h.qlogger != nil {
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: 0})
 		if !oldAlarm.Time.IsZero() {
+			// Discarding a packet number space cancels the timer of that
+			// space: the alarm it replaces says which one it was.
 			h.qlogger.RecordEvent(qlog.LossTimerUpdated{
-				Type: qlog.LossTimerUpdateTypeCancelled,
+				Type:      qlog.LossTimerUpdateTypeCancelled,
+				TimerType: oldAlarm.TimerType,
+				EncLevel:  oldAlarm.EncryptionLevel,
 			})
 		}
 	}

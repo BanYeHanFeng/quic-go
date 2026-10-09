@@ -3127,6 +3127,30 @@ func (c *Conn) onStreamCompleted(id protocol.StreamID) {
 	c.framer.RemoveActiveStream(id)
 }
 
+// MaxDatagramPayloadSize returns the maximum payload size of a DATAGRAM frame
+// which can currently be sent on this connection. It is the smaller of the
+// limit the peer announced in its max_datagram_frame_size transport parameter
+// and the payload size the current path can carry. It returns 0 when the peer
+// does not support DATAGRAM frames, or before the handshake completed, and the
+// value can grow while path MTU discovery raises the packet size.
+func (c *Conn) MaxDatagramPayloadSize() int64 {
+	if c.peerParams == nil || !c.supportsDatagrams() {
+		return 0
+	}
+	return int64(c.maxDatagramPayloadSize())
+}
+
+// maxDatagramPayloadSize is the payload size SendDatagram can send right now.
+// The payload size estimate is conservative: under many circumstances a few
+// more bytes would fit.
+func (c *Conn) maxDatagramPayloadSize() protocol.ByteCount {
+	f := &wire.DatagramFrame{DataLenPresent: true}
+	return min(
+		f.MaxDataLen(c.peerMaxDatagramFrameSize(), c.version),
+		protocol.ByteCount(c.maxPayloadSizeEstimate.Load()),
+	)
+}
+
 // SendDatagram sends a message using a QUIC datagram, as specified in RFC 9221,
 // if the peer enabled datagram support.
 // There is no delivery guarantee for DATAGRAM frames, they are not retransmitted if lost.
@@ -3152,12 +3176,7 @@ func (c *Conn) sendDatagram(p []byte, queue *datagramQueue) error {
 	}
 
 	f := &wire.DatagramFrame{DataLenPresent: true}
-	// The payload size estimate is conservative.
-	// Under many circumstances we could send a few more bytes.
-	maxDataLen := min(
-		f.MaxDataLen(c.peerMaxDatagramFrameSize(), c.version),
-		protocol.ByteCount(c.maxPayloadSizeEstimate.Load()),
-	)
+	maxDataLen := c.maxDatagramPayloadSize()
 	if protocol.ByteCount(len(p)) > maxDataLen {
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
 	}
@@ -3271,8 +3290,22 @@ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
 	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
 }
 
+// qlogRecorderSetter is implemented by congestion controllers which can report
+// their internal state into the connection's qlog trace. Controllers installed
+// with SetCongestionControl are not built by the connection, so they have no
+// other way to reach the trace; a controller which does not implement it is
+// simply not traced.
+type qlogRecorderSetter interface {
+	SetQlogger(qlogwriter.Recorder)
+}
+
 // SetCongestionControl replace the current congestion control algorithm with a new one.
 func (c *Conn) SetCongestionControl(cc congestion.CongestionControl) {
+	if c.qlogger != nil {
+		if setter, ok := cc.(qlogRecorderSetter); ok {
+			setter.SetQlogger(c.qlogger)
+		}
+	}
 	c.sentPacketHandler.SetCongestionControl(cc)
 }
 
