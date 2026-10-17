@@ -3158,7 +3158,20 @@ func (c *Conn) maxDatagramPayloadSize() protocol.ByteCount {
 // In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
 // If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
 func (c *Conn) SendDatagram(p []byte) error {
-	return c.sendDatagram(p, c.datagramQueue)
+	return c.sendDatagram(p, nil, c.datagramQueue)
+}
+
+// SendDatagramOwned sends a message using a QUIC datagram, like SendDatagram,
+// but takes over the payload instead of copying it: the payload is written into
+// the packet as it is, and owner is asked to release it once the datagram has
+// been sent out or discarded. owner may be nil, in which case the payload is
+// simply not released.
+//
+// The caller must not modify or reference p after the call. The payload is still
+// copied into the packet, so a payload that was assembled for exactly this
+// datagram (as a forwarder does) saves the copy SendDatagram makes.
+func (c *Conn) SendDatagramOwned(p []byte, owner DatagramBufferOwner) error {
+	return c.sendDatagram(p, owner, c.datagramQueue)
 }
 
 // SendDatagramWithoutCongestionControl sends an IP-tunneling DATAGRAM without
@@ -3167,30 +3180,61 @@ func (c *Conn) SendDatagram(p []byte) error {
 // Packets are Not-ECT, remain ACK/loss tracked and are never retransmitted.
 // This opt-in API uses a bounded queue and waits for handshake confirmation.
 func (c *Conn) SendDatagramWithoutCongestionControl(p []byte) error {
-	return c.sendDatagram(p, c.uncongestedDatagramQueue)
+	return c.sendDatagram(p, nil, c.uncongestedDatagramQueue)
 }
 
-func (c *Conn) sendDatagram(p []byte, queue *datagramQueue) error {
+func (c *Conn) sendDatagram(p []byte, owner DatagramBufferOwner, queue *datagramQueue) error {
 	if !c.supportsDatagrams() {
+		releaseDatagramBuffer(owner)
 		return errors.New("datagram support disabled")
 	}
 
 	f := &wire.DatagramFrame{DataLenPresent: true}
 	maxDataLen := c.maxDatagramPayloadSize()
 	if protocol.ByteCount(len(p)) > maxDataLen {
+		releaseDatagramBuffer(owner)
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
 	}
-	f.Data = make([]byte, len(p))
-	copy(f.Data, p)
+	if owner != nil {
+		f.Data = p
+		f.Owner = owner
+	} else {
+		f.Data = make([]byte, len(p))
+		copy(f.Data, p)
+	}
 	return queue.Add(f)
 }
 
 // ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.
+//
+// The payload of the returned message is only valid until it is released: it is
+// recycled once the next datagram is received on this connection. Use
+// ReceiveDatagramOwned to keep or to forward the payload.
 func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	if !c.config.EnableDatagrams {
 		return nil, errors.New("datagram support disabled")
 	}
-	return c.datagramQueue.Receive(ctx)
+	f, err := c.datagramQueue.Receive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return f.Data, nil
+}
+
+// ReceiveDatagramOwned gets a message received in a QUIC datagram, as specified
+// in RFC 9221, together with the owner of its payload. The payload stays valid
+// until owner.ReleaseDatagramBuffer is called, which the caller must do once the
+// payload is no longer used. owner may be nil, in which case the payload is only
+// garbage collected.
+func (c *Conn) ReceiveDatagramOwned(ctx context.Context) ([]byte, DatagramBufferOwner, error) {
+	if !c.config.EnableDatagrams {
+		return nil, nil, errors.New("datagram support disabled")
+	}
+	f, err := c.datagramQueue.Receive(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f.Data, f.Owner, nil
 }
 
 // LocalAddr returns the local address of the QUIC connection.
