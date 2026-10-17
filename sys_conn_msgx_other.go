@@ -1,4 +1,4 @@
-//go:build freebsd || (linux && (386 || s390x))
+//go:build freebsd || (linux && (386 || arm || mips || mipsle || s390x))
 
 package quic
 
