@@ -767,29 +767,46 @@ func (p *packetPacker) composeNextPacket(
 	}
 
 	if p.datagramQueue != nil {
-		if f := p.datagramQueue.Peek(); f != nil {
+		// A packet carries as many DATAGRAM frames as fit into it. A datagram
+		// forwarder sends messages that are much smaller than a packet, and one
+		// frame per packet then costs one packet number, one header, one AEAD tag
+		// and one sendmsg per message. The frames are independent, so a packet
+		// that is lost takes several of them down with it, which is the delivery
+		// guarantee DATAGRAM frames have anyway.
+		for {
+			f := p.datagramQueue.Peek()
+			if f == nil {
+				break
+			}
 			size := f.Length(v)
 			if size <= maxPayloadSize-pl.length { // DATAGRAM frame fits
 				pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
 				pl.length += size
 				p.datagramQueue.Pop()
 				p.peekTimes = 0
-			} else if pl.ack == nil {
-				// The DATAGRAM frame doesn't fit, and the packet doesn't contain an ACK.
-				// Discard this frame. There's no point in retrying this in the next packet,
-				// as it's unlikely that the available packet size will increase.
-				p.datagramQueue.Pop()
-				p.peekTimes = 0
+				continue
 			}
-			// If the DATAGRAM frame was too large and the packet contained an ACK, we'll try to send it out later.
+			if pl.ack == nil && len(pl.frames) == 0 {
+				// The DATAGRAM frame doesn't fit into a packet of its own, so the
+				// available packet size must have decreased since it was queued.
+				// Discard this frame. There's no point in retrying this in the next
+				// packet, as it's unlikely that the available packet size will increase.
+				p.datagramQueue.Discard()
+				p.peekTimes = 0
+				continue
+			}
+			// The frame doesn't fit next to what this packet already carries (an ACK,
+			// or the DATAGRAM frames packed above), so it goes out with a later one.
 			p.peekTimes++
 			if p.peekTimes > DatagramFrameMaxPeekTimes {
 				if p.datagramQueue.logger != nil && p.datagramQueue.logger.Debug() {
 					p.datagramQueue.logger.Debugf("Discarded DATAGRAM frame (%d bytes payload)", size)
 				}
-				p.datagramQueue.Pop()
+				p.datagramQueue.Discard()
 				p.peekTimes = 0
+				continue
 			}
+			break
 		}
 	}
 
