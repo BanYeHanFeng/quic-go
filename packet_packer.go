@@ -556,11 +556,13 @@ func (p *packetPacker) AppendUncongestedDatagramPacket(buf *packetBuffer, queue 
 		size := f.Length(v)
 		queue.Pop()
 		if size > maxPayload {
+			f.ReleaseDatagram()
 			continue
 		} // PMTU may have decreased since enqueueing.
 		if size < 4-protocol.ByteCount(pnLen) {
 			// IP packets are larger than this. Do not silently add PADDING frames
 			// to an exempt packet when this API is accidentally used for a tiny payload.
+			f.ReleaseDatagram()
 			continue
 		}
 		pl := payload{frames: []ackhandler.Frame{{Frame: f}}, length: size}
@@ -1105,6 +1107,12 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 		raw, err = f.Frame.Append(raw, v)
 		if err != nil {
 			return nil, err
+		}
+		// The DATAGRAM payload was copied into the packet buffer, so the frame no
+		// longer needs it: returning it to its owner is what keeps the forwarding
+		// path free of per-packet allocations.
+		if datagramFrame, ok := f.Frame.(*wire.DatagramFrame); ok {
+			datagramFrame.ReleaseDatagram()
 		}
 	}
 	for _, f := range pl.streamFrames {
