@@ -70,7 +70,10 @@ func parseDatagramFrame(b []byte, typ FrameType, _ protocol.Version) (*DatagramF
 	} else {
 		length = uint64(len(b))
 	}
-	f.Data = make([]byte, length)
+	// The payload is copied out of the packet buffer, which is recycled as soon
+	// as the packet has been processed, but it is taken from a pool: the copy is
+	// what makes the frame independent of the packet, the allocation is not.
+	f.Data, f.Owner = getDatagramPayload(int(length))
 	copy(f.Data, b)
 	return f, startLen - len(b) + int(length), nil
 }
