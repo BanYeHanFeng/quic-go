@@ -606,8 +606,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	ackedPackets = nil    //nolint:ineffassign // This is just to be on the safe side.
 	clear(h.ackedPackets) // make sure the memory is released
 	h.ackedPackets = h.ackedPackets[:0]
-	h.ackedPacketsInfo = nil //nolint:ineffassign // This is just to be on the safe side.
-	h.lostPacketsInfo = nil  //nolint:ineffassign // This is just to be on the safe side.
+	// The two slices are reused instead of being dropped: they only hold plain
+	// counters and the congestion controller just reads them, while dropping them
+	// made every ACK allocate them again from scratch. That was the single largest
+	// allocation of the send path.
+	h.ackedPacketsInfo = h.ackedPacketsInfo[:0]
+	h.lostPacketsInfo = h.lostPacketsInfo[:0]
 
 	// Reset the pto_count unless the client is unsure if the server has validated the client's address.
 	if h.peerCompletedAddressValidation {
