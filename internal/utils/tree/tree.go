@@ -29,6 +29,7 @@ package tree
 
 import (
 	"fmt"
+	"sync"
 )
 
 type Val[T any] interface {
@@ -38,9 +39,10 @@ type Val[T any] interface {
 
 // Btree represents an AVL tree
 type Btree[T Val[T]] struct {
-	root   *Node[T]
-	values []T
-	len    int
+	root    *Node[T]
+	values  []T
+	matches []T
+	len     int
 }
 
 // Node represents a node in the tree with a value, left and right children, and a height/balance of the node.
@@ -48,6 +50,31 @@ type Node[T Val[T]] struct {
 	Value       T
 	left, right *Node[T]
 	height      int8
+}
+
+// Nodes are recycled: a frame sorter allocates one node per received gap and
+// frees it again when the gap is filled, so at forwarding rates the tree churn is
+// a steady stream of small allocations.
+var nodePool sync.Pool
+
+func getNode[T Val[T]](value T) *Node[T] {
+	if pooled := nodePool.Get(); pooled != nil {
+		if n, ok := pooled.(*Node[T]); ok {
+			n.Value = value
+			return n.Init()
+		}
+		nodePool.Put(pooled)
+	}
+	return (&Node[T]{Value: value}).Init()
+}
+
+func putNode[T Val[T]](n *Node[T]) {
+	var zero T
+	// Drop the reference the value might hold, the node outlives it in the pool.
+	n.Value = zero
+	n.left, n.right = nil, nil
+	n.height = 0
+	nodePool.Put(n)
 }
 
 // New returns a new btree
@@ -90,7 +117,7 @@ func (t *Btree[T]) Insert(value T) *Btree[T] {
 func insert[T Val[T]](n *Node[T], value T, added *bool) *Node[T] {
 	if n == nil {
 		*added = true
-		return (&Node[T]{Value: value}).Init()
+		return getNode(value)
 	}
 	c := value.Comp(n.Value)
 	if c > 0 {
@@ -171,11 +198,18 @@ func (t *Btree[T]) Get(value T) *T {
 	return nil
 }
 
+// Match returns all values matching cond.
+//
+// The result is only valid until the next call to Match on the same tree: it is
+// written into a buffer that the tree keeps, because the frame sorter calls this
+// once per received frame and a fresh slice per call was a noticeable part of its
+// allocation profile.
 func (t *Btree[T]) Match(cond T) []T {
-	var matches []T
+	matches := t.matches[:0]
 	if t.root != nil {
 		t.root.match(cond, &matches)
 	}
+	t.matches = matches
 	return matches
 }
 
@@ -269,12 +303,12 @@ func deleteNode[T Val[T]](n *Node[T], value T, deleted *bool) *Node[T] {
 	} else {
 		if n.left == nil {
 			t := n.right
-			n.Init()
+			putNode(n)
 			*deleted = true
 			return t
 		} else if n.right == nil {
 			t := n.left
-			n.Init()
+			putNode(n)
 			*deleted = true
 			return t
 		}
@@ -310,19 +344,25 @@ func deleteNode[T Val[T]](n *Node[T], value T, deleted *bool) *Node[T] {
 // Pop deletes the last node from the tree and returns its value
 func (t *Btree[T]) Pop() *T {
 	value := t.Tail()
-	if value != nil {
-		t.Delete(*value)
+	if value == nil {
+		return nil
 	}
-	return value
+	// The value is copied out: deleting the node returns it to the pool, and the
+	// returned pointer would otherwise point into a recycled node.
+	popped := *value
+	t.Delete(popped)
+	return &popped
 }
 
 // Pull deletes the first node from the tree and returns its value
 func (t *Btree[T]) Pull() *T {
 	value := t.Head()
-	if value != nil {
-		t.Delete(*value)
+	if value == nil {
+		return nil
 	}
-	return value
+	pulled := *value
+	t.Delete(pulled)
+	return &pulled
 }
 
 // NodeIterator expresses the iterator function used for traversals
