@@ -17,6 +17,37 @@ var MaxDatagramSize protocol.ByteCount = 16383
 type DatagramFrame struct {
 	DataLenPresent bool
 	Data           []byte
+
+	// Owner releases Data once the frame has been serialized into a packet, or
+	// once it is discarded without being sent. It is nil when the frame does not
+	// own its payload (the application keeps ownership, e.g. for SendDatagram).
+	Owner DatagramBufferOwner
+
+	// releasedLen remembers the payload size after Data was released, so that
+	// logging still reports the size of the datagram that went out.
+	releasedLen int
+}
+
+// PayloadLen returns the length of the datagram payload, also after the payload
+// was returned to its owner.
+func (f *DatagramFrame) PayloadLen() int {
+	if f.Data == nil {
+		return f.releasedLen
+	}
+	return len(f.Data)
+}
+
+// ReleaseDatagram returns the payload to its owner. It is called exactly once,
+// when the payload is no longer needed.
+func (f *DatagramFrame) ReleaseDatagram() {
+	if f.Owner == nil {
+		return
+	}
+	f.releasedLen = len(f.Data)
+	f.Data = nil
+	owner := f.Owner
+	f.Owner = nil
+	owner.ReleaseDatagramBuffer()
 }
 
 func parseDatagramFrame(b []byte, typ FrameType, _ protocol.Version) (*DatagramFrame, int, error) {

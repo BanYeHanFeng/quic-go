@@ -38,7 +38,7 @@ func toQlogFrame(frame wire.Frame) qlog.Frame {
 	case *wire.DatagramFrame:
 		return qlog.Frame{
 			Frame: &qlog.DatagramFrame{
-				Length: int64(len(f.Data)),
+				Length: int64(f.PayloadLen()),
 			},
 		}
 	default:
