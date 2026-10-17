@@ -461,13 +461,52 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 	return p, nil
 }
 
+// oobWriteState carries one WritePacket call into the runtime poller.
+//
+// The send has to be handed to syscall.RawConn.Write as a callback, and a closure
+// capturing the packet allocates on every sent packet: a forwarding session sends
+// hundreds of thousands of them per second, so the callback is bound to a state
+// object that comes from a pool instead.
+type oobWriteState struct {
+	// The control messages of a packet are assembled here: the segment size and
+	// ECN control messages are appended to the packet info control message.
+	oobBuffer [oobBufferSize]byte
+
+	b        []byte
+	oob      []byte
+	sockaddr unix.Sockaddr
+	n        int
+	err      error
+	writeFn  func(fd uintptr) bool
+}
+
+var oobWriteStatePool = sync.Pool{
+	New: func() any {
+		state := new(oobWriteState)
+		state.writeFn = state.write
+		return state
+	},
+}
+
+func (s *oobWriteState) write(fd uintptr) bool {
+	for {
+		s.n, s.err = unix.SendmsgN(int(fd), s.b, s.oob, s.sockaddr, 0)
+		if s.err == unix.EINTR {
+			continue
+		}
+		return s.err != unix.EAGAIN
+	}
+}
+
 // WritePacket writes a new packet.
 func (c *oobConn) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN) (int, error) {
 	remoteUDPAddr, isUDPAddr := addr.(*net.UDPAddr)
 	if !isUDPAddr {
 		return 0, fmt.Errorf("expected a *net.UDPAddr, got %T", addr)
 	}
-	oob := packetInfoOOB
+	state := oobWriteStatePool.Get().(*oobWriteState)
+	defer oobWriteStatePool.Put(state)
+	oob := append(state.oobBuffer[:0], packetInfoOOB...)
 	var segmentSize int
 	if gsoSize > 0 {
 		if !c.capabilities().GSO {
@@ -509,17 +548,15 @@ func (c *oobConn) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gso
 	if segmentSize > 0 && c.segmentWriter != nil {
 		return c.segmentWriter.WriteSegments(b, segmentSize, sockaddr, oob)
 	}
-	var n int
-	var sendErr error
-	err := c.sysConn.Write(func(fd uintptr) bool {
-		for {
-			n, sendErr = unix.SendmsgN(int(fd), b, oob, sockaddr, 0)
-			if sendErr == unix.EINTR {
-				continue
-			}
-			return sendErr != unix.EAGAIN
-		}
-	})
+	state.b = b
+	state.oob = oob
+	state.sockaddr = sockaddr
+	err := c.sysConn.Write(state.writeFn)
+	n, sendErr := state.n, state.err
+	state.b = nil
+	state.oob = nil
+	state.sockaddr = nil
+	state.n, state.err = 0, nil
 	if err != nil {
 		return n, err
 	}
