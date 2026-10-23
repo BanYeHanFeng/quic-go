@@ -51,6 +51,7 @@ func newRawServerConn(
 		logger:         logger,
 	}
 	c.rawConn = newRawConn(conn, enableDatagrams, maxHeaderBytes, c.onStreamsEmpty, c.handleControlStream, qlogger, logger)
+	c.rawConn.bufferPendingDatagrams = true
 	if idleTimeout > 0 {
 		c.idleTimer = time.AfterFunc(idleTimeout, func() {
 			conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "idle timeout")

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/quic-go/qpack"
 	"github.com/sagernet/quic-go"
@@ -23,6 +24,22 @@ const maxQuarterStreamID = 1<<60 - 1
 
 // invalidStreamID is a stream ID that is invalid. The first valid stream ID in QUIC is 0.
 const invalidStreamID = quic.StreamID(-1)
+
+const (
+	// maxPendingDatagramStreams limits how many not-yet-tracked request streams
+	// can have datagrams buffered at the same time.
+	maxPendingDatagramStreams = 16
+	// minPendingDatagramTimeout is the lower bound for how long datagrams are buffered
+	// while waiting for the corresponding request stream to be tracked.
+	minPendingDatagramTimeout = 250 * time.Millisecond
+)
+
+// pendingDatagrams holds datagrams that arrived before their request stream was tracked.
+// RFC 9297, Section 2.1 allows buffering them for about a round trip.
+type pendingDatagrams struct {
+	deadline time.Time
+	queue    [][]byte
+}
 
 // rawConn is an HTTP/3 connection.
 // It provides HTTP/3 specific functionality by wrapping a quic.Conn,
@@ -39,6 +56,11 @@ type rawConn struct {
 
 	streamMx sync.Mutex
 	streams  map[quic.StreamID]*stateTrackingStream
+
+	// bufferPendingDatagrams is set on the server, where a client may send datagrams
+	// before the request stream was accepted and tracked.
+	bufferPendingDatagrams bool
+	pendingDatagrams       map[quic.StreamID]*pendingDatagrams // protected by streamMx
 
 	rcvdControlStr      atomic.Bool
 	rcvdQPACKEncoderStr atomic.Bool
@@ -179,6 +201,13 @@ func (c *rawConn) TrackStream(str *quic.Stream) *stateTrackingStream {
 	hstr := newStateTrackingStream(str, c, func(b []byte, bypass bool) error { return c.sendDatagram(str.StreamID(), b, bypass) })
 
 	c.streamMx.Lock()
+	if pending, ok := c.pendingDatagrams[str.StreamID()]; ok {
+		delete(c.pendingDatagrams, str.StreamID())
+		// hstr is not reachable by other goroutines yet, so its queue can be set directly.
+		if time.Now().Before(pending.deadline) {
+			hstr.queue = pending.queue
+		}
+	}
 	c.streams[str.StreamID()] = hstr
 	c.streamMx.Unlock()
 	return hstr
@@ -386,12 +415,43 @@ func (c *rawConn) receiveDatagrams() error {
 		streamID := quic.StreamID(4 * quarterStreamID)
 		c.streamMx.Lock()
 		dg, ok := c.streams[streamID]
-		c.streamMx.Unlock()
 		if !ok {
+			if c.bufferPendingDatagrams {
+				c.bufferPendingDatagramLocked(streamID, b[n:])
+			}
+			c.streamMx.Unlock()
 			continue
 		}
+		c.streamMx.Unlock()
 		dg.enqueueDatagram(b[n:])
 	}
+}
+
+// bufferPendingDatagramLocked buffers a datagram for a request stream that hasn't been tracked yet.
+// The stream might also have been closed already, so buffered datagrams expire.
+// The caller must hold streamMx.
+func (c *rawConn) bufferPendingDatagramLocked(id quic.StreamID, data []byte) {
+	now := time.Now()
+	for pendingID, pending := range c.pendingDatagrams {
+		if !now.Before(pending.deadline) {
+			delete(c.pendingDatagrams, pendingID)
+		}
+	}
+	pending, ok := c.pendingDatagrams[id]
+	if !ok {
+		if len(c.pendingDatagrams) >= maxPendingDatagramStreams {
+			return
+		}
+		if c.pendingDatagrams == nil {
+			c.pendingDatagrams = make(map[quic.StreamID]*pendingDatagrams)
+		}
+		pending = &pendingDatagrams{deadline: now.Add(max(4*c.conn.ConnectionStats().SmoothedRTT, minPendingDatagramTimeout))}
+		c.pendingDatagrams[id] = pending
+	}
+	if len(pending.queue) >= streamDatagramQueueLen {
+		return
+	}
+	pending.queue = append(pending.queue, data)
 }
 
 // ReceivedSettings returns a channel that is closed once the peer's SETTINGS frame was received.
