@@ -46,16 +46,14 @@ func newUTLSQUICClient(tlsConf *tls.Config) (*utlsQUICConn, error) {
 // utlsConfigFromStd converts a crypto/tls client config into the uTLS
 // equivalent.
 //
-// uTLS ships no converter, so this copies field by field. Any field that cannot
-// be carried across is a hard error rather than a silent omission: dropping
-// something like VerifyConnection would quietly weaken certificate validation.
+// uTLS ships no converter, so this copies field by field. Unsupported fields
+// are rejected rather than silently omitted so security-sensitive behavior is
+// never weakened. VerifyConnection is bridged by translating the uTLS
+// ConnectionState into crypto/tls.ConnectionState (excluding unexported
+// exporter hooks and uTLS-only fields).
 func utlsConfigFromStd(c *tls.Config) (*utls.Config, error) {
 	if c == nil {
 		return &utls.Config{MinVersion: utls.VersionTLS13}, nil
-	}
-	if c.VerifyConnection != nil {
-		// Takes a crypto/tls ConnectionState, which uTLS will never produce.
-		return nil, errors.New("quic: tls.Config.VerifyConnection is not supported with ChromeParrot")
 	}
 	if c.EncryptedClientHelloRejectionVerify != nil {
 		// Takes a crypto/tls ConnectionState, which uTLS will never produce.
@@ -103,6 +101,13 @@ func utlsConfigFromStd(c *tls.Config) (*utls.Config, error) {
 		}
 	}
 
+	if c.VerifyConnection != nil {
+		verify := c.VerifyConnection
+		uc.VerifyConnection = func(state utls.ConnectionState) error {
+			return verify(connectionStateToStd(state))
+		}
+	}
+
 	// GREASE ECH is covered by the ClientHello spec; a caller-supplied config list
 	// takes precedence.
 	if len(c.EncryptedClientHelloConfigList) > 0 {
@@ -133,11 +138,25 @@ func signatureSchemesToStd(in []utls.SignatureScheme) []tls.SignatureScheme {
 	return out
 }
 
-func (c *utlsQUICConn) Start(ctx context.Context) error { return c.conn.Start(ctx) }
-func (c *utlsQUICConn) Close() error                    { return c.conn.Close() }
+// wrapUTLSError attaches an equivalent crypto/tls.AlertError when uTLS wraps a
+// utls.AlertError, so handshake.wrapError maps it to a QUIC CRYPTO_ERROR
+// instead of INTERNAL_ERROR while preserving the original error chain.
+func wrapUTLSError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var alertErr utls.AlertError
+	if errors.As(err, &alertErr) {
+		return fmt.Errorf("%w%.0w", err, tls.AlertError(alertErr))
+	}
+	return err
+}
+
+func (c *utlsQUICConn) Start(ctx context.Context) error { return wrapUTLSError(c.conn.Start(ctx)) }
+func (c *utlsQUICConn) Close() error                    { return wrapUTLSError(c.conn.Close()) }
 
 func (c *utlsQUICConn) HandleData(level tls.QUICEncryptionLevel, data []byte) error {
-	return c.conn.HandleData(utlsEncryptionLevel(level), data)
+	return wrapUTLSError(c.conn.HandleData(utlsEncryptionLevel(level), data))
 }
 
 // SetTransportParameters installs quic-go's marshalled transport parameters into
@@ -233,22 +252,32 @@ func (c *utlsQUICConn) StoreSession(*tls.SessionState) error {
 	return errors.New("quic: session resumption is unsupported with ChromeParrot")
 }
 
-func (c *utlsQUICConn) ConnectionState() tls.ConnectionState {
-	s := c.conn.ConnectionState()
+// connectionStateToStd translates uTLS connection state to crypto/tls.
+// ExportKeyingMaterial cannot be used on the returned value because crypto/tls
+// stores the exporter callback in an unexported field; uTLS-only fields
+// (PeerApplicationSettings, JLS) have no crypto/tls counterpart.
+func connectionStateToStd(s utls.ConnectionState) tls.ConnectionState {
 	return tls.ConnectionState{
 		Version:                     s.Version,
 		HandshakeComplete:           s.HandshakeComplete,
 		DidResume:                   s.DidResume,
 		CipherSuite:                 s.CipherSuite,
+		CurveID:                     tls.CurveID(s.CurveID),
 		NegotiatedProtocol:          s.NegotiatedProtocol,
-		NegotiatedProtocolIsMutual:  true,
+		NegotiatedProtocolIsMutual:  s.NegotiatedProtocolIsMutual,
 		ServerName:                  s.ServerName,
 		PeerCertificates:            s.PeerCertificates,
 		VerifiedChains:              s.VerifiedChains,
 		SignedCertificateTimestamps: s.SignedCertificateTimestamps,
 		OCSPResponse:                s.OCSPResponse,
+		TLSUnique:                   s.TLSUnique,
 		ECHAccepted:                 s.ECHAccepted,
+		HelloRetryRequest:           s.HelloRetryRequest,
 	}
+}
+
+func (c *utlsQUICConn) ConnectionState() tls.ConnectionState {
+	return connectionStateToStd(c.conn.ConnectionState())
 }
 
 func utlsEncryptionLevel(l tls.QUICEncryptionLevel) utls.QUICEncryptionLevel {

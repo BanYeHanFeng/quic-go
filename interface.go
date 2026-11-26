@@ -216,6 +216,9 @@ type Config struct {
 	//
 	// Client side only; it has no effect on a listener. Because it pins the
 	// values above, settings that conflict with Chrome's are ignored.
+	// tls.Config.VerifyConnection is supported via a translated
+	// tls.ConnectionState, except that ExportKeyingMaterial is unavailable on
+	// that translated value.
 	ChromeParrot bool
 }
 

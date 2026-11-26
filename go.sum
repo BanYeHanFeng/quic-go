@@ -7,8 +7,8 @@ github.com/jordanlewis/gcassert v0.0.0-20250430164644-389ef753e22e h1:a+PGEeXb+e
 github.com/jordanlewis/gcassert v0.0.0-20250430164644-389ef753e22e/go.mod h1:ZybsQk6DWyN5t7An1MuPm1gtSZ1xDaTXS9ZjIOxvQrk=
 github.com/klauspost/compress v1.17.9 h1:6KIumPrER1LHsvBVuDa0r5xaG0Es51mhhB9BQB2qeMA=
 github.com/klauspost/compress v1.17.9/go.mod h1:Di0epgTjJY877eYKx5yC51cX2A2Vl2ibi7bDH9ttBbw=
-github.com/metacubex/utls v1.8.7 h1:Cp+yWkNTFkSihETgGWq34hlVFds5HpYWVOR1xovUVTs=
-github.com/metacubex/utls v1.8.7/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
+github.com/metacubex/utls v1.9.0-alpha.1 h1:0tE4Pi5eoGnhEvS+ZZvVhEpZh5Ugo2nDQM+69g4SFaM=
+github.com/metacubex/utls v1.9.0-alpha.1/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
 github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
